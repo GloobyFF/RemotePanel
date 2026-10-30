@@ -177,8 +177,9 @@
         size = CGSizeMake(1024, 1024);
     }
     PHImageRequestOptions *opts = [[PHImageRequestOptions alloc] init];
-    opts.deliveryMode = PHImageRequestOptionsDeliveryModeHighQualityFormat;
-    opts.resizeMode = PHImageRequestOptionsResizeModeFast;
+    // FastFormat + sized request keeps peak memory down on iPad 3.
+    opts.deliveryMode = PHImageRequestOptionsDeliveryModeFastFormat;
+    opts.resizeMode = PHImageRequestOptionsResizeModeExact;
     opts.networkAccessAllowed = YES;
     opts.synchronous = NO;
     [[PHImageManager defaultManager] requestImageForAsset:asset

@@ -30,7 +30,7 @@
 | Display name | RemotePanel |
 | Team ID | `FLFYQXCCZM` |
 | CFBundleShortVersionString | `2.0` |
-| CFBundleVersion (build) | **`3`**（本包对应刚装上的版本） |
+| CFBundleVersion (build) | **`4`**（内存/预加载/日历乱码修复后） |
 | App Icon | `Images.xcassets/AppIcon.appiconset`（已嵌入） |
 
 Provisioning 细节见 `ios/PROVISIONING-NOTES.txt`。  
@@ -223,6 +223,12 @@ curl -sS 'http://192.168.28.12:9121/api/h5/state?rotate=1' | python3 -m json.too
 
 ## 10. 已知限制 / 下一步值得做的修复
 
+### 已在 build 4 处理
+- **有图页飞入前预加载**：`loadImageURL` 会计入 pending，intro 等封面进缓存（最长 ~1.35s）；dwell 末段会 `RPPrefetchImagesForPage` 预热下一页。
+- **内存**：图片解码最长边 720、`NSCache` totalCostLimit ~18MB、离页清 UIImage、相册 FastFormat + 尺寸上限、memory warning 清缓存。
+- **日历乱码**：两处原因——(1) 像素字体缺大量汉字 → 日程正文改用系统字体 `RPTheme readable:`；(2) ICS 订阅未解 `QUOTED-PRINTABLE` / `CHARSET=GBK|GB18030` / 整文件 GBK → `RPParseICS` 与 `server/core/ics_calendar.py` 已修。EventKit 日期格式用 Gregorian + `zh_CN` + `EEEE`。
+
+### 仍待处理
 - Build 只能在 `.179`；TeamC 上改完必须同步再编。
 - `ios-deploy` 路径绑死在某次 DerivedData；换机需改脚本。
 - `server/ipad/data` 媒体巨大，handoff 未收录；若要离线完整预览需另拷。
@@ -231,6 +237,7 @@ curl -sS 'http://192.168.28.12:9121/api/h5/state?rotate=1' | python3 -m json.too
 - `RPKioskRootVC.m.pre_capture_bak` 是备份，可忽略或删。
 - `build_install.sh` 的 `ROOT` 写死为 `.179` 路径；若在别的目录构建需改。
 - 截图 `extras/*.png` 多为改版前 roster（仍含 system/vps/weekly），仅作视觉参考。
+- 文档仍写「30s poll `/api/h5/state`」，实际 `pollNow` 走 `RPLocalFeed`（双轨待统一）。
 
 ---
 
@@ -271,7 +278,7 @@ RemotePanel-handoff-20261030/
 
 ## 13. 快速自检清单
 
-- [ ] `ios/RemotePanel/Info.plist` → `CFBundleVersion` == 3  
+- [ ] `ios/RemotePanel/Info.plist` → `CFBundleVersion` == 4  
 - [ ] 存在 `AppIcon.appiconset` 且含 png  
 - [ ] `RPKioskRootVC` roster 含「天气+VPS」，不含启用的 system/weekly/vps  
 - [ ] `curl` TeamC `:9121/api/h5/state` 返回 `weather` / `news.github_items` / `vps`  

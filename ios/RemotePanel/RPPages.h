@@ -21,7 +21,14 @@
 - (void)playPageOutro:(void (^)(void))done;
 - (NSURL *)absURL:(NSString *)path base:(NSString *)base;
 - (void)loadImageURL:(NSURL *)url into:(UIImageView *)iv;
+/** Drop decoded bitmaps held by this page (call on leave / memory warning). */
+- (void)purgeDisplayedImages;
 @end
+
+/** Prefetch remote images for a page id into the shared cache (no UI). */
+void RPPrefetchImagesForPage(NSString *pageId, NSDictionary *state, NSString *baseURL);
+/** Evict the shared UIImage cache (memory pressure). */
+void RPPurgeImageCache(void);
 
 @interface RPHelloPageVC : RPBasePageVC
 @end

@@ -23,6 +23,8 @@
 + (UIFont *)hero:(CGFloat)size;
 + (UIFont *)small:(CGFloat)size;
 + (UIFont *)weatherIcon:(CGFloat)size;
+/** System font for calendar / long CJK text (pixel fonts miss many glyphs → tofu). */
++ (UIFont *)readable:(CGFloat)size;
 + (CGFloat)snap:(CGFloat)size;
 /** Content-page scale (~2x legacy sizes). Pass intended visual size. */
 + (CGFloat)contentScale;

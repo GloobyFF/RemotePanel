@@ -1,9 +1,12 @@
 #import "RPLocalFeed.h"
 #import "RPNet.h"
+#import <CoreFoundation/CoreFoundation.h>
 #import <arpa/inet.h>
+#import <ctype.h>
 #import <ifaddrs.h>
 #import <math.h>
 #import <netinet/in.h>
+#import <stdio.h>
 #import <sys/socket.h>
 #import <unistd.h>
 
@@ -372,10 +375,104 @@ static NSArray *RPParseMovies(NSData *data, NSInteger limit) {
     return items;
 }
 
+static NSStringEncoding RPICSEncodingNamed(NSString *name) {
+    NSString *n = [[name ?: @""] lowercaseString];
+    if ([n rangeOfString:@"gb18030"].location != NSNotFound || [n rangeOfString:@"gbk"].location != NSNotFound ||
+        [n rangeOfString:@"gb2312"].location != NSNotFound || [n rangeOfString:@"cp936"].location != NSNotFound) {
+        return CFStringConvertEncodingToNSStringEncoding(kCFStringEncodingGB_18030_2000);
+    }
+    if ([n rangeOfString:@"utf-8"].location != NSNotFound || [n rangeOfString:@"utf8"].location != NSNotFound) {
+        return NSUTF8StringEncoding;
+    }
+    return NSUTF8StringEncoding;
+}
+
+static NSString *RPICSDataToString(NSData *data) {
+    if (data.length == 0) return @"";
+    const unsigned char *b = data.bytes;
+    NSUInteger off = 0;
+    if (data.length >= 3 && b[0] == 0xEF && b[1] == 0xBB && b[2] == 0xBF) off = 3;
+    NSData *body = off ? [data subdataWithRange:NSMakeRange(off, data.length - off)] : data;
+    NSString *utf8 = [[NSString alloc] initWithData:body encoding:NSUTF8StringEncoding];
+    if (utf8.length) return utf8;
+    NSStringEncoding gb = CFStringConvertEncodingToNSStringEncoding(kCFStringEncodingGB_18030_2000);
+    NSString *gbStr = [[NSString alloc] initWithData:body encoding:gb];
+    if (gbStr.length) return gbStr;
+    return [[NSString alloc] initWithData:body encoding:NSISOLatin1StringEncoding] ?: @"";
+}
+
+static NSString *RPICSDecodeQP(NSString *value, NSStringEncoding enc) {
+    if (value.length == 0) return @"";
+    NSString *s = [value stringByReplacingOccurrencesOfString:@"=\r\n" withString:@""];
+    s = [s stringByReplacingOccurrencesOfString:@"=\n" withString:@""];
+    NSMutableData *bytes = [NSMutableData dataWithCapacity:s.length];
+    const char *utf8 = [s UTF8String];
+    if (!utf8) return value;
+    for (size_t i = 0; utf8[i]; ) {
+        if (utf8[i] == '=' && isxdigit((unsigned char)utf8[i + 1]) && isxdigit((unsigned char)utf8[i + 2])) {
+            unsigned int b = 0;
+            sscanf(utf8 + i + 1, "%02x", &b);
+            unsigned char c = (unsigned char)b;
+            [bytes appendBytes:&c length:1];
+            i += 3;
+        } else {
+            [bytes appendBytes:utf8 + i length:1];
+            i += 1;
+        }
+    }
+    NSString *out = [[NSString alloc] initWithData:bytes encoding:enc];
+    if (!out && enc != NSUTF8StringEncoding) out = [[NSString alloc] initWithData:bytes encoding:NSUTF8StringEncoding];
+    return out.length ? out : value;
+}
+
+static NSString *RPICSUnescape(NSString *value) {
+    if (value.length == 0) return @"";
+    NSString *s = value;
+    s = [s stringByReplacingOccurrencesOfString:@"\\n" withString:@"\n"];
+    s = [s stringByReplacingOccurrencesOfString:@"\\N" withString:@"\n"];
+    s = [s stringByReplacingOccurrencesOfString:@"\\," withString:@","];
+    s = [s stringByReplacingOccurrencesOfString:@"\\;" withString:@";"];
+    s = [s stringByReplacingOccurrencesOfString:@"\\\\" withString:@"\\"];
+    return s;
+}
+
+/** Parse one ICS content line into key / params / value; decode CHARSET + QUOTED-PRINTABLE. */
+static void RPICSParseLine(NSString *line, NSString **outKey, NSString **outValue) {
+    *outKey = nil; *outValue = nil;
+    NSRange colon = [line rangeOfString:@":"];
+    if (colon.location == NSNotFound) return;
+    NSArray *parts = [[line substringToIndex:colon.location] componentsSeparatedByString:@";"];
+    NSString *key = [parts.firstObject uppercaseString];
+    NSString *value = [line substringFromIndex:NSMaxRange(colon)];
+    NSStringEncoding enc = NSUTF8StringEncoding;
+    BOOL qp = NO;
+    for (NSUInteger i = 1; i < parts.count; i++) {
+        NSString *p = parts[i];
+        NSRange eq = [p rangeOfString:@"="];
+        if (eq.location == NSNotFound) continue;
+        NSString *pk = [[p substringToIndex:eq.location] uppercaseString];
+        NSString *pv = [[p substringFromIndex:NSMaxRange(eq)] stringByTrimmingCharactersInSet:[NSCharacterSet characterSetWithCharactersInString:@"\""]];
+        if ([pk isEqualToString:@"CHARSET"]) enc = RPICSEncodingNamed(pv);
+        if ([pk isEqualToString:@"ENCODING"] && [[pv uppercaseString] rangeOfString:@"QUOTED-PRINTABLE"].location != NSNotFound) qp = YES;
+    }
+    if (qp) value = RPICSDecodeQP(value, enc);
+    else if (enc != NSUTF8StringEncoding) {
+        // Some exporters put GBK bytes into a mislabeled UTF-8 transport; try re-decode from latin1 bridge.
+        NSData *raw = [value dataUsingEncoding:NSISOLatin1StringEncoding];
+        NSString *re = raw ? [[NSString alloc] initWithData:raw encoding:enc] : nil;
+        if (re.length) value = re;
+    }
+    *outKey = key;
+    *outValue = RPICSUnescape(value);
+}
+
 static NSDictionary *RPParseICS(NSData *data) {
-    NSString *text = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] ?: @"";
+    NSString *text = RPICSDataToString(data);
+    // RFC 5545 line unfolding (space or tab continuation).
     text = [text stringByReplacingOccurrencesOfString:@"\r\n " withString:@""];
+    text = [text stringByReplacingOccurrencesOfString:@"\r\n\t" withString:@""];
     text = [text stringByReplacingOccurrencesOfString:@"\n " withString:@""];
+    text = [text stringByReplacingOccurrencesOfString:@"\n\t" withString:@""];
     NSDateFormatter *fmt = [[NSDateFormatter alloc] init];
     fmt.dateFormat = @"yyyy-MM-dd";
     fmt.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
@@ -385,7 +482,7 @@ static NSDictionary *RPParseICS(NSData *data) {
     NSString *kind = @"";
     NSMutableDictionary *cur = nil;
     for (NSString *raw in [text componentsSeparatedByCharactersInSet:[NSCharacterSet newlineCharacterSet]]) {
-        NSString *line = [raw stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+        NSString *line = [raw stringByTrimmingCharactersInSet:[NSCharacterSet characterSetWithCharactersInString:@"\r"]];
         if ([line isEqualToString:@"BEGIN:VEVENT"]) { kind = @"event"; cur = [NSMutableDictionary dictionary]; continue; }
         if ([line isEqualToString:@"BEGIN:VTODO"]) { kind = @"todo"; cur = [NSMutableDictionary dictionary]; continue; }
         if ([line isEqualToString:@"END:VEVENT"] || [line isEqualToString:@"END:VTODO"]) {
@@ -393,14 +490,15 @@ static NSDictionary *RPParseICS(NSData *data) {
             if ([kind isEqualToString:@"todo"]) [todos addObject:cur ?: @{}];
             kind = @""; cur = nil; continue;
         }
-        if (!cur || [line rangeOfString:@":"].location == NSNotFound) continue;
-        NSRange colon = [line rangeOfString:@":"];
-        NSString *key = [[line substringToIndex:colon.location] componentsSeparatedByString:@";"].firstObject.uppercaseString;
-        cur[key] = [line substringFromIndex:NSMaxRange(colon)];
+        if (!cur) continue;
+        NSString *key = nil, *value = nil;
+        RPICSParseLine(line, &key, &value);
+        if (key.length == 0) continue;
+        cur[key] = value ?: @"";
     }
     NSMutableArray *upcoming = [NSMutableArray array];
     for (NSDictionary *ev in events) {
-        NSString *title = RPDecode([ev[@"SUMMARY"] stringByReplacingOccurrencesOfString:@"\\n" withString:@" "]);
+        NSString *title = RPDecode([ev[@"SUMMARY"] ?: @"" stringByReplacingOccurrencesOfString:@"\n" withString:@" "]);
         NSString *start = ev[@"DTSTART"] ?: @"";
         NSString *day = @"";
         NSString *clock = @"";

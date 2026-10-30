@@ -8,6 +8,7 @@
 #import <EventKit/EventKit.h>
 #import <objc/runtime.h>
 #import <CommonCrypto/CommonDigest.h>
+#import <ctype.h>
 
 @interface RPBasePageVC (Fingerprint)
 - (BOOL)shouldSkipRebuildForKey:(NSString *)key bounds:(CGRect)b;
@@ -21,19 +22,128 @@
 - (CGFloat)mInset;
 - (BOOL)isLandscape;
 - (UIColor *)colorFromHex:(NSString *)hex;
+- (void)noteImageLoadBegan;
+- (void)noteImageLoadEnded;
+- (void)tryPlayIntro;
 @end
 
 static char kRPImageURLKey;
 static char kRPDismissDimKey;
 static char kRPReminderID;
+/** Soft cap for decoded bitmaps on iPad 3 (1024×768 @2x still huge if kept full-res). */
+static const CGFloat kRPImageMaxSide = 720.0;
+static const NSTimeInterval kRPIntroImageWait = 1.35;
+
 static NSCache *RPImageCache(void) {
     static NSCache *c;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         c = [[NSCache alloc] init];
-        c.countLimit = 80;
+        c.countLimit = 28;
+        // ~18 MB of decoded RGBA budget for the kiosk.
+        c.totalCostLimit = 18 * 1024 * 1024;
     });
     return c;
+}
+
+void RPPurgeImageCache(void) {
+    [RPImageCache() removeAllObjects];
+}
+
+static UIImage *RPDownscaleImage(UIImage *img, CGFloat maxSide) {
+    if (!img) return nil;
+    CGSize s = img.size;
+    CGFloat longest = MAX(s.width, s.height);
+    if (longest <= 1.0 || longest <= maxSide) return img;
+    CGFloat scale = maxSide / longest;
+    CGSize ns = CGSizeMake(MAX(1.0, round(s.width * scale)), MAX(1.0, round(s.height * scale)));
+    UIGraphicsBeginImageContextWithOptions(ns, YES, 1.0);
+    [img drawInRect:CGRectMake(0, 0, ns.width, ns.height)];
+    UIImage *out = UIGraphicsGetImageFromCurrentImageContext();
+    UIGraphicsEndImageContext();
+    return out ?: img;
+}
+
+static NSUInteger RPImageCost(UIImage *img) {
+    if (!img) return 1;
+    CGFloat w = img.size.width * img.scale;
+    CGFloat h = img.size.height * img.scale;
+    NSUInteger bytes = (NSUInteger)MAX(1.0, w * h * 4.0);
+    return bytes;
+}
+
+static void RPCacheImage(NSString *key, UIImage *img) {
+    if (key.length == 0 || !img) return;
+    [RPImageCache() setObject:img forKey:key cost:RPImageCost(img)];
+}
+
+static NSURL *RPAbsURLString(NSString *path, NSString *base) {
+    if (![path isKindOfClass:[NSString class]] || path.length == 0) return nil;
+    if ([path hasPrefix:@"http"]) return [NSURL URLWithString:path];
+    NSString *b = base ?: @"";
+    if ([b hasSuffix:@"/"]) b = [b substringToIndex:b.length - 1];
+    if (![path hasPrefix:@"/"]) path = [@"/" stringByAppendingString:path];
+    return [NSURL URLWithString:[b stringByAppendingString:path]];
+}
+
+static void RPCollectURL(NSMutableArray *out, NSString *path, NSString *base) {
+    NSURL *u = RPAbsURLString(path, base);
+    if (u.absoluteString.length) [out addObject:u.absoluteString];
+}
+
+void RPPrefetchImagesForPage(NSString *pageId, NSDictionary *state, NSString *baseURL) {
+    if (![state isKindOfClass:[NSDictionary class]] || pageId.length == 0) return;
+    NSMutableArray *keys = [NSMutableArray array];
+    if ([pageId isEqualToString:@"movie-now-showing"]) {
+        for (NSDictionary *mov in (state[@"movies"] ?: @[])) {
+            if ([mov isKindOfClass:[NSDictionary class]]) RPCollectURL(keys, mov[@"poster_url"], baseURL);
+        }
+    } else if ([pageId hasPrefix:@"steam-new-releases"]) {
+        NSDictionary *steam = state[@"steam"] ?: @{};
+        NSArray *items = ([pageId hasSuffix:@"-2"] ? (steam[@"top_sellers"] ?: steam[@"trending"]) : steam[@"new_releases"]) ?: @[];
+        for (NSDictionary *item in items) {
+            if (![item isKindOfClass:[NSDictionary class]]) continue;
+            RPCollectURL(keys, item[@"header_url"] ?: item[@"capsule_url"] ?: item[@"image_url"], baseURL);
+        }
+    } else if ([pageId hasPrefix:@"gamer520"] || [pageId isEqualToString:@"ps5-games-latest"]) {
+        NSArray *items = nil;
+        if ([pageId rangeOfString:@"switch"].location != NSNotFound) items = state[@"gamer520"][@"switch_items"] ?: state[@"switch_games"];
+        else if ([pageId rangeOfString:@"ps5"].location != NSNotFound) items = state[@"ps5_games"] ?: state[@"gamer520"][@"ps5_items"];
+        else items = state[@"gamer520"][@"items"];
+        for (NSDictionary *item in (items ?: @[])) {
+            if ([item isKindOfClass:[NSDictionary class]]) RPCollectURL(keys, item[@"image_url"] ?: item[@"cover_url"] ?: item[@"poster_url"], baseURL);
+        }
+    } else if ([pageId isEqualToString:@"daily-news"] || [pageId isEqualToString:@"github-news"] ||
+               [pageId isEqualToString:@"x-news"] || [pageId isEqualToString:@"xiaohongshu-hot"] ||
+               [pageId isEqualToString:@"bilibili-hot"]) {
+        NSArray *items = nil;
+        if ([pageId isEqualToString:@"github-news"]) items = state[@"news"][@"github_items"] ?: state[@"news"][@"github"];
+        else if ([pageId isEqualToString:@"x-news"]) items = state[@"news"][@"x_items"] ?: state[@"news"][@"x"];
+        else if ([pageId isEqualToString:@"xiaohongshu-hot"]) items = state[@"news"][@"xhs_items"] ?: state[@"news"][@"xiaohongshu"];
+        else if ([pageId isEqualToString:@"bilibili-hot"]) items = state[@"bilibili"][@"items"] ?: state[@"news"][@"bilibili_items"];
+        else items = state[@"news"][@"daily_items"] ?: state[@"news"][@"daily"];
+        NSInteger n = 0;
+        for (NSDictionary *it in (items ?: @[])) {
+            if (![it isKindOfClass:[NSDictionary class]]) continue;
+            RPCollectURL(keys, it[@"image_url"], baseURL);
+            if (++n >= 8) break;
+        }
+    }
+    if (keys.count == 0) return;
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_LOW, 0), ^{
+        for (NSString *key in keys) {
+            if ([RPImageCache() objectForKey:key]) continue;
+            NSError *error = nil;
+            NSString *proxy = nil;
+            if ([key rangeOfString:@"github"].location != NSNotFound) {
+                proxy = [[NSUserDefaults standardUserDefaults] stringForKey:RPProxyDefaultsKey];
+                if (proxy.length == 0) proxy = RPLocalDefaultProxy();
+            }
+            NSData *data = [RPNet syncGET:key proxy:proxy headers:nil timeout:16 error:&error];
+            UIImage *img = data ? RPDownscaleImage([UIImage imageWithData:data], kRPImageMaxSide) : nil;
+            if (img) RPCacheImage(key, img);
+        }
+    });
 }
 
 static NSString *RPHashObject(id obj) {
@@ -54,6 +164,9 @@ static NSString *RPHashObject(id obj) {
     NSString *_lastFingerprint;
     CGSize _lastBoundsSize;
     BOOL _introPlayed;
+    BOOL _waitingIntro;
+    NSInteger _pendingImageLoads;
+    NSInteger _introWaitToken;
 }
 - (void)viewDidLoad {
     [super viewDidLoad];
@@ -62,12 +175,53 @@ static NSString *RPHashObject(id obj) {
     self.contentView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     [self.view addSubview:self.contentView];
 }
-- (void)pageWillAppear { [self playPageIntro]; }
-- (void)pageDidDisappear {}
+- (void)pageWillAppear {
+    _waitingIntro = YES;
+    _introWaitToken += 1;
+    NSInteger token = _introWaitToken;
+    [self tryPlayIntro];
+    // Don't stall the fly-in forever on a slow LAN — start with whatever is ready.
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kRPIntroImageWait * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        if (token != self->_introWaitToken) return;
+        if (!self->_waitingIntro || self->_introPlayed) return;
+        self->_pendingImageLoads = 0;
+        [self tryPlayIntro];
+    });
+}
+- (void)pageDidDisappear {
+    _waitingIntro = NO;
+    _introWaitToken += 1;
+    [self purgeDisplayedImages];
+}
 - (void)applyState:(NSDictionary *)state baseURL:(NSString *)baseURL { (void)state; (void)baseURL; }
 - (void)clearContent {
     _introPlayed = NO;
+    _pendingImageLoads = 0;
     for (UIView *v in self.contentView.subviews) [v removeFromSuperview];
+}
+- (void)tryPlayIntro {
+    if (!_waitingIntro || _introPlayed) return;
+    if (_pendingImageLoads > 0) return;
+    _waitingIntro = NO;
+    [self playPageIntro];
+}
+- (void)noteImageLoadBegan {
+    _pendingImageLoads += 1;
+}
+- (void)noteImageLoadEnded {
+    if (_pendingImageLoads > 0) _pendingImageLoads -= 1;
+    [self tryPlayIntro];
+}
+- (void)purgeDisplayedImages {
+    void (^walk)(UIView *) = nil;
+    __block void (^walkBlock)(UIView *) = ^(UIView *root) {
+        if ([root isKindOfClass:[UIImageView class]]) {
+            ((UIImageView *)root).image = nil;
+        }
+        for (UIView *sub in root.subviews) walkBlock(sub);
+    };
+    walk = walkBlock;
+    walk(self.contentView);
 }
 - (NSInteger)rpMotionKind {
     NSArray *ids = @[@"hello", @"schedule", @"weather", @"daily-news", @"github-news", @"x-news", @"xiaohongshu-hot", @"bilibili-hot", @"stocks-cn", @"crypto", @"person-photo-local-1", @"print", @"movie-now-showing", @"steam-new-releases", @"steam-new-releases-2", @"gamer520-pc-latest", @"person-photo-local-2", @"gamer520-switch-latest", @"ps5-games-latest"];
@@ -350,6 +504,7 @@ static NSString *RPHashObject(id obj) {
     }
     if (key.length == 0) {
         objc_setAssociatedObject(iv, &kRPImageURLKey, nil, OBJC_ASSOCIATION_COPY_NONATOMIC);
+        iv.image = nil;
         return;
     }
     UIImage *cached = [RPImageCache() objectForKey:key];
@@ -359,35 +514,37 @@ static NSString *RPHashObject(id obj) {
         return;
     }
     objc_setAssociatedObject(iv, &kRPImageURLKey, key, OBJC_ASSOCIATION_COPY_NONATOMIC);
-    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_LOW, 0), ^{
+    [self noteImageLoadBegan];
+    __weak typeof(self) weakSelf = self;
+    __weak UIImageView *weakIV = iv;
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
         NSError *error = nil;
         NSString *proxy = nil;
         if ([key rangeOfString:@"github"].location != NSNotFound) {
             proxy = [[NSUserDefaults standardUserDefaults] stringForKey:RPProxyDefaultsKey];
             if (proxy.length == 0) proxy = RPLocalDefaultProxy();
         }
-        NSData *data = [RPNet syncGET:key proxy:proxy headers:nil timeout:20 error:&error];
-        UIImage *img = data ? [UIImage imageWithData:data] : nil;
-        if (!img) {
-            dispatch_async(dispatch_get_main_queue(), ^{
-                NSString *cur = objc_getAssociatedObject(iv, &kRPImageURLKey);
-                if (![cur isEqualToString:key] || iv.image) return;
-                UILabel *miss = [UILabel new];
-                miss.text = @"封面没读到";
-                miss.textAlignment = NSTextAlignmentCenter;
-                miss.textColor = [UIColor colorWithWhite:0.65 alpha:1];
-                miss.font = [RPTheme body:16];
-                miss.frame = iv.bounds;
-                miss.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-                [iv addSubview:miss];
-            });
-            return;
-        }
-        [RPImageCache() setObject:img forKey:key];
+        NSData *data = [RPNet syncGET:key proxy:proxy headers:nil timeout:18 error:&error];
+        UIImage *img = data ? RPDownscaleImage([UIImage imageWithData:data], kRPImageMaxSide) : nil;
+        if (img) RPCacheImage(key, img);
         dispatch_async(dispatch_get_main_queue(), ^{
-            NSString *cur = objc_getAssociatedObject(iv, &kRPImageURLKey);
-            if (![cur isEqualToString:key]) return;
-            iv.image = img;
+            UIImageView *strongIV = weakIV;
+            NSString *cur = strongIV ? objc_getAssociatedObject(strongIV, &kRPImageURLKey) : nil;
+            if (strongIV && [cur isEqualToString:key]) {
+                if (img) {
+                    strongIV.image = img;
+                } else if (!strongIV.image) {
+                    UILabel *miss = [UILabel new];
+                    miss.text = @"封面没读到";
+                    miss.textAlignment = NSTextAlignmentCenter;
+                    miss.textColor = [UIColor colorWithWhite:0.65 alpha:1];
+                    miss.font = [RPTheme body:16];
+                    miss.frame = strongIV.bounds;
+                    miss.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+                    [strongIV addSubview:miss];
+                }
+            }
+            [weakSelf noteImageLoadEnded];
         });
     });
 }
@@ -1617,7 +1774,8 @@ static NSString *RPHashObject(id obj) {
     self.clockLabel.text = [NSString stringWithFormat:@" %@ ", [f stringFromDate:[NSDate date]]];
 }
 - (void)pageWillAppear {
-    [self playPageIntro];
+    [self noteImageLoadBegan]; // hold intro until first photo (or empty/error) lands
+    [super pageWillAppear];
     [self updateClock];
     [self.clockTimer invalidate];
     self.clockTimer = [NSTimer scheduledTimerWithTimeInterval:1.0 target:self selector:@selector(updateClock) userInfo:nil repeats:YES];
@@ -1628,6 +1786,7 @@ static NSString *RPHashObject(id obj) {
             weakSelf.errorLabel.text = @"请允许访问照片\n设置 → RemotePanel → 照片";
             weakSelf.caption.text = @"无相册权限";
             weakSelf.imageView.image = nil;
+            [weakSelf noteImageLoadEnded];
             return;
         }
         [weakSelf.photoSource loadAlbumAssetsPreferFavorites:^(NSArray<PHAsset *> *assets, NSString *albumTitle) {
@@ -1639,6 +1798,7 @@ static NSString *RPHashObject(id obj) {
                 weakSelf.errorLabel.text = @"相册无照片";
                 weakSelf.caption.text = [NSString stringWithFormat:@"%@ · 0 张", weakSelf.albumTitle];
                 weakSelf.imageView.image = nil;
+                [weakSelf noteImageLoadEnded];
                 return;
             }
             weakSelf.errorLabel.hidden = YES;
@@ -1659,6 +1819,9 @@ static NSString *RPHashObject(id obj) {
     self.photoTimer = nil;
     [self.clockTimer invalidate];
     self.clockTimer = nil;
+    self.imageView.image = nil;
+    self.currentAssetId = nil;
+    [super pageDidDisappear];
 }
 - (NSArray<PHAsset *> *)partitionAssets:(NSArray<PHAsset *> *)assets {
     if (assets.count == 0) return assets;
@@ -1685,21 +1848,30 @@ static NSString *RPHashObject(id obj) {
     if (self.assets.count == 0) {
         self.errorLabel.hidden = NO;
         self.errorLabel.text = @"相册无照片";
+        [self noteImageLoadEnded];
         return;
     }
     if (self.assetIndex >= (NSInteger)self.assets.count) self.assetIndex = 0;
     PHAsset *a = self.assets[self.assetIndex];
     if ([a.localIdentifier isEqualToString:self.currentAssetId] && self.imageView.image) {
+        [self noteImageLoadEnded];
         return;
     }
+    BOOL firstPaint = (self.imageView.image == nil);
+    if (!firstPaint) [self noteImageLoadBegan];
     self.currentAssetId = a.localIdentifier;
-    CGFloat scale = [UIScreen mainScreen].scale;
-    CGSize sz = CGSizeMake(MAX(320, self.contentView.bounds.size.width * scale),
-                           MAX(320, self.contentView.bounds.size.height * scale));
+    // Cap decode size for iPad 3 memory; screen is 1024×768.
+    CGFloat scale = MIN(2.0, [UIScreen mainScreen].scale);
+    CGSize host = self.contentView.bounds.size;
+    CGSize sz = CGSizeMake(MIN(1024.0, MAX(320.0, host.width * scale)),
+                           MIN(1024.0, MAX(320.0, host.height * scale)));
     __weak typeof(self) weakSelf = self;
     NSString *wantId = a.localIdentifier;
     [self.photoSource requestImageForAsset:a targetSize:sz completion:^(UIImage *image) {
-        if (![weakSelf.currentAssetId isEqualToString:wantId]) return;
+        if (![weakSelf.currentAssetId isEqualToString:wantId]) {
+            [weakSelf noteImageLoadEnded];
+            return;
+        }
         if (image) {
             weakSelf.imageView.image = image;
             weakSelf.errorLabel.hidden = YES;
@@ -1708,6 +1880,7 @@ static NSString *RPHashObject(id obj) {
             weakSelf.errorLabel.text = @"无法加载照片";
         }
         NSDateFormatter *df = [[NSDateFormatter alloc] init];
+        df.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
         df.dateFormat = @"yyyy-MM-dd HH:mm";
         NSString *when = a.creationDate ? [df stringFromDate:a.creationDate] : @"";
         weakSelf.caption.text = [NSString stringWithFormat:@"%@ · %@ · %ld/%lu",
@@ -1715,6 +1888,7 @@ static NSString *RPHashObject(id obj) {
                                  when,
                                  (long)(weakSelf.assetIndex+1),
                                  (unsigned long)weakSelf.assets.count];
+        [weakSelf noteImageLoadEnded];
     }];
 }
 - (void)nextPhoto {
@@ -1776,16 +1950,56 @@ static NSString *RPHashObject(id obj) {
 @end
 
 @implementation RPSchedulePageVC
+/** Strip HTML / QP leftovers that often show up as “乱码” in calendar notes. */
+- (NSString *)cleanCalText:(id)raw {
+    if (![raw isKindOfClass:[NSString class]]) return @"";
+    NSString *s = (NSString *)raw;
+    if ([s isEqualToString:@"(null)"]) return @"";
+    // Quoted-printable that leaked through (ICS or mail-sourced notes).
+    if ([s rangeOfString:@"="].location != NSNotFound) {
+        NSMutableData *bytes = [NSMutableData data];
+        const char *utf8 = [s UTF8String];
+        if (utf8) {
+            for (size_t i = 0; utf8[i]; ) {
+                if (utf8[i] == '=' && isxdigit((unsigned char)utf8[i+1]) && isxdigit((unsigned char)utf8[i+2])) {
+                    unsigned int b = 0;
+                    sscanf(utf8 + i + 1, "%02x", &b);
+                    unsigned char c = (unsigned char)b;
+                    [bytes appendBytes:&c length:1];
+                    i += 3;
+                } else if (utf8[i] == '=' && (utf8[i+1] == '\r' || utf8[i+1] == '\n')) {
+                    i += (utf8[i+1] == '\r' && utf8[i+2] == '\n') ? 3 : 2;
+                } else {
+                    [bytes appendBytes:utf8 + i length:1];
+                    i += 1;
+                }
+            }
+            NSString *decoded = [[NSString alloc] initWithData:bytes encoding:NSUTF8StringEncoding];
+            if (decoded.length) s = decoded;
+        }
+    }
+    s = [s stringByReplacingOccurrencesOfString:@"&amp;" withString:@"&"];
+    s = [s stringByReplacingOccurrencesOfString:@"&lt;" withString:@"<" ];
+    s = [s stringByReplacingOccurrencesOfString:@"&gt;" withString:@">"];
+    s = [s stringByReplacingOccurrencesOfString:@"&nbsp;" withString:@" "];
+    s = [s stringByReplacingOccurrencesOfString:@"\\n" withString:@" "];
+    s = [s stringByReplacingOccurrencesOfString:@"\\," withString:@","];
+    NSRegularExpression *tags = [NSRegularExpression regularExpressionWithPattern:@"<[^>]+>" options:0 error:nil];
+    s = [tags stringByReplacingMatchesInString:s options:0 range:NSMakeRange(0, s.length) withTemplate:@" "];
+    NSRegularExpression *space = [NSRegularExpression regularExpressionWithPattern:@"[ \\t\\x0B\\f\\r\\n]+" options:0 error:nil];
+    s = [space stringByReplacingMatchesInString:s options:0 range:NSMakeRange(0, s.length) withTemplate:@" "];
+    return [s stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+}
 - (NSString *)lineForItem:(NSDictionary *)item reminder:(BOOL)reminder {
-    NSString *when = reminder ? [NSString stringWithFormat:@"%@", item[@"due"] ?: @""] : [NSString stringWithFormat:@"%@", item[@"date"] ?: @""];
-    NSString *clock = [NSString stringWithFormat:@"%@", item[@"time"] ?: @""];
-    if ([when isEqualToString:@"(null)"]) when = @"";
-    if ([clock isEqualToString:@"(null)"]) clock = @"";
-    NSString *title = [NSString stringWithFormat:@"%@", item[@"title"] ?: @""];
-    NSString *notes = [NSString stringWithFormat:@"%@", item[@"notes"] ?: @""];
-    if ([notes isEqualToString:@"(null)"]) notes = @"";
+    NSString *when = [self cleanCalText:reminder ? item[@"due"] : item[@"date"]];
+    NSString *clock = [self cleanCalText:item[@"time"]];
+    NSString *title = [self cleanCalText:item[@"title"]];
+    NSString *notes = [self cleanCalText:item[@"notes"]];
+    if (title.length == 0) title = reminder ? @"未命名提醒" : @"未命名日程";
+    // Cap notes — Exchange/Outlook dumps huge HTML that looks like garbage on a kiosk card.
+    if (notes.length > 80) notes = [[notes substringToIndex:80] stringByAppendingString:@"…"];
     NSMutableString *text = [NSMutableString string];
-    if (when.length || clock.length) [text appendFormat:@"%@ %@\n", when, clock];
+    if (when.length || clock.length) [text appendFormat:@"%@%@%@\n", when, (when.length && clock.length) ? @" " : @"", clock];
     [text appendString:title];
     if (notes.length) [text appendFormat:@"\n%@", notes];
     return text;
@@ -1819,24 +2033,33 @@ static NSString *RPHashObject(id obj) {
 - (NSDictionary *)eventRow:(EKEvent *)ev dayFmt:(NSDateFormatter *)dayFmt timeFmt:(NSDateFormatter *)timeFmt {
     NSString *when = ev.startDate ? [dayFmt stringFromDate:ev.startDate] : @"";
     NSString *clock = ev.allDay ? @"全天" : (ev.startDate ? [timeFmt stringFromDate:ev.startDate] : @"");
+    NSString *title = [self cleanCalText:ev.title];
     return @{
-        @"title": ev.title ?: @"未命名日程",
-        @"date": when,
-        @"time": clock,
-        @"notes": ev.notes ?: @"",
-        @"calendar": ev.calendar.title ?: @"",
+        @"title": title.length ? title : @"未命名日程",
+        @"date": when ?: @"",
+        @"time": clock ?: @"",
+        @"notes": [self cleanCalText:ev.notes],
+        @"calendar": [self cleanCalText:ev.calendar.title],
         @"sort": @([ev.startDate timeIntervalSince1970]),
         @"id": ev.eventIdentifier ?: @"",
     };
 }
 - (NSDictionary *)reminderRow:(EKReminder *)rem dayFmt:(NSDateFormatter *)dayFmt timeFmt:(NSDateFormatter *)timeFmt {
-    NSDate *due = rem.dueDateComponents ? [rem.dueDateComponents.calendar dateFromComponents:rem.dueDateComponents] : nil;
-    if (!due && rem.dueDateComponents) due = [[NSCalendar currentCalendar] dateFromComponents:rem.dueDateComponents];
+    // dueDateComponents.calendar is often nil on iOS 9 — always use currentCalendar + gregorian.
+    NSDate *due = nil;
+    if (rem.dueDateComponents) {
+        NSCalendar *compCal = rem.dueDateComponents.calendar ?: [NSCalendar currentCalendar];
+        if (compCal.calendarIdentifier == nil) {
+            compCal = [NSCalendar calendarWithIdentifier:NSCalendarIdentifierGregorian] ?: [NSCalendar currentCalendar];
+        }
+        due = [compCal dateFromComponents:rem.dueDateComponents];
+    }
+    NSString *title = [self cleanCalText:rem.title];
     return @{
-        @"title": rem.title ?: @"未命名提醒",
+        @"title": title.length ? title : @"未命名提醒",
         @"due": due ? [dayFmt stringFromDate:due] : @"",
         @"time": due ? [timeFmt stringFromDate:due] : @"",
-        @"notes": rem.notes ?: @"",
+        @"notes": [self cleanCalText:rem.notes],
         @"id": rem.calendarItemIdentifier ?: @"",
         @"completed": @(rem.completed),
         @"sort": @(due ? [due timeIntervalSince1970] : 0),
@@ -1848,14 +2071,22 @@ static NSString *RPHashObject(id obj) {
         self.pausedForAuth = NO;
         [self rpSetModalOpen:NO];
     }
-    NSCalendar *cal = [NSCalendar currentCalendar];
+    // Force Gregorian + Shanghai so weekday labels match what users expect on Chinese iPads.
+    NSCalendar *cal = [NSCalendar calendarWithIdentifier:NSCalendarIdentifierGregorian] ?: [NSCalendar currentCalendar];
+    cal.locale = [NSLocale localeWithLocaleIdentifier:@"zh_CN"];
+    cal.timeZone = [NSTimeZone localTimeZone];
     NSDate *start = [cal startOfDayForDate:[NSDate date]];
     NSDate *end = [cal dateByAddingUnit:NSCalendarUnitDay value:8 toDate:start options:0];
     NSDateFormatter *dayFmt = [[NSDateFormatter alloc] init];
+    dayFmt.calendar = cal;
     dayFmt.locale = [NSLocale localeWithLocaleIdentifier:@"zh_CN"];
-    dayFmt.dateFormat = @"M月d日 EEE";
+    dayFmt.timeZone = cal.timeZone;
+    // EEEE (全称) is more reliable than EEE on iOS 9 zh_CN for some region settings.
+    dayFmt.dateFormat = @"M月d日 EEEE";
     NSDateFormatter *timeFmt = [[NSDateFormatter alloc] init];
-    timeFmt.locale = [NSLocale localeWithLocaleIdentifier:@"zh_CN"];
+    timeFmt.calendar = cal;
+    timeFmt.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
+    timeFmt.timeZone = cal.timeZone;
     timeFmt.dateFormat = @"HH:mm";
     NSMutableArray *events = [NSMutableArray array];
     if (self.allowEvent) {
@@ -1953,7 +2184,7 @@ static NSString *RPHashObject(id obj) {
     [self.contentView addSubview:scroll];
     CGFloat y = 8;
     CGFloat w = b.size.width - 2*m;
-    UILabel *note = [self makeLabel:[RPTheme body:16] color:[RPTheme textDim]];
+    UILabel *note = [self makeLabel:[RPTheme readable:15] color:[RPTheme textDim]];
     note.numberOfLines = 2;
     NSMutableString *noteText = [NSMutableString stringWithString:@"日历来自这台 iPad，只能查看。提醒事项可以打勾，会写回系统并同步。"];
     if (self.askedEvent && !self.allowEvent) [noteText appendString:@" 日历未授权。"];
@@ -1983,7 +2214,7 @@ static NSString *RPHashObject(id obj) {
     }
     y = [self addSection:@"订阅" items:subscribed reminder:NO y:y width:w margin:m scroll:scroll];
     if (deviceToday.count == 0 && deviceLater.count == 0 && self.deviceReminders.count == 0 && subscribed.count == 0) {
-        UILabel *empty = [self makeLabel:[RPTheme body:22] color:[RPTheme textDim]];
+        UILabel *empty = [self makeLabel:[RPTheme readable:22] color:[RPTheme textDim]];
         empty.numberOfLines = 4;
         empty.text = self.calendarStarted && self.askedEvent
             ? @"系统日历和提醒事项里，这几天还是空的。若刚弹出授权，允许之后会自动出现。"
@@ -2005,13 +2236,14 @@ static NSString *RPHashObject(id obj) {
     for (id raw in items) {
         if (![raw isKindOfClass:[NSDictionary class]] || shown >= 8) break;
         UIView *card = [self makeCardTinted:shown accent:reminder ? [RPTheme tintOrange] : [RPTheme tintTeal]];
-        card.frame = CGRectMake(m, y, w, 78);
-        UILabel *lab = [self makeLabel:[RPTheme body:18] color:[RPTheme text]];
+        card.frame = CGRectMake(m, y, w, 90);
+        // Pixel fonts miss many CJK glyphs used in calendar titles → looks like 乱码/tofu.
+        UILabel *lab = [self makeLabel:[RPTheme readable:17] color:[RPTheme text]];
         lab.text = [self lineForItem:raw reminder:reminder];
-        lab.frame = CGRectMake(16, 8, w - 28, 62);
+        lab.frame = CGRectMake(16, 8, w - 28, 74);
         [card addSubview:lab];
         [scroll addSubview:card];
-        y += 88;
+        y += 100;
         shown++;
     }
     return y + 8;
@@ -2028,21 +2260,21 @@ static NSString *RPHashObject(id obj) {
         if (![raw isKindOfClass:[NSDictionary class]] || shown >= 12) break;
         BOOL done = [raw[@"completed"] boolValue];
         UIView *card = [self makeCardTinted:shown accent:[RPTheme tintOrange]];
-        card.frame = CGRectMake(m, y, w, 72);
+        card.frame = CGRectMake(m, y, w, 86);
         UIButton *check = [UIButton buttonWithType:UIButtonTypeSystem];
         check.frame = CGRectMake(8, 12, 52, 48);
-        check.titleLabel.font = [RPTheme title:32];
+        check.titleLabel.font = [RPTheme readable:28];
         [check setTitle:done ? @"已" : @"待" forState:UIControlStateNormal];
         [check setTitleColor:done ? [RPTheme ok] : [RPTheme text] forState:UIControlStateNormal];
         objc_setAssociatedObject(check, &kRPReminderID, raw[@"id"] ?: @"", OBJC_ASSOCIATION_COPY_NONATOMIC);
         [check addTarget:self action:@selector(onReminderCheck:) forControlEvents:UIControlEventTouchUpInside];
         [card addSubview:check];
-        UILabel *lab = [self makeLabel:[RPTheme body:18] color:done ? [RPTheme textDim] : [RPTheme text]];
+        UILabel *lab = [self makeLabel:[RPTheme readable:17] color:done ? [RPTheme textDim] : [RPTheme text]];
         lab.text = [self lineForItem:raw reminder:YES];
-        lab.frame = CGRectMake(64, 8, w - 80, 56);
+        lab.frame = CGRectMake(64, 8, w - 80, 70);
         [card addSubview:lab];
         [scroll addSubview:card];
-        y += 82;
+        y += 96;
         shown++;
     }
     return y + 8;

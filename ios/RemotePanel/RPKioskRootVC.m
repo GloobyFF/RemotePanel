@@ -566,12 +566,31 @@ static BOOL RPDefaultUseProxy(NSString *pid) { return RPLocalDefaultUseProxy(pid
 - (void)dwellTick {
     if (self.pageTransitioning) return;
     self.dwellLeft -= 0.25;
+    // Warm the next page's cover art so fly-in can start with images already in cache.
+    if (self.dwellLeft <= 12.0 && self.dwellLeft > 11.5) {
+        [self prefetchUpcomingPageImages];
+    }
     if (self.dwellLeft <= 2.4) {
         [self nextPage];
         return;
     }
     [self updateProgress];
     self.indexLabel.text = [NSString stringWithFormat:@"%ld/%lu · %.0fs", (long)(self.index+1), (unsigned long)self.pages.count, ceil(self.dwellLeft)];
+}
+- (void)prefetchUpcomingPageImages {
+    if (!self.lastState || self.pages.count < 2) return;
+    NSInteger next = self.index + 1;
+    if (next >= (NSInteger)self.pages.count) next = 0;
+    RPPageDef *def = self.pages[next];
+    RPPrefetchImagesForPage(def.pid, self.lastState, self.baseURL ?: @"");
+}
+- (void)didReceiveMemoryWarning {
+    [super didReceiveMemoryWarning];
+    RPPurgeImageCache();
+    if ([self.currentPage isKindOfClass:[RPBasePageVC class]]) {
+        // Keep the on-screen page; only drop non-visible bitmaps via cache purge above.
+        (void)self.currentPage;
+    }
 }
 
 - (void)updateProgress {
