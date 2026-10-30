@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="rp_bg">#142D78</color>
+    <color name="rp_card">#1D4EC4</color>
+    <color name="rp_border">#8EE7FF</color>
+    <color name="rp_accent">#5EF0FF</color>
+    <color name="rp_text">#FFFFFF</color>
+    <color name="rp_text_dim">#B8E7FF</color>
+    <color name="rp_ok">#3DFF8A</color>
+    <color name="rp_warn">#FFE13A</color>
+    <color name="rp_bad">#FF4D6A</color>
+    <color name="rp_black">#000000</color>
+</resources>

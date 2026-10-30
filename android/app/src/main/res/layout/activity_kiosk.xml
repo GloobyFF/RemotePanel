@@ -1,0 +1,110 @@
+<?xml version="1.0" encoding="utf-8"?>
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/root"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@color/rp_bg"
+    android:keepScreenOn="true">
+
+    <FrameLayout
+        android:id="@+id/pageHost"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:layout_marginTop="88dp"
+        android:layout_marginBottom="4dp" />
+
+    <LinearLayout
+        android:id="@+id/chrome"
+        android:layout_width="match_parent"
+        android:layout_height="88dp"
+        android:gravity="center_vertical"
+        android:orientation="horizontal"
+        android:paddingStart="16dp"
+        android:paddingEnd="12dp">
+
+        <TextView
+            android:id="@+id/titleLabel"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:ellipsize="end"
+            android:maxLines="1"
+            android:textColor="@color/rp_text"
+            android:textSize="28sp"
+            android:textStyle="bold" />
+
+        <TextView
+            android:id="@+id/statusPill"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:background="@color/rp_ok"
+            android:paddingHorizontal="10dp"
+            android:paddingVertical="4dp"
+            android:text="@string/live"
+            android:textColor="@color/rp_black"
+            android:textSize="14sp"
+            android:textStyle="bold" />
+
+        <TextView
+            android:id="@+id/indexLabel"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="10dp"
+            android:textColor="@color/rp_accent"
+            android:textSize="16sp" />
+
+        <TextView
+            android:id="@+id/clockLabel"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="10dp"
+            android:textColor="@color/rp_text_dim"
+            android:textSize="18sp" />
+
+        <ImageButton
+            android:id="@+id/settingsBtn"
+            android:layout_width="48dp"
+            android:layout_height="48dp"
+            android:layout_marginStart="4dp"
+            android:background="?attr/selectableItemBackgroundBorderless"
+            android:contentDescription="@string/settings"
+            android:src="@android:drawable/ic_menu_preferences"
+            android:tint="@color/rp_accent" />
+    </LinearLayout>
+
+    <View
+        android:id="@+id/progressTrack"
+        android:layout_width="match_parent"
+        android:layout_height="4dp"
+        android:layout_gravity="bottom"
+        android:background="@color/rp_border" />
+
+    <View
+        android:id="@+id/progressFill"
+        android:layout_width="0dp"
+        android:layout_height="4dp"
+        android:layout_gravity="bottom|start"
+        android:background="@color/rp_accent" />
+
+    <View
+        android:id="@+id/edgeLeft"
+        android:layout_width="72dp"
+        android:layout_height="match_parent"
+        android:layout_gravity="start"
+        android:background="@android:color/transparent" />
+
+    <View
+        android:id="@+id/edgeRight"
+        android:layout_width="72dp"
+        android:layout_height="match_parent"
+        android:layout_gravity="end"
+        android:background="@android:color/transparent" />
+
+    <View
+        android:id="@+id/chromePeek"
+        android:layout_width="match_parent"
+        android:layout_height="48dp"
+        android:layout_gravity="top"
+        android:background="@android:color/transparent"
+        android:visibility="gone" />
+</FrameLayout>

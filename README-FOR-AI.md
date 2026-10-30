@@ -1,6 +1,6 @@
 # RemotePanel 交接说明（给后续 AI） / Handoff for successor AIs
 
-更新日期 / Updated: **2026-10-30**（Asia/Shanghai）
+更新日期 / Updated: **2026-10-31**（Asia/Shanghai）
 
 本包路径（TeamC Mac mini）：
 - 目录：`/Users/teamc/Documents/RemotePanel-handoff-20261030/`
@@ -254,6 +254,9 @@ RemotePanel-handoff-20261030/
     build_install.sh        # 密码已剥离
     PROVISIONING-NOTES.txt
     README.txt
+  android/                  # Kotlin 家庭信息屏（P0，见 android/README.md）
+    app/src/main/...
+    gradlew
   server/                   # RemotePanelih5Standalone 瘦身版
     ipad/ipad_server.py
     core/
@@ -266,6 +269,19 @@ RemotePanel-handoff-20261030/
     若干小截图
   RemotePanel-handoff-20261030.zip
 ```
+
+---
+
+## 11b. Android 客户端（P0）
+
+同仓库 `android/`：Kotlin + View，**minSdk 28**，竖屏为主/支持横屏。P0 页：问候、天气（Open-Meteo）、新闻 RSS、本地相册、自定义 Web×N（≤8，全屏无 chrome）。**不依赖** `:9121`；本地 Prefs 管 dwell / 开关 / URL。
+
+```bash
+cd android && ./gradlew :app:assembleDebug
+# APK → app/build/outputs/apk/debug/app-debug.apk
+```
+
+细节见 `android/README.md`。
 
 ---
 
@@ -284,4 +300,5 @@ RemotePanel-handoff-20261030/
 - [ ] `RPKioskRootVC` roster 含「天气+VPS」，不含启用的 system/weekly/vps  
 - [ ] `curl` TeamC `:9121/api/h5/state` 返回 `weather` / `news.github_items` / `vps`  
 - [ ] 在 `.179` 用 `build_install.sh` 能装到 UDID 设备  
+- [ ] `android/` 存在且 `./gradlew :app:assembleDebug` 可通过  
 

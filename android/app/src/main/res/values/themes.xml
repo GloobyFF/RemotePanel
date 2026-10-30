@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.RemotePanel" parent="Theme.MaterialComponents.DayNight.NoActionBar">
+        <item name="colorPrimary">@color/rp_accent</item>
+        <item name="colorPrimaryVariant">@color/rp_card</item>
+        <item name="colorOnPrimary">@color/rp_black</item>
+        <item name="android:statusBarColor">@color/rp_bg</item>
+        <item name="android:navigationBarColor">@color/rp_bg</item>
+        <item name="android:windowBackground">@color/rp_bg</item>
+        <item name="android:textColorPrimary">@color/rp_text</item>
+    </style>
+    <style name="Theme.RemotePanel.Kiosk" parent="Theme.RemotePanel">
+        <item name="android:windowFullscreen">true</item>
+    </style>
+</resources>
