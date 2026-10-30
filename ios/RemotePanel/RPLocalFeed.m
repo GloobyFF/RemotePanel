@@ -23,6 +23,7 @@ NSString * const RPTickerProxyKey = @"RemotePanel.ticker.useProxy";
 NSString * const RPHelloKeyKey = @"RemotePanel.hello.key";
 NSString * const RPHelloModelKey = @"RemotePanel.hello.model";
 NSString * const RPFeedProgressNotification = @"RPFeedProgress";
+NSString * const RPWebPagesDefaultsKey = @"RemotePanel.webPages";
 
 NSString *RPLocalDefaultProxy(void) { return @"socks5h://192.168.28.77:1080"; }
 NSString *RPLocalDefaultVPSURL(void) { return @"https://igobeat.com/api/traffic"; }
@@ -162,6 +163,69 @@ NSArray *RPLocalPageCatalog(void) {
 static NSString *RPString(id value) {
     if (![value isKindOfClass:[NSString class]]) return @"";
     return [(NSString *)value stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+}
+
+NSUInteger RPWebPagesMaxCount(void) { return 8; }
+
+NSString *RPWebPagesMakeId(void) {
+    return [NSString stringWithFormat:@"web-%ld", (long)llround([[NSDate date] timeIntervalSince1970] * 1000.0)];
+}
+
+NSMutableDictionary *RPWebPageNormalize(NSDictionary *raw, NSInteger indexHint) {
+    NSMutableDictionary *page = [NSMutableDictionary dictionary];
+    NSString *pid = RPString(raw[@"id"]);
+    if (![pid hasPrefix:@"web-"]) pid = RPWebPagesMakeId();
+    NSString *title = RPString(raw[@"title"]);
+    if (title.length == 0) title = [NSString stringWithFormat:@"网页 %ld", (long)MAX(1, indexHint + 1)];
+    NSString *url = RPString(raw[@"url"]);
+    if ([url hasPrefix:@"webcal://"]) url = [@"https://" stringByAppendingString:[url substringFromIndex:9]];
+    NSInteger dwell = [raw[@"dwell"] respondsToSelector:@selector(integerValue)] ? [raw[@"dwell"] integerValue] : 60;
+    if (dwell <= 0) dwell = 60;
+    if (dwell < 8) dwell = 8;
+    if (dwell > 3600) dwell = 3600;
+    BOOL enabled = [raw[@"enabled"] respondsToSelector:@selector(boolValue)] ? [raw[@"enabled"] boolValue] : NO;
+    if (url.length == 0) enabled = NO;
+    page[@"id"] = pid;
+    page[@"title"] = title;
+    page[@"url"] = url;
+    page[@"dwell"] = @(dwell);
+    page[@"enabled"] = @(enabled);
+    return page;
+}
+
+NSArray *RPWebPagesLoad(void) {
+    id raw = [[NSUserDefaults standardUserDefaults] objectForKey:RPWebPagesDefaultsKey];
+    if (![raw isKindOfClass:[NSArray class]]) return @[];
+    NSMutableArray *out = [NSMutableArray array];
+    NSInteger i = 0;
+    for (id item in (NSArray *)raw) {
+        if (![item isKindOfClass:[NSDictionary class]]) continue;
+        [out addObject:RPWebPageNormalize(item, i)];
+        if (out.count >= RPWebPagesMaxCount()) break;
+        i++;
+    }
+    return out;
+}
+
+void RPWebPagesSave(NSArray *pages) {
+    NSMutableArray *out = [NSMutableArray array];
+    NSInteger i = 0;
+    for (id item in pages ?: @[]) {
+        if (![item isKindOfClass:[NSDictionary class]]) continue;
+        [out addObject:RPWebPageNormalize(item, i)];
+        if (out.count >= RPWebPagesMaxCount()) break;
+        i++;
+    }
+    [[NSUserDefaults standardUserDefaults] setObject:out forKey:RPWebPagesDefaultsKey];
+    [[NSUserDefaults standardUserDefaults] synchronize];
+}
+
+NSDictionary *RPWebPageFind(NSString *pageId) {
+    if (pageId.length == 0) return nil;
+    for (NSDictionary *page in RPWebPagesLoad()) {
+        if ([page[@"id"] isEqualToString:pageId]) return page;
+    }
+    return nil;
 }
 
 static NSString *RPDecode(NSString *text) {
@@ -1310,6 +1374,8 @@ static NSString * const RPDwellOverrideDefaultsKey = @"RemotePanel.dwellOverride
         @"refresh_choices": choices,
         @"refresh_titles": RPLocalRefreshChoiceTitles(),
         @"pages": pages,
+        @"web_pages": RPWebPagesLoad(),
+        @"web_pages_max": @(RPWebPagesMaxCount()),
     };
 }
 
@@ -1378,6 +1444,11 @@ static NSString * const RPDwellOverrideDefaultsKey = @"RemotePanel.dwellOverride
                 if (feed.length && sec >= 60) [ud setDouble:sec forKey:[RPRefreshPrefix stringByAppendingString:feed]];
             }
         }
+    }
+    // Only replace when the browser payload includes web_pages (avoid wiping on old clients).
+    if ([doc objectForKey:@"web_pages"]) {
+        NSArray *webPages = [doc[@"web_pages"] isKindOfClass:[NSArray class]] ? doc[@"web_pages"] : @[];
+        RPWebPagesSave(webPages);
     }
     [ud synchronize];
     [self markCacheStale];

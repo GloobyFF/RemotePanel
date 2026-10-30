@@ -1900,7 +1900,7 @@ static NSString *RPHashObject(id obj) {
 - (void)applyState:(NSDictionary *)state baseURL:(NSString *)baseURL { (void)state; (void)baseURL; }
 @end
 
-#pragma mark - Web fallback
+#pragma mark - Web fallback (legacy H5 template)
 
 @interface RPWebFallbackPageVC () <WKNavigationDelegate>
 @property (nonatomic, strong) WKWebView *web;
@@ -1929,6 +1929,124 @@ static NSString *RPHashObject(id obj) {
     [self.web loadRequest:[NSURLRequest requestWithURL:[NSURL URLWithString:url]]];
 }
 - (void)pageDidDisappear {
+}
+@end
+
+#pragma mark - Custom fullscreen Web page
+
+@interface RPWebPageVC () <WKNavigationDelegate>
+@property (nonatomic, strong) WKWebView *web;
+@property (nonatomic, strong) UILabel *statusLabel;
+@property (nonatomic, copy) NSString *lastURL;
+@property (nonatomic, assign) BOOL loading;
+@end
+
+@implementation RPWebPageVC
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.view.backgroundColor = [UIColor blackColor];
+    self.contentView.backgroundColor = [UIColor blackColor];
+    WKWebViewConfiguration *cfg = [[WKWebViewConfiguration alloc] init];
+    if ([cfg respondsToSelector:@selector(setAllowsInlineMediaPlayback:)]) {
+        cfg.allowsInlineMediaPlayback = YES;
+    }
+    self.web = [[WKWebView alloc] initWithFrame:self.contentView.bounds configuration:cfg];
+    self.web.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    self.web.navigationDelegate = self;
+    self.web.opaque = YES;
+    self.web.backgroundColor = [UIColor blackColor];
+    if ([self.web respondsToSelector:@selector(scrollView)]) {
+        self.web.scrollView.backgroundColor = [UIColor blackColor];
+        self.web.scrollView.bounces = NO;
+    }
+    // Keep left/right 12% strips free of web touch so kiosk edge-tap still flips pages.
+    // (Root VC gesture is on self.view; WKWebView would otherwise eat taps.)
+    self.web.userInteractionEnabled = YES;
+    [self.contentView addSubview:self.web];
+
+    self.statusLabel = [self makeLabel:[RPTheme readable:22] color:[UIColor colorWithWhite:0.85 alpha:1]];
+    self.statusLabel.textAlignment = NSTextAlignmentCenter;
+    self.statusLabel.numberOfLines = 0;
+    self.statusLabel.hidden = YES;
+    self.statusLabel.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    [self.contentView addSubview:self.statusLabel];
+}
+- (void)viewDidLayoutSubviews {
+    [super viewDidLayoutSubviews];
+    self.web.frame = self.contentView.bounds;
+    self.statusLabel.frame = UIEdgeInsetsInsetRect(self.contentView.bounds, UIEdgeInsetsMake(40, 40, 40, 40));
+}
+- (void)pageWillAppear {
+    // No fly-in — fullscreen web should appear instantly (do not call super).
+    [self reloadConfiguredURL];
+}
+- (void)pageDidDisappear {
+    [self.web stopLoading];
+    // Drop document to free memory on iPad 3; next appear reloads.
+    if (self.lastURL.length) {
+        [self.web loadHTMLString:@"" baseURL:nil];
+        self.lastURL = nil;
+    }
+    [super pageDidDisappear];
+}
+- (void)applyState:(NSDictionary *)state baseURL:(NSString *)baseURL {
+    (void)state; (void)baseURL;
+    [self reloadConfiguredURL];
+}
+- (void)reloadConfiguredURL {
+    NSDictionary *cfg = RPWebPageFind(self.pageId);
+    NSString *raw = [cfg[@"url"] isKindOfClass:[NSString class]] ? cfg[@"url"] : @"";
+    raw = [raw stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (raw.length == 0) {
+        self.statusLabel.hidden = NO;
+        self.statusLabel.text = @"还没有填写网址\n长按屏幕打开设置 → 自定义网页";
+        self.web.hidden = YES;
+        return;
+    }
+    if (![raw hasPrefix:@"http://"] && ![raw hasPrefix:@"https://"]) {
+        raw = [@"http://" stringByAppendingString:raw];
+    }
+    if ([raw isEqualToString:self.lastURL] && !self.loading) {
+        self.web.hidden = NO;
+        self.statusLabel.hidden = YES;
+        return;
+    }
+    NSURL *url = [NSURL URLWithString:raw];
+    if (!url) {
+        self.statusLabel.hidden = NO;
+        self.statusLabel.text = [NSString stringWithFormat:@"网址无效\n%@", raw];
+        self.web.hidden = YES;
+        return;
+    }
+    self.lastURL = raw;
+    self.web.hidden = NO;
+    self.statusLabel.hidden = NO;
+    self.statusLabel.text = @"正在打开网页…";
+    self.loading = YES;
+    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
+    req.cachePolicy = NSURLRequestReloadIgnoringLocalCacheData;
+    req.timeoutInterval = 25;
+    [self.web loadRequest:req];
+}
+- (void)webView:(WKWebView *)webView didFinishNavigation:(WKNavigation *)navigation {
+    self.loading = NO;
+    self.statusLabel.hidden = YES;
+}
+- (void)webView:(WKWebView *)webView didFailNavigation:(WKNavigation *)navigation withError:(NSError *)error {
+    [self showWebFail:error];
+}
+- (void)webView:(WKWebView *)webView didFailProvisionalNavigation:(WKNavigation *)navigation withError:(NSError *)error {
+    [self showWebFail:error];
+}
+- (void)showWebFail:(NSError *)error {
+    self.loading = NO;
+    if (error.code == NSURLErrorCancelled) return;
+    self.statusLabel.hidden = NO;
+    self.statusLabel.text = [NSString stringWithFormat:@"打不开这个网页\n%@", error.localizedDescription ?: @"网络错误"];
+}
+- (void)playPageIntro { /* fullscreen web: no motion */ }
+- (void)playPageOutro:(void (^)(void))done {
+    if (done) done();
 }
 @end
 
@@ -2463,9 +2581,13 @@ static UIColor *RPMoveColor(double percent) {
 #pragma mark - Factory
 
 @implementation RPPageFactory
++ (BOOL)isWebPageId:(NSString *)pid {
+    return [pid hasPrefix:@"web-"];
+}
 + (UIViewController<RPPage> *)pageForId:(NSString *)pid title:(NSString *)title {
     UIViewController<RPPage> *vc = nil;
-    if ([pid isEqualToString:@"hello"]) vc = [[RPHelloPageVC alloc] init];
+    if ([self isWebPageId:pid]) vc = [[RPWebPageVC alloc] init];
+    else if ([pid isEqualToString:@"hello"]) vc = [[RPHelloPageVC alloc] init];
     else if ([pid isEqualToString:@"weather"]) { RPWeatherPageVC *w=[[RPWeatherPageVC alloc] init]; w.weekly=NO; vc=w; }
     else if ([pid isEqualToString:@"weather-weekly"]) { RPWeatherPageVC *w=[[RPWeatherPageVC alloc] init]; w.weekly=YES; vc=w; }
     else if ([pid isEqualToString:@"system"]) vc = [[RPSystemPageVC alloc] init];

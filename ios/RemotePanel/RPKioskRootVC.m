@@ -92,6 +92,19 @@ static BOOL RPDefaultUseProxy(NSString *pid) { return RPLocalDefaultUseProxy(pid
 @property (nonatomic, strong) NSMutableArray *pageProxySwitches;  // UISwitch or NSNull
 @property (nonatomic, strong) NSMutableArray *pageRefreshControls; // UISegmentedControl or NSNull
 @property (nonatomic, strong) NSMutableArray *settingsDefs;       // RPPageDef mirrors
+@property (nonatomic, strong) NSMutableArray *webDraftPages;      // editable web page dicts in settings
+@property (nonatomic, strong) NSMutableArray *webTitleFields;
+@property (nonatomic, strong) NSMutableArray *webURLFields;
+@property (nonatomic, strong) NSMutableArray *webDwellFields;
+@property (nonatomic, strong) NSMutableArray *webEnableSwitches;
+@property (nonatomic, strong) UIView *webPagesSectionHost;        // rows container inside settings scroll
+@property (nonatomic, assign) CGFloat webPagesSectionY;
+@property (nonatomic, strong) UIView *edgeLeft;
+@property (nonatomic, strong) UIView *edgeRight;
+@property (nonatomic, strong) UIView *chromePeek;                 // invisible long-press strip when chrome hidden
+@property (nonatomic, assign) BOOL chromeHidden;
+@property (nonatomic, strong) NSLayoutConstraint *pageHostTop;
+@property (nonatomic, strong) NSLayoutConstraint *pageHostBottom;
 @property (nonatomic, copy) NSString *themeDayName;
 @end
 
@@ -132,6 +145,11 @@ static BOOL RPDefaultUseProxy(NSString *pid) { return RPLocalDefaultUseProxy(pid
     self.pollTimer = [NSTimer scheduledTimerWithTimeInterval:30.0 target:self selector:@selector(pollNow) userInfo:nil repeats:YES];
 }
 
+static NSString *RPStringish(id value) {
+    if (![value isKindOfClass:[NSString class]]) return @"";
+    return [(NSString *)value stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+}
+
 - (void)buildMasterRoster {
     // Native roster — printer merged to one dense page
     NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
@@ -151,23 +169,48 @@ static BOOL RPDefaultUseProxy(NSString *pid) { return RPLocalDefaultUseProxy(pid
         if (pd > 0) d.dwell = pd;
         [arr addObject:d];
     }
+    for (NSDictionary *w in RPWebPagesLoad()) {
+        RPPageDef *d = [[RPPageDef alloc] init];
+        d.pid = w[@"id"];
+        d.title = w[@"title"];
+        d.dwell = [w[@"dwell"] integerValue];
+        d.enabled = [w[@"enabled"] boolValue] && RPStringish(w[@"url"]).length > 0;
+        [arr addObject:d];
+    }
     self.allDefs = arr;
 }
 
 - (void)rebuildEnabledPages {
+    [self buildMasterRoster];
     NSMutableArray *en = [NSMutableArray array];
     for (RPPageDef *d in self.allDefs) {
-        NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
-        NSString *ek = [kPageEnabledPrefix stringByAppendingString:d.pid];
-        if ([ud objectForKey:ek] == nil) d.enabled = YES;
-        else d.enabled = [ud boolForKey:ek];
+        if ([RPPageFactory isWebPageId:d.pid]) {
+            NSDictionary *w = RPWebPageFind(d.pid);
+            d.enabled = [w[@"enabled"] boolValue] && RPStringish(w[@"url"]).length > 0;
+            d.dwell = [w[@"dwell"] integerValue] > 0 ? [w[@"dwell"] integerValue] : 60;
+            d.title = w[@"title"] ?: d.title;
+        } else {
+            NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+            NSString *ek = [kPageEnabledPrefix stringByAppendingString:d.pid];
+            if ([ud objectForKey:ek] == nil) d.enabled = YES;
+            else d.enabled = [ud boolForKey:ek];
+        }
         if (d.enabled) [en addObject:d];
     }
     if (en.count == 0 && self.allDefs.count) {
-        // Never allow empty rotate — force first page on
-        RPPageDef *d = self.allDefs[0];
-        d.enabled = YES;
-        [en addObject:d];
+        // Never allow empty rotate — force first built-in page on
+        for (RPPageDef *d in self.allDefs) {
+            if (![RPPageFactory isWebPageId:d.pid]) {
+                d.enabled = YES;
+                [en addObject:d];
+                break;
+            }
+        }
+        if (en.count == 0) {
+            RPPageDef *d = self.allDefs[0];
+            d.enabled = YES;
+            [en addObject:d];
+        }
     }
     self.pages = en;
 }
@@ -290,7 +333,13 @@ static BOOL RPDefaultUseProxy(NSString *pid) { return RPLocalDefaultUseProxy(pid
     [self.view addConstraints:[NSLayoutConstraint constraintsWithVisualFormat:@"H:|-16-[_chrome]-16-|" options:0 metrics:nil views:views]];
     [self.view addConstraints:[NSLayoutConstraint constraintsWithVisualFormat:@"H:|-0-[_pageHost]-0-|" options:0 metrics:nil views:views]];
     [self.view addConstraints:[NSLayoutConstraint constraintsWithVisualFormat:@"H:|-0-[_progressTrack]-0-|" options:0 metrics:nil views:views]];
-    [self.view addConstraints:[NSLayoutConstraint constraintsWithVisualFormat:@"V:|-8-[_chrome(72)][_pageHost]-0-[_progressTrack(4)]-0-|" options:0 metrics:nil views:views]];
+    [self.view addConstraints:[NSLayoutConstraint constraintsWithVisualFormat:@"V:|-8-[_chrome(72)]" options:0 metrics:nil views:views]];
+    [self.view addConstraints:[NSLayoutConstraint constraintsWithVisualFormat:@"V:[_progressTrack(4)]-0-|" options:0 metrics:nil views:views]];
+    // Normal: pageHost between chrome and progress. Web fullscreen: pin to edges (constants flipped in setKioskChromeHidden:).
+    self.pageHostTop = [NSLayoutConstraint constraintWithItem:self.pageHost attribute:NSLayoutAttributeTop relatedBy:NSLayoutRelationEqual toItem:self.chrome attribute:NSLayoutAttributeBottom multiplier:1 constant:0];
+    self.pageHostBottom = [NSLayoutConstraint constraintWithItem:self.pageHost attribute:NSLayoutAttributeBottom relatedBy:NSLayoutRelationEqual toItem:self.progressTrack attribute:NSLayoutAttributeTop multiplier:1 constant:0];
+    [self.view addConstraint:self.pageHostTop];
+    [self.view addConstraint:self.pageHostBottom];
     [self.titleLabel setContentCompressionResistancePriority:UILayoutPriorityDefaultLow forAxis:UILayoutConstraintAxisHorizontal];
     [self.indexLabel setContentCompressionResistancePriority:UILayoutPriorityDefaultLow forAxis:UILayoutConstraintAxisHorizontal];
     self.indexLabel.adjustsFontSizeToFitWidth = YES;
@@ -301,10 +350,88 @@ static BOOL RPDefaultUseProxy(NSString *pid) { return RPLocalDefaultUseProxy(pid
     [self.progressTrack addConstraint:[NSLayoutConstraint constraintWithItem:self.progressFill attribute:NSLayoutAttributeLeading relatedBy:NSLayoutRelationEqual toItem:self.progressTrack attribute:NSLayoutAttributeLeading multiplier:1 constant:0]];
     self.progressWidth = [NSLayoutConstraint constraintWithItem:self.progressFill attribute:NSLayoutAttributeWidth relatedBy:NSLayoutRelationEqual toItem:self.progressTrack attribute:NSLayoutAttributeWidth multiplier:0 constant:0];
     [self.view addConstraint:self.progressWidth];
+
+    // Edge catchers so WKWebView cannot swallow left/right page-flip taps.
+    self.edgeLeft = [[UIView alloc] initWithFrame:CGRectZero];
+    self.edgeRight = [[UIView alloc] initWithFrame:CGRectZero];
+    self.chromePeek = [[UIView alloc] initWithFrame:CGRectZero];
+    for (UIView *edge in @[self.edgeLeft, self.edgeRight, self.chromePeek]) {
+        edge.backgroundColor = [UIColor clearColor];
+        edge.userInteractionEnabled = YES;
+        [self.view addSubview:edge];
+        UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(onEdgeTap:)];
+        [edge addGestureRecognizer:tap];
+        UILongPressGestureRecognizer *lp = [[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(onLongPress:)];
+        lp.minimumPressDuration = 0.85;
+        [edge addGestureRecognizer:lp];
+    }
+    self.edgeLeft.tag = 1;
+    self.edgeRight.tag = 2;
+    self.chromePeek.tag = 3;
+    self.chromePeek.hidden = YES;
+}
+
+- (void)layoutEdgeCatchers {
+    CGFloat w = self.view.bounds.size.width;
+    CGFloat h = self.view.bounds.size.height;
+    CGFloat strip = MAX(72.0, w * 0.22);
+    // When chrome is visible, don't cover the top bar (settings / clock still tappable).
+    CGFloat top = self.chromeHidden ? 0 : CGRectGetMaxY(self.chrome.frame);
+    CGFloat bottom = self.chromeHidden ? h : CGRectGetMinY(self.progressTrack.frame);
+    if (bottom < top) bottom = h;
+    CGFloat eh = MAX(0, bottom - top);
+    self.edgeLeft.frame = CGRectMake(0, top, strip, eh);
+    self.edgeRight.frame = CGRectMake(w - strip, top, strip, eh);
+    self.chromePeek.frame = CGRectMake(0, 0, w, 44);
+    self.chromePeek.hidden = !self.chromeHidden;
+    [self.view bringSubviewToFront:self.edgeLeft];
+    [self.view bringSubviewToFront:self.edgeRight];
+    if (self.chromeHidden) [self.view bringSubviewToFront:self.chromePeek];
+    if (self.chrome && !self.chrome.hidden) [self.view bringSubviewToFront:self.chrome];
+    if (self.progressTrack && !self.progressTrack.hidden) [self.view bringSubviewToFront:self.progressTrack];
+    if (self.toast && !self.toast.hidden) [self.view bringSubviewToFront:self.toast];
+    if (self.settingsDim) [self.view bringSubviewToFront:self.settingsDim];
+    if (self.overlayDim) [self.view bringSubviewToFront:self.overlayDim];
+}
+
+- (void)onEdgeTap:(UITapGestureRecognizer *)gr {
+    if (gr.state != UIGestureRecognizerStateEnded) return;
+    if (self.settingsDim || self.overlayDim) return;
+    if (gr.view == self.edgeLeft) [self prevPage];
+    else if (gr.view == self.edgeRight) [self nextPage];
+}
+
+- (void)setKioskChromeHidden:(BOOL)hidden {
+    self.chromeHidden = hidden;
+    self.chrome.hidden = hidden;
+    self.progressTrack.hidden = hidden;
+    if (hidden) {
+        self.toast.hidden = YES;
+        self.toast.alpha = 0;
+        self.chromePeek.hidden = NO;
+        // Unpin from chrome/progress; fill the window.
+        [self.view removeConstraint:self.pageHostTop];
+        [self.view removeConstraint:self.pageHostBottom];
+        self.pageHostTop = [NSLayoutConstraint constraintWithItem:self.pageHost attribute:NSLayoutAttributeTop relatedBy:NSLayoutRelationEqual toItem:self.view attribute:NSLayoutAttributeTop multiplier:1 constant:0];
+        self.pageHostBottom = [NSLayoutConstraint constraintWithItem:self.pageHost attribute:NSLayoutAttributeBottom relatedBy:NSLayoutRelationEqual toItem:self.view attribute:NSLayoutAttributeBottom multiplier:1 constant:0];
+        [self.view addConstraint:self.pageHostTop];
+        [self.view addConstraint:self.pageHostBottom];
+    } else {
+        self.chromePeek.hidden = YES;
+        [self.view removeConstraint:self.pageHostTop];
+        [self.view removeConstraint:self.pageHostBottom];
+        self.pageHostTop = [NSLayoutConstraint constraintWithItem:self.pageHost attribute:NSLayoutAttributeTop relatedBy:NSLayoutRelationEqual toItem:self.chrome attribute:NSLayoutAttributeBottom multiplier:1 constant:0];
+        self.pageHostBottom = [NSLayoutConstraint constraintWithItem:self.pageHost attribute:NSLayoutAttributeBottom relatedBy:NSLayoutRelationEqual toItem:self.progressTrack attribute:NSLayoutAttributeTop multiplier:1 constant:0];
+        [self.view addConstraint:self.pageHostTop];
+        [self.view addConstraint:self.pageHostBottom];
+    }
+    [self.view layoutIfNeeded];
+    [self layoutEdgeCatchers];
 }
 
 - (void)viewDidLayoutSubviews {
     [super viewDidLayoutSubviews];
+    [self layoutEdgeCatchers];
     if (!self.toast.hidden) [self placeToast];
 }
 
@@ -542,14 +669,23 @@ static BOOL RPDefaultUseProxy(NSString *pid) { return RPLocalDefaultUseProxy(pid
     self.currentPage = page;
     self.titleLabel.text = def.title;
     self.indexLabel.text = [NSString stringWithFormat:@"%ld/%lu · %lds", (long)(idx+1), (unsigned long)self.pages.count, (long)[self dwellForDef:def]];
-    if (self.lastState) [page applyState:self.lastState baseURL:self.baseURL];
+    BOOL web = [RPPageFactory isWebPageId:def.pid];
+    [self setKioskChromeHidden:web];
+    if (self.lastState || web) [page applyState:self.lastState ?: @{} baseURL:self.baseURL ?: @""];
     [page pageWillAppear];
+    [self layoutEdgeCatchers];
 
     if (reset) [self restartDwell];
 }
 
 - (NSInteger)dwellForDef:(RPPageDef *)def {
     if (self.dwellOverride > 0) return self.dwellOverride;
+    if ([RPPageFactory isWebPageId:def.pid]) {
+        NSDictionary *w = RPWebPageFind(def.pid);
+        NSInteger d = [w[@"dwell"] integerValue];
+        if (d <= 0) d = def.dwell > 0 ? def.dwell : 60;
+        return MAX(8, d);
+    }
     return MAX(8, [self storedDwellForPid:def.pid template:def.dwell]);
 }
 
@@ -903,6 +1039,7 @@ static BOOL RPDefaultUseProxy(NSString *pid) { return RPLocalDefaultUseProxy(pid
     NSDictionary *sourceDefaults = RPSourceDefaults();
     CGFloat rowW = sheetW - 32;
     for (RPPageDef *d in self.allDefs) {
+        if ([RPPageFactory isWebPageId:d.pid]) continue;
         [self.settingsDefs addObject:d];
         BOOL hasSource = sourceDefaults[d.pid] != nil;
         BOOL greet = [d.pid isEqualToString:@"hello"];
@@ -1046,14 +1183,190 @@ static BOOL RPDefaultUseProxy(NSString *pid) { return RPLocalDefaultUseProxy(pid
         y += rowH + 8;
     }
 
+    UILabel *webSec = [[UILabel alloc] initWithFrame:CGRectMake(20, y, contentW - 160, 28)];
+    webSec.font = [RPTheme title:18]; webSec.textColor = [RPTheme accent];
+    webSec.text = @"自定义网页（全屏）";
+    [self.settingsScroll addSubview:webSec];
+    UIButton *addWeb = [UIButton buttonWithType:UIButtonTypeSystem];
+    addWeb.frame = CGRectMake(sheetW - 150, y - 2, 130, 32);
+    [addWeb setTitle:@"＋ 添加网页" forState:UIControlStateNormal];
+    addWeb.titleLabel.font = [RPTheme title:16];
+    [addWeb setTitleColor:[RPTheme ok] forState:UIControlStateNormal];
+    [addWeb addTarget:self action:@selector(addWebPageRow) forControlEvents:UIControlEventTouchUpInside];
+    [self.settingsScroll addSubview:addWeb];
+    y += 34;
+    UILabel *webHint = [[UILabel alloc] initWithFrame:CGRectMake(20, y, contentW, 40)];
+    webHint.font = [RPTheme small:13]; webHint.textColor = [RPTheme textDim];
+    webHint.numberOfLines = 2;
+    webHint.text = @"轮到该页时全屏打开网址，无顶栏。最多 8 个。左右边缘点按仍可翻页；顶部长按打开设置。";
+    [self.settingsScroll addSubview:webHint];
+    y += 44;
+
+    self.webDraftPages = [RPWebPagesLoad() mutableCopy] ?: [NSMutableArray array];
+    self.webTitleFields = [NSMutableArray array];
+    self.webURLFields = [NSMutableArray array];
+    self.webDwellFields = [NSMutableArray array];
+    self.webEnableSwitches = [NSMutableArray array];
+    self.webPagesSectionY = y;
+    self.webPagesSectionHost = [[UIView alloc] initWithFrame:CGRectMake(0, y, sheetW, 8)];
+    [self.settingsScroll addSubview:self.webPagesSectionHost];
+    [self rebuildWebPagesSettingsRows];
+    y = CGRectGetMaxY(self.webPagesSectionHost.frame) + 12;
+
     UILabel *hint = [[UILabel alloc] initWithFrame:CGRectMake(20, y, contentW, 72)];
     hint.font = [RPTheme small:13]; hint.textColor = [RPTheme textDim];
     hint.numberOfLines = 0;
+    hint.tag = 88001;
     hint.text = @"上面的「秒」是翻页停留。「数据更新」是多久重新拉一次。同一局域网的电脑浏览器打开 http://这台iPad的地址:8090/setup ，也可以改这里的全部设置。";
     [self.settingsScroll addSubview:hint];
     y += 84;
 
     self.settingsScroll.contentSize = CGSizeMake(sheetW, y + 20);
+}
+
+- (void)rebuildWebPagesSettingsRows {
+    if (!self.webPagesSectionHost || !self.settingsScroll) return;
+    for (UIView *v in [self.webPagesSectionHost.subviews copy]) [v removeFromSuperview];
+    [self.webTitleFields removeAllObjects];
+    [self.webURLFields removeAllObjects];
+    [self.webDwellFields removeAllObjects];
+    [self.webEnableSwitches removeAllObjects];
+    CGFloat sheetW = self.settingsSheet.bounds.size.width;
+    CGFloat rowW = sheetW - 32;
+    CGFloat y = 0;
+    for (NSUInteger i = 0; i < self.webDraftPages.count; i++) {
+        NSDictionary *page = self.webDraftPages[i];
+        UIView *row = [[UIView alloc] initWithFrame:CGRectMake(16, y, rowW, 118)];
+        row.backgroundColor = [RPTheme bg];
+        row.layer.cornerRadius = 8;
+        row.tag = (NSInteger)i;
+
+        UITextField *title = [[UITextField alloc] initWithFrame:CGRectMake(12, 10, rowW - 200, 32)];
+        title.backgroundColor = [RPTheme card];
+        title.textColor = [RPTheme text];
+        title.font = [RPTheme readable:16];
+        title.text = page[@"title"] ?: @"";
+        title.placeholder = @"标题";
+        title.layer.cornerRadius = 4;
+        title.leftView = [[UIView alloc] initWithFrame:CGRectMake(0,0,6,32)];
+        title.leftViewMode = UITextFieldViewModeAlways;
+        title.delegate = self;
+        [row addSubview:title];
+        [self.webTitleFields addObject:title];
+
+        UITextField *dwell = [[UITextField alloc] initWithFrame:CGRectMake(rowW - 168, 10, 64, 32)];
+        dwell.backgroundColor = [RPTheme card];
+        dwell.textColor = [RPTheme text];
+        dwell.font = [RPTheme mono:16];
+        dwell.keyboardType = UIKeyboardTypeNumberPad;
+        dwell.textAlignment = NSTextAlignmentCenter;
+        dwell.layer.cornerRadius = 4;
+        dwell.text = [NSString stringWithFormat:@"%ld", (long)MAX(8, [page[@"dwell"] integerValue])];
+        [row addSubview:dwell];
+        [self.webDwellFields addObject:dwell];
+        UILabel *secL = [[UILabel alloc] initWithFrame:CGRectMake(rowW - 100, 14, 20, 24)];
+        secL.font = [RPTheme small:13]; secL.textColor = [RPTheme textDim]; secL.text = @"秒";
+        [row addSubview:secL];
+
+        UISwitch *sw = [[UISwitch alloc] initWithFrame:CGRectMake(rowW - 74, 10, 51, 31)];
+        sw.on = [page[@"enabled"] boolValue];
+        sw.onTintColor = [RPTheme accent];
+        [row addSubview:sw];
+        [self.webEnableSwitches addObject:sw];
+
+        UITextField *url = [[UITextField alloc] initWithFrame:CGRectMake(12, 50, rowW - 100, 32)];
+        url.backgroundColor = [RPTheme card];
+        url.textColor = [RPTheme text];
+        url.font = [RPTheme mono:13];
+        url.autocapitalizationType = UITextAutocapitalizationTypeNone;
+        url.autocorrectionType = UITextAutocorrectionTypeNo;
+        url.keyboardType = UIKeyboardTypeURL;
+        url.delegate = self;
+        url.layer.cornerRadius = 4;
+        url.leftView = [[UIView alloc] initWithFrame:CGRectMake(0,0,6,32)];
+        url.leftViewMode = UITextFieldViewModeAlways;
+        url.text = page[@"url"] ?: @"";
+        url.placeholder = @"https://example.com";
+        [row addSubview:url];
+        [self.webURLFields addObject:url];
+
+        UIButton *del = [UIButton buttonWithType:UIButtonTypeSystem];
+        del.frame = CGRectMake(rowW - 80, 50, 68, 32);
+        [del setTitle:@"删除" forState:UIControlStateNormal];
+        del.titleLabel.font = [RPTheme readable:15];
+        [del setTitleColor:[RPTheme bad] forState:UIControlStateNormal];
+        del.tag = (NSInteger)i;
+        [del addTarget:self action:@selector(deleteWebPageRow:) forControlEvents:UIControlEventTouchUpInside];
+        [row addSubview:del];
+
+        UILabel *note = [[UILabel alloc] initWithFrame:CGRectMake(12, 88, rowW - 24, 22)];
+        note.font = [RPTheme small:12];
+        note.textColor = [RPTheme textDim];
+        note.text = @"空网址不能启用。保存后按停留秒数全屏轮播。";
+        [row addSubview:note];
+
+        [self.webPagesSectionHost addSubview:row];
+        y += 126;
+    }
+    if (self.webDraftPages.count == 0) {
+        UILabel *empty = [[UILabel alloc] initWithFrame:CGRectMake(20, 0, rowW, 36)];
+        empty.font = [RPTheme readable:15];
+        empty.textColor = [RPTheme textDim];
+        empty.text = @"还没有自定义网页，点右上角「添加网页」。";
+        [self.webPagesSectionHost addSubview:empty];
+        y = 44;
+    }
+    CGRect hostFrame = self.webPagesSectionHost.frame;
+    hostFrame.size.height = y;
+    self.webPagesSectionHost.frame = hostFrame;
+
+    UIView *hint = [self.settingsScroll viewWithTag:88001];
+    if (hint) {
+        CGRect hf = hint.frame;
+        hf.origin.y = CGRectGetMaxY(self.webPagesSectionHost.frame) + 12;
+        hint.frame = hf;
+        self.settingsScroll.contentSize = CGSizeMake(sheetW, CGRectGetMaxY(hf) + 20);
+    } else {
+        self.settingsScroll.contentSize = CGSizeMake(sheetW, CGRectGetMaxY(self.webPagesSectionHost.frame) + 100);
+    }
+}
+
+- (NSArray *)collectWebDraftFromFields {
+    NSMutableArray *out = [NSMutableArray array];
+    for (NSUInteger i = 0; i < self.webDraftPages.count; i++) {
+        NSMutableDictionary *base = [self.webDraftPages[i] mutableCopy] ?: [NSMutableDictionary dictionary];
+        if (i < self.webTitleFields.count) base[@"title"] = ((UITextField *)self.webTitleFields[i]).text ?: @"";
+        if (i < self.webURLFields.count) base[@"url"] = ((UITextField *)self.webURLFields[i]).text ?: @"";
+        if (i < self.webDwellFields.count) base[@"dwell"] = @([((UITextField *)self.webDwellFields[i]).text integerValue]);
+        if (i < self.webEnableSwitches.count) base[@"enabled"] = @(((UISwitch *)self.webEnableSwitches[i]).on);
+        if (![base[@"id"] isKindOfClass:[NSString class]] || ![base[@"id"] hasPrefix:@"web-"]) {
+            base[@"id"] = RPWebPagesMakeId();
+        }
+        [out addObject:RPWebPageNormalize(base, (NSInteger)i)];
+    }
+    return out;
+}
+
+- (void)addWebPageRow {
+    if (self.webDraftPages.count >= RPWebPagesMaxCount()) return;
+    self.webDraftPages = [[self collectWebDraftFromFields] mutableCopy] ?: [NSMutableArray array];
+    NSMutableDictionary *page = RPWebPageNormalize(@{
+        @"id": RPWebPagesMakeId(),
+        @"title": [NSString stringWithFormat:@"网页 %lu", (unsigned long)(self.webDraftPages.count + 1)],
+        @"url": @"",
+        @"dwell": @60,
+        @"enabled": @NO,
+    }, (NSInteger)self.webDraftPages.count);
+    [self.webDraftPages addObject:page];
+    [self rebuildWebPagesSettingsRows];
+}
+
+- (void)deleteWebPageRow:(UIButton *)sender {
+    self.webDraftPages = [[self collectWebDraftFromFields] mutableCopy] ?: [NSMutableArray array];
+    NSInteger idx = sender.tag;
+    if (idx < 0 || idx >= (NSInteger)self.webDraftPages.count) return;
+    [self.webDraftPages removeObjectAtIndex:(NSUInteger)idx];
+    [self rebuildWebPagesSettingsRows];
 }
 
 - (void)hideSettings {
@@ -1073,6 +1386,12 @@ static BOOL RPDefaultUseProxy(NSString *pid) { return RPLocalDefaultUseProxy(pid
     self.tickerField = nil;
     self.tickerProxySwitch = nil;
     self.tickerRefreshControl = nil;
+    self.webDraftPages = nil;
+    self.webTitleFields = nil;
+    self.webURLFields = nil;
+    self.webDwellFields = nil;
+    self.webEnableSwitches = nil;
+    self.webPagesSectionHost = nil;
 }
 
 - (BOOL)textFieldShouldReturn:(UITextField *)textField {
@@ -1136,6 +1455,9 @@ static BOOL RPDefaultUseProxy(NSString *pid) { return RPLocalDefaultUseProxy(pid
         if (idx >= 0 && idx < (NSInteger)choices.count) {
             [ud setDouble:[choices[idx] doubleValue] forKey:[RPRefreshPrefix stringByAppendingString:@"vps"]];
         }
+    }
+    if (self.webDraftPages) {
+        RPWebPagesSave([self collectWebDraftFromFields]);
     }
     [ud synchronize];
 

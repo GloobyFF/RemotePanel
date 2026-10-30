@@ -71,7 +71,11 @@ void RPPurgeImageCache(void);
 @end
 @interface RPWebFallbackPageVC : RPBasePageVC
 @end
+/** Fullscreen user-configured webpage (pageId prefix web-). */
+@interface RPWebPageVC : RPBasePageVC
+@end
 
 @interface RPPageFactory : NSObject
 + (UIViewController<RPPage> *)pageForId:(NSString *)pid title:(NSString *)title;
++ (BOOL)isWebPageId:(NSString *)pid;
 @end
