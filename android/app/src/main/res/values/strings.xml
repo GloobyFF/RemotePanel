@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">RemotePanel</string>
+    <string name="settings">设置</string>
+    <string name="live">LIVE</string>
+    <string name="stale">STALE</string>
+    <string name="loading">加载中…</string>
+    <string name="no_photos">相册里还没有照片，或未授予读取权限</string>
+    <string name="web_empty">还没有填写网址\n打开设置 → 自定义网页</string>
+    <string name="web_fail">打不开这个网页</string>
+    <string name="add_web_page">＋ 添加网页</string>
+    <string name="save">保存</string>
+    <string name="web_section">自定义网页（全屏）</string>
+    <string name="pages_section">页面 · 开关 / 停留</string>
+    <string name="dwell_global">全局停留秒数覆盖（0=各页各自）</string>
+    <string name="weather_city">天气城市</string>
+    <string name="news_rss">新闻 RSS</string>
+</resources>

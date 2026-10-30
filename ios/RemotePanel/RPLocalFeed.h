@@ -29,6 +29,15 @@ NSArray *RPLocalRefreshChoiceTitles(void);
 NSInteger RPLocalRefreshChoiceIndex(NSTimeInterval ttl);
 NSArray *RPLocalPageCatalog(void);
 
+/** Custom fullscreen WebView pages (max 8). Each: id/title/url/enabled/dwell. */
+extern NSString * const RPWebPagesDefaultsKey;
+NSUInteger RPWebPagesMaxCount(void);
+NSArray *RPWebPagesLoad(void);
+void RPWebPagesSave(NSArray *pages);
+NSDictionary *RPWebPageFind(NSString *pageId);
+NSString *RPWebPagesMakeId(void);
+NSMutableDictionary *RPWebPageNormalize(NSDictionary *raw, NSInteger indexHint);
+
 @interface RPLocalFeed : NSObject
 + (instancetype)sharedFeed;
 - (void)refreshWithCompletion:(void (^)(NSDictionary *state, NSError *error))completion;

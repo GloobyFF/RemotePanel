@@ -7,6 +7,7 @@
 | Path | Contents |
 |------|----------|
 | `ios/` | Native ObjC Xcode project (canonical build tree from `.179`) |
+| `android/` | Kotlin kiosk app (P0：问候/天气/新闻/相册/Web×N)，见 `android/README.md` |
 | `server/` | Slim copy of `RemotePanelih5Standalone` (port 9121 API) |
 | `extras/` | Optional appicon tarball, project map, small screenshots |
 | `RemotePanel-handoff-20261030.zip` | Archive of this whole folder (created after packaging) |

@@ -126,5 +126,8 @@ static const unsigned RPWeekPalette[7][4] = {
     if (!f) f = [self title:size];
     return f;
 }
++ (UIFont *)readable:(CGFloat)size {
+    return [UIFont systemFontOfSize:[self snap:size]];
+}
 
 @end

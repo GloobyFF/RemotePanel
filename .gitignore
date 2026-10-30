@@ -6,3 +6,18 @@ build/
 *.xcuserstate
 xcuserdata/
 .DS_Store
+
+__pycache__/
+*.pyc
+*.pyo
+
+# Android
+android/local.properties
+android/.gradle/
+android/**/build/
+android/*.iml
+android/.idea/
+*.apk
+*.aab
+*.ap_
+*.dex

@@ -1,6 +1,6 @@
 # RemotePanel 交接说明（给后续 AI） / Handoff for successor AIs
 
-更新日期 / Updated: **2026-10-30**（Asia/Shanghai）
+更新日期 / Updated: **2026-10-31**（Asia/Shanghai）
 
 本包路径（TeamC Mac mini）：
 - 目录：`/Users/teamc/Documents/RemotePanel-handoff-20261030/`
@@ -30,7 +30,7 @@
 | Display name | RemotePanel |
 | Team ID | `FLFYQXCCZM` |
 | CFBundleShortVersionString | `2.0` |
-| CFBundleVersion (build) | **`3`**（本包对应刚装上的版本） |
+| CFBundleVersion (build) | **`6`**（行情卡三栏布局：中间放大价） |
 | App Icon | `Images.xcassets/AppIcon.appiconset`（已嵌入） |
 
 Provisioning 细节见 `ios/PROVISIONING-NOTES.txt`。  
@@ -223,6 +223,13 @@ curl -sS 'http://192.168.28.12:9121/api/h5/state?rotate=1' | python3 -m json.too
 
 ## 10. 已知限制 / 下一步值得做的修复
 
+### 已在 build 5 处理
+- **自定义全屏网页**：设置 →「自定义网页」可添加最多 8 个；`RemotePanel.webPages`；轮到时隐藏顶栏/进度条，WKWebView 真全屏；按该页 dwell 切页；左右缘点按翻页；顶部长按开设置。`pageId` 前缀 `web-`。
+- **有图页飞入前预加载**（build 4）：intro 等封面；dwell 末段预取下一页。
+- **内存**（build 4）：解码上限 / NSCache / 离页释放 / 相册 FastFormat。
+- **日历乱码**（build 4）：系统字体 + ICS QP/GBK 解码。
+
+### 仍待处理
 - Build 只能在 `.179`；TeamC 上改完必须同步再编。
 - `ios-deploy` 路径绑死在某次 DerivedData；换机需改脚本。
 - `server/ipad/data` 媒体巨大，handoff 未收录；若要离线完整预览需另拷。
@@ -231,6 +238,7 @@ curl -sS 'http://192.168.28.12:9121/api/h5/state?rotate=1' | python3 -m json.too
 - `RPKioskRootVC.m.pre_capture_bak` 是备份，可忽略或删。
 - `build_install.sh` 的 `ROOT` 写死为 `.179` 路径；若在别的目录构建需改。
 - 截图 `extras/*.png` 多为改版前 roster（仍含 system/vps/weekly），仅作视觉参考。
+- 文档仍写「30s poll `/api/h5/state`」，实际 `pollNow` 走 `RPLocalFeed`（双轨待统一）。
 
 ---
 
@@ -246,6 +254,9 @@ RemotePanel-handoff-20261030/
     build_install.sh        # 密码已剥离
     PROVISIONING-NOTES.txt
     README.txt
+  android/                  # Kotlin 家庭信息屏（P0，见 android/README.md）
+    app/src/main/...
+    gradlew
   server/                   # RemotePanelih5Standalone 瘦身版
     ipad/ipad_server.py
     core/
@@ -261,6 +272,19 @@ RemotePanel-handoff-20261030/
 
 ---
 
+## 11b. Android 客户端（P0）
+
+同仓库 `android/`：Kotlin + View，**minSdk 28**，竖屏为主/支持横屏。页：问候、天气（Open-Meteo）、新闻 RSS、国内股票、比特币/加密、本地相册、自定义 Web×N（≤8，全屏无 chrome）。行情卡与 iOS 一致：中间放大现价，左右其它信息。**不依赖** `:9121`；本地 Prefs 管 dwell / 开关 / URL。
+
+```bash
+cd android && ./gradlew :app:assembleDebug
+# APK → app/build/outputs/apk/debug/app-debug.apk
+```
+
+细节见 `android/README.md`。
+
+---
+
 ## 12. 安全提醒
 
 - **不要**把 fangzhiling / teamc / vault 密码写入 README、脚本默认值或 git。
@@ -271,9 +295,10 @@ RemotePanel-handoff-20261030/
 
 ## 13. 快速自检清单
 
-- [ ] `ios/RemotePanel/Info.plist` → `CFBundleVersion` == 3  
+- [ ] `ios/RemotePanel/Info.plist` → `CFBundleVersion` == 6  
 - [ ] 存在 `AppIcon.appiconset` 且含 png  
 - [ ] `RPKioskRootVC` roster 含「天气+VPS」，不含启用的 system/weekly/vps  
 - [ ] `curl` TeamC `:9121/api/h5/state` 返回 `weather` / `news.github_items` / `vps`  
 - [ ] 在 `.179` 用 `build_install.sh` 能装到 UDID 设备  
+- [ ] `android/` 存在且 `./gradlew :app:assembleDebug` 可通过  
 

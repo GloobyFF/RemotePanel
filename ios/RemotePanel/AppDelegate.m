@@ -1,5 +1,6 @@
 #import "AppDelegate.h"
 #import "RPKioskRootVC.h"
+#import "RPPages.h"
 #import "RPTheme.h"
 
 @implementation AppDelegate
@@ -12,6 +13,10 @@
     [self.window makeKeyAndVisible];
     [UIApplication sharedApplication].idleTimerDisabled = YES;
     return YES;
+}
+
+- (void)applicationDidReceiveMemoryWarning:(UIApplication *)application {
+    RPPurgeImageCache();
 }
 
 @end

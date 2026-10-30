@@ -1,19 +1,76 @@
-"""Pull an ICS subscription into schedule.json (events + to-do reminders)."""
+"""Pull an ICS subscription into schedule.json (events + to-do reminders).
+
+Handles common Chinese calendar export pitfalls that show up as 乱码:
+- whole-file GBK / GB18030 (mis-decoded as UTF-8)
+- SUMMARY;CHARSET=...;ENCODING=QUOTED-PRINTABLE:=E4=BC=9A...
+- RFC 5545 folded lines
+"""
 
 from __future__ import annotations
 
 import hashlib
 import json
 import os
+import quopri
 import re
 from datetime import datetime
 from pathlib import Path
 
-from core.http_fetch import fetch_text
+from core.http_fetch import fetch_bytes
+
+
+def _decode_ics_bytes(raw: bytes) -> str:
+    if not raw:
+        return ""
+    if raw.startswith(b"\xef\xbb\xbf"):
+        raw = raw[3:]
+    candidate = ""
+    for encoding in ("utf-8", "gb18030", "gbk", "gb2312", "latin-1"):
+        try:
+            text = raw.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+        if not candidate:
+            candidate = text
+        if "BEGIN:VCALENDAR" in text.upper() or "BEGIN:VEVENT" in text.upper():
+            return text
+    return candidate or raw.decode("utf-8", "ignore")
 
 
 def _unfold(text: str) -> str:
     return re.sub(r"\r?\n[ \t]", "", text or "")
+
+
+def _charset_name(params: dict[str, str]) -> str:
+    name = (params.get("CHARSET") or "utf-8").strip().strip('"').lower()
+    if name in {"gb2312", "gbk", "cp936", "gb18030"}:
+        return "gb18030"
+    if name in {"utf8", "utf-8"}:
+        return "utf-8"
+    return name or "utf-8"
+
+
+def _decode_value(value: str, params: dict[str, str]) -> str:
+    value = str(value or "")
+    encoding = (params.get("ENCODING") or "").upper()
+    charset = _charset_name(params)
+    if "QUOTED-PRINTABLE" in encoding:
+        soft = value.replace("=\r\n", "").replace("=\n", "")
+        try:
+            raw = quopri.decodestring(soft.encode("ascii", "ignore"))
+            value = raw.decode(charset, "ignore")
+        except Exception:
+            try:
+                value = quopri.decodestring(soft.encode("utf-8", "ignore")).decode("utf-8", "ignore")
+            except Exception:
+                pass
+    elif charset not in {"utf-8", "utf8"} and value:
+        # Mis-transcoded GBK sitting in a latin-1-ish unicode string.
+        try:
+            value = value.encode("latin-1", "ignore").decode(charset, "ignore")
+        except Exception:
+            pass
+    return value
 
 
 def _unescape(value: str) -> str:
@@ -21,6 +78,21 @@ def _unescape(value: str) -> str:
     value = value.replace("\\n", "\n").replace("\\N", "\n")
     value = value.replace("\\,", ",").replace("\\;", ";").replace("\\\\", "\\")
     return value.strip()
+
+
+def _split_props(line: str) -> tuple[str, dict[str, str], str]:
+    if ":" not in line:
+        return "", {}, ""
+    left, value = line.split(":", 1)
+    parts = left.split(";")
+    key = (parts[0] or "").upper()
+    params: dict[str, str] = {}
+    for part in parts[1:]:
+        if "=" not in part:
+            continue
+        pk, pv = part.split("=", 1)
+        params[pk.upper()] = pv.strip().strip('"')
+    return key, params, value
 
 
 def _split_when(value: str) -> tuple[str, str]:
@@ -47,7 +119,7 @@ def parse_ics(text: str) -> tuple[list[dict], list[dict]]:
     kind = ""
     current: dict[str, str] = {}
     for raw_line in _unfold(text).splitlines():
-        line = raw_line.strip()
+        line = raw_line.strip("\r")
         if line == "BEGIN:VEVENT":
             kind, current = "event", {}
             continue
@@ -63,8 +135,10 @@ def parse_ics(text: str) -> tuple[list[dict], list[dict]]:
             continue
         if not kind or ":" not in line:
             continue
-        key, value = line.split(":", 1)
-        current[key.split(";", 1)[0].upper()] = value.strip()
+        key, params, value = _split_props(line)
+        if not key:
+            continue
+        current[key] = _unescape(_decode_value(value, params))
     return events, reminders
 
 
@@ -175,7 +249,8 @@ def sync_ics_file(schedule_path: Path, url: str, proxy: str = "") -> dict:
         _write(schedule_path, payload)
         return payload
     try:
-        text = fetch_text(url, timeout=25, proxy=proxy, headers={"User-Agent": "RemotePanel/1.0"})
+        raw = fetch_bytes(url, timeout=25, proxy=proxy, headers={"User-Agent": "RemotePanel/1.0"})
+        text = _decode_ics_bytes(raw)
         if "BEGIN:VCALENDAR" not in text.upper():
             raise RuntimeError("响应里没有 VCALENDAR")
         events, todos = parse_ics(text)
