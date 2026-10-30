@@ -2512,7 +2512,7 @@ static UIColor *RPMoveColor(double percent) {
     NSInteger n = (NSInteger)items.count;
     CGFloat gap = 8;
     CGFloat rowH = floor((scroll.bounds.size.height - gap * MAX(n - 1, 0) - 4) / MAX(n, 1));
-    if (rowH > 156) rowH = 156;
+    if (rowH > 168) rowH = 168;
     if (rowH < 118) rowH = 118;
     CGFloat sy = 0;
     NSInteger shown = 0;
@@ -2533,42 +2533,125 @@ static UIColor *RPMoveColor(double percent) {
         bar.backgroundColor = move;
         [card addGestureRecognizer:[[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(onQuoteTap:)]];
 
+        // Three columns: left meta · center maximized price · right change/range.
+        CGFloat padL = 14.0;
+        CGFloat padR = 12.0;
+        CGFloat sideW = floor(w * 0.26);
+        if (sideW < 120.0) sideW = 120.0;
+        if (sideW > 200.0) sideW = 200.0;
+        CGFloat leftX = padL;
+        CGFloat rightX = w - padR - sideW;
+        CGFloat centerX = leftX + sideW + 4.0;
+        CGFloat centerW = MAX(80.0, rightX - centerX - 4.0);
+        CGFloat topY = 8.0;
+        CGFloat botPad = 8.0;
+
         NSString *symbol = [item[@"symbol"] isKindOfClass:[NSString class]] ? item[@"symbol"] : @"";
+        NSString *nameText = [item[@"name"] isKindOfClass:[NSString class]] ? item[@"name"] : @"";
+        NSString *unit = [item[@"unit"] isKindOfClass:[NSString class]] ? item[@"unit"] : @"";
+        NSString *turn = RPTurnover([item[@"turnover"] doubleValue]);
+
         UILabel *name = [self makeLabel:[RPTheme title:22] color:[RPTheme text]];
-        name.textAlignment = NSTextAlignmentCenter;
-        name.text = symbol.length
-            ? [NSString stringWithFormat:@"%@   %@", [item[@"name"] isKindOfClass:[NSString class]] ? item[@"name"] : @"", symbol]
-            : ([item[@"name"] isKindOfClass:[NSString class]] ? item[@"name"] : @"");
-        name.frame = CGRectMake(12, 6, w - 24, 26);
+        name.textAlignment = NSTextAlignmentLeft;
+        name.adjustsFontSizeToFitWidth = YES;
+        name.minimumScaleFactor = 0.7;
+        name.numberOfLines = 1;
+        name.text = nameText.length ? nameText : symbol;
+        name.frame = CGRectMake(leftX, topY, sideW, 26);
         [card addSubview:name];
 
-        CGFloat metaY = rowH - 24;
-        UILabel *px = [self makeLabel:[RPTheme title:48] color:move];
+        UILabel *sym = [self makeLabel:[RPTheme body:16] color:[RPTheme textDim]];
+        sym.textAlignment = NSTextAlignmentLeft;
+        sym.text = symbol;
+        sym.frame = CGRectMake(leftX, topY + 26, sideW, 20);
+        [card addSubview:sym];
+
+        UILabel *openL = [self makeLabel:[RPTheme body:15] color:[RPTheme textDim]];
+        openL.textAlignment = NSTextAlignmentLeft;
+        openL.adjustsFontSizeToFitWidth = YES;
+        openL.minimumScaleFactor = 0.6;
+        openL.numberOfLines = 1;
+        openL.text = [NSString stringWithFormat:@"开 %@", RPGrouped([item[@"open"] doubleValue], frac)];
+        openL.frame = CGRectMake(leftX, rowH - botPad - 42, sideW, 20);
+        [card addSubview:openL];
+
+        UILabel *prevL = [self makeLabel:[RPTheme body:15] color:[RPTheme textDim]];
+        prevL.textAlignment = NSTextAlignmentLeft;
+        prevL.adjustsFontSizeToFitWidth = YES;
+        prevL.minimumScaleFactor = 0.6;
+        prevL.numberOfLines = 1;
+        NSString *prevLabel = crypto ? @"24h前" : @"昨收";
+        prevL.text = [NSString stringWithFormat:@"%@ %@", prevLabel, RPGrouped([item[@"prev"] doubleValue], frac)];
+        prevL.frame = CGRectMake(leftX, rowH - botPad - 22, sideW, 20);
+        [card addSubview:prevL];
+
+        CGFloat priceFont = MIN(92.0, MAX(44.0, rowH * 0.58));
+        UILabel *px = [self makeLabel:[RPTheme hero:priceFont] color:move];
         px.textAlignment = NSTextAlignmentCenter;
         px.adjustsFontSizeToFitWidth = YES;
-        px.minimumScaleFactor = 0.5;
-        NSString *unit = [item[@"unit"] isKindOfClass:[NSString class]] ? item[@"unit"] : @"";
-        px.text = [NSString stringWithFormat:@"%@ %@", RPGrouped(price, frac), unit];
-        px.frame = CGRectMake(12, 26, w - 24, MAX(36, metaY - 54));
+        px.minimumScaleFactor = 0.35;
+        px.numberOfLines = 1;
+        px.text = RPGrouped(price, frac);
+        px.frame = CGRectMake(centerX, 10, centerW, rowH - 36);
         [card addSubview:px];
 
-        UILabel *chg = [self makeLabel:[RPTheme title:22] color:move];
-        chg.textAlignment = NSTextAlignmentCenter;
-        chg.text = [NSString stringWithFormat:@"%@%%    %@", RPSigned(pct, 2), RPSigned(change, frac)];
-        chg.frame = CGRectMake(12, metaY - 26, w - 24, 24);
-        [card addSubview:chg];
+        UILabel *unitL = [self makeLabel:[RPTheme body:14] color:[RPTheme textDim]];
+        unitL.textAlignment = NSTextAlignmentCenter;
+        unitL.text = unit;
+        unitL.frame = CGRectMake(centerX, rowH - botPad - 18, centerW, 18);
+        [card addSubview:unitL];
 
-        UILabel *meta = [self makeLabel:[RPTheme body:16] color:[RPTheme textDim]];
-        meta.textAlignment = NSTextAlignmentCenter;
-        NSString *turn = RPTurnover([item[@"turnover"] doubleValue]);
-        NSString *deal = turn.length ? [NSString stringWithFormat:@"    %@ %@", crypto ? @"24h" : @"成交", turn] : @"";
-        meta.text = [NSString stringWithFormat:@"开 %@    高 %@    低 %@%@",
-            RPGrouped([item[@"open"] doubleValue], frac),
-            RPGrouped([item[@"high"] doubleValue], frac),
-            RPGrouped([item[@"low"] doubleValue], frac),
-            deal];
-        meta.frame = CGRectMake(12, metaY, w - 24, 22);
-        [card addSubview:meta];
+        UILabel *pctL = [self makeLabel:[RPTheme title:26] color:move];
+        pctL.textAlignment = NSTextAlignmentRight;
+        pctL.adjustsFontSizeToFitWidth = YES;
+        pctL.minimumScaleFactor = 0.6;
+        pctL.numberOfLines = 1;
+        pctL.text = [NSString stringWithFormat:@"%@%%", RPSigned(pct, 2)];
+        pctL.frame = CGRectMake(rightX, topY, sideW, 28);
+        [card addSubview:pctL];
+
+        UILabel *chgL = [self makeLabel:[RPTheme title:18] color:move];
+        chgL.textAlignment = NSTextAlignmentRight;
+        chgL.adjustsFontSizeToFitWidth = YES;
+        chgL.minimumScaleFactor = 0.6;
+        chgL.numberOfLines = 1;
+        chgL.text = RPSigned(change, frac);
+        chgL.frame = CGRectMake(rightX, topY + 28, sideW, 22);
+        [card addSubview:chgL];
+
+        UILabel *highL = [self makeLabel:[RPTheme body:15] color:[RPTheme textDim]];
+        highL.textAlignment = NSTextAlignmentRight;
+        highL.adjustsFontSizeToFitWidth = YES;
+        highL.minimumScaleFactor = 0.6;
+        highL.numberOfLines = 1;
+        highL.text = [NSString stringWithFormat:@"高 %@", RPGrouped([item[@"high"] doubleValue], frac)];
+        highL.frame = CGRectMake(rightX, rowH - botPad - 42, sideW, 20);
+        [card addSubview:highL];
+
+        UILabel *lowL = [self makeLabel:[RPTheme body:15] color:[RPTheme textDim]];
+        lowL.textAlignment = NSTextAlignmentRight;
+        lowL.adjustsFontSizeToFitWidth = YES;
+        lowL.minimumScaleFactor = 0.6;
+        lowL.numberOfLines = 1;
+        if (turn.length) {
+            lowL.text = [NSString stringWithFormat:@"%@ %@", crypto ? @"24h" : @"成交", turn];
+        } else {
+            lowL.text = [NSString stringWithFormat:@"低 %@", RPGrouped([item[@"low"] doubleValue], frac)];
+        }
+        lowL.frame = CGRectMake(rightX, rowH - botPad - 22, sideW, 20);
+        [card addSubview:lowL];
+
+        // If turnover took the bottom-right slot, still show 低 just above when space allows.
+        if (turn.length && rowH >= 140) {
+            UILabel *lowExtra = [self makeLabel:[RPTheme body:14] color:[RPTheme textDim]];
+            lowExtra.textAlignment = NSTextAlignmentRight;
+            lowExtra.adjustsFontSizeToFitWidth = YES;
+            lowExtra.minimumScaleFactor = 0.6;
+            lowExtra.numberOfLines = 1;
+            lowExtra.text = [NSString stringWithFormat:@"低 %@", RPGrouped([item[@"low"] doubleValue], frac)];
+            lowExtra.frame = CGRectMake(rightX, rowH - botPad - 62, sideW, 18);
+            [card addSubview:lowExtra];
+        }
 
         [scroll addSubview:card];
         sy += rowH + gap;

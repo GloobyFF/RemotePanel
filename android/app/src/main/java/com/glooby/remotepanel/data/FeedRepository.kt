@@ -25,10 +25,27 @@ data class WeatherState(
     val weekly: List<Triple<String, String, String>> // day, hi/lo, desc
 )
 
+data class QuoteItem(
+    val name: String,
+    val symbol: String,
+    val price: Double,
+    val percent: Double,
+    val change: Double,
+    val high: Double,
+    val low: Double,
+    val open: Double,
+    val prev: Double,
+    val turnover: Double,
+    val unit: String,
+    val market: String
+)
+
 data class PanelState(
     val hello: String = "",
     val weather: WeatherState? = null,
     val dailyNews: List<NewsItem> = emptyList(),
+    val stocks: List<QuoteItem> = emptyList(),
+    val crypto: List<QuoteItem> = emptyList(),
     val updatedAt: Long = System.currentTimeMillis(),
     val errors: List<String> = emptyList()
 )
@@ -39,6 +56,23 @@ object FeedRepository {
     var lastState: PanelState = PanelState()
         private set
 
+    private val coinTable = mapOf(
+        "btc" to ("BTC-USDT" to "比特币"),
+        "eth" to ("ETH-USDT" to "以太坊"),
+        "sol" to ("SOL-USDT" to "Solana"),
+        "bnb" to ("BNB-USDT" to "币安币"),
+        "xrp" to ("XRP-USDT" to "瑞波币"),
+        "doge" to ("DOGE-USDT" to "狗狗币"),
+        "ada" to ("ADA-USDT" to "艾达币"),
+        "trx" to ("TRX-USDT" to "波场"),
+        "ltc" to ("LTC-USDT" to "莱特币"),
+        "bch" to ("BCH-USDT" to "比特币现金"),
+        "dot" to ("DOT-USDT" to "波卡"),
+        "avax" to ("AVAX-USDT" to "Avalanche"),
+        "link" to ("LINK-USDT" to "Chainlink"),
+        "ton" to ("TON-USDT" to "TON"),
+    )
+
     suspend fun refresh(): PanelState = withContext(Dispatchers.IO) {
         coroutineScope {
             val errors = mutableListOf<String>()
@@ -48,11 +82,19 @@ object FeedRepository {
             val newsDef = async {
                 runCatching { fetchDailyNews() }.onFailure { errors += "新闻: ${it.message}" }.getOrNull()
             }
+            val stocksDef = async {
+                runCatching { fetchStocks() }.onFailure { errors += "股票: ${it.message}" }.getOrNull()
+            }
+            val cryptoDef = async {
+                runCatching { fetchCrypto() }.onFailure { errors += "加密: ${it.message}" }.getOrNull()
+            }
             val hello = buildHello()
             val state = PanelState(
                 hello = hello,
                 weather = weatherDef.await(),
                 dailyNews = newsDef.await().orEmpty(),
+                stocks = stocksDef.await().orEmpty(),
+                crypto = cryptoDef.await().orEmpty(),
                 errors = errors.toList()
             )
             lastState = state
@@ -203,4 +245,135 @@ object FeedRepository {
 
     private fun enc(s: String): String =
         URLEncoder.encode(s, StandardCharsets.UTF_8.name())
+
+    private fun splitSymbols(raw: String, limit: Int): List<String> =
+        raw.split(Regex("[,，\\s;；]+"))
+            .map { it.trim() }
+            .filter { it.isNotEmpty() }
+            .distinct()
+            .take(limit)
+
+    private fun stockSecid(token: String): Pair<String, String>? {
+        var s = token.lowercase().trim().replace(".", "")
+        val market: String
+        val code: String
+        when {
+            s.startsWith("sh") -> {
+                market = "1"; code = s.removePrefix("sh")
+            }
+            s.startsWith("sz") || s.startsWith("bj") -> {
+                market = "0"; code = s.drop(2)
+            }
+            s.length == 6 && s.all { it.isDigit() } -> {
+                market = if (s[0] == '6' || s[0] == '5' || s[0] == '9') "1" else "0"
+                code = s
+            }
+            else -> return null
+        }
+        if (code.length != 6 || !code.all { it.isDigit() }) return null
+        return "$market.$code" to code
+    }
+
+    private fun fetchStocks(): List<QuoteItem> {
+        val cached = cache["stocks"]
+        if (cached != null && System.currentTimeMillis() - cached.first < 30 * 60_000L) {
+            @Suppress("UNCHECKED_CAST")
+            return cached.second as List<QuoteItem>
+        }
+        val spec = Prefs.sourceUrl("stocks-cn").ifBlank { "600519,300750,600036,601318,002594" }
+        val secids = mutableListOf<String>()
+        val codes = mutableListOf<String>()
+        for (token in splitSymbols(spec, 8)) {
+            val pair = stockSecid(token) ?: continue
+            secids += pair.first
+            codes += pair.second
+        }
+        if (secids.isEmpty()) error("没有认出股票代码")
+        val url =
+            "https://push2.eastmoney.com/api/qt/ulist.np/get?fltt=2&fields=f2,f3,f4,f6,f12,f14,f15,f16,f17,f18&secids=${secids.joinToString(",")}"
+        val json = JSONObject(HttpClient.getString(url))
+        val diff = json.optJSONObject("data")?.optJSONArray("diff")
+            ?: error("没有解析到行情")
+        val byCode = mutableMapOf<String, QuoteItem>()
+        for (i in 0 until diff.length()) {
+            val row = diff.optJSONObject(i) ?: continue
+            val code = row.optString("f12")
+            if (code.isBlank()) continue
+            byCode[code] = QuoteItem(
+                name = row.optString("f14").ifBlank { code },
+                symbol = code,
+                price = row.optDouble("f2"),
+                percent = row.optDouble("f3"),
+                change = row.optDouble("f4"),
+                high = row.optDouble("f15"),
+                low = row.optDouble("f16"),
+                open = row.optDouble("f17"),
+                prev = row.optDouble("f18"),
+                turnover = row.optDouble("f6"),
+                unit = "元",
+                market = "stock"
+            )
+        }
+        val items = codes.mapNotNull { byCode[it] }
+        if (items.isEmpty()) error("没有解析到行情")
+        cache["stocks"] = System.currentTimeMillis() to items
+        return items
+    }
+
+    private fun fetchCrypto(): List<QuoteItem> {
+        val cached = cache["crypto"]
+        if (cached != null && System.currentTimeMillis() - cached.first < 30 * 60_000L) {
+            @Suppress("UNCHECKED_CAST")
+            return cached.second as List<QuoteItem>
+        }
+        val spec = Prefs.sourceUrl("crypto").ifBlank { "btc,eth,sol,bnb,xrp" }
+        val wanted = mutableListOf<Triple<String, String, String>>() // inst, name, symbol
+        for (token in splitSymbols(spec, 8)) {
+            val key = token.lowercase()
+            val known = coinTable[key]
+            if (known != null) {
+                wanted += Triple(known.first, known.second, key.uppercase())
+            } else {
+                val inst = if (key.contains("-")) key.uppercase() else "${key.uppercase()}-USDT"
+                val symbol = inst.substringBefore("-")
+                wanted += Triple(inst, symbol, symbol)
+            }
+        }
+        if (wanted.isEmpty()) error("没有认出币种")
+        val json = JSONObject(
+            HttpClient.getString("https://www.okx.com/api/v5/market/tickers?instType=SPOT")
+        )
+        val rows = json.optJSONArray("data") ?: error("没有解析到行情")
+        val byId = mutableMapOf<String, JSONObject>()
+        for (i in 0 until rows.length()) {
+            val row = rows.optJSONObject(i) ?: continue
+            val inst = row.optString("instId")
+            if (inst.isNotBlank()) byId[inst] = row
+        }
+        val items = mutableListOf<QuoteItem>()
+        for ((inst, name, symbol) in wanted) {
+            val row = byId[inst] ?: continue
+            val last = row.optString("last").toDoubleOrNull() ?: 0.0
+            val open = row.optString("open24h").toDoubleOrNull() ?: 0.0
+            val change = last - open
+            val percent = if (open > 0) change / open * 100.0 else 0.0
+            items += QuoteItem(
+                name = name,
+                symbol = symbol,
+                price = last,
+                percent = percent,
+                change = change,
+                high = row.optString("high24h").toDoubleOrNull() ?: 0.0,
+                low = row.optString("low24h").toDoubleOrNull() ?: 0.0,
+                open = open,
+                prev = open,
+                turnover = row.optString("volCcy24h").toDoubleOrNull() ?: 0.0,
+                unit = "USDT",
+                market = "crypto"
+            )
+        }
+        if (items.isEmpty()) error("没有解析到行情")
+        cache["crypto"] = System.currentTimeMillis() to items
+        return items
+    }
 }

@@ -10,6 +10,8 @@ object DefaultPageFactory : PanelPageFactory {
             pageId == "hello" -> HelloPage(context)
             pageId == "weather" -> WeatherPage(context)
             pageId == "daily-news" -> NewsPage(context)
+            pageId == "stocks-cn" -> QuotePage(context, crypto = false)
+            pageId == "crypto" -> QuotePage(context, crypto = true)
             pageId.startsWith("person-photo-local") -> PhotoPage(context)
             else -> HelloPage(context)
         }

@@ -30,7 +30,7 @@
 | Display name | RemotePanel |
 | Team ID | `FLFYQXCCZM` |
 | CFBundleShortVersionString | `2.0` |
-| CFBundleVersion (build) | **`5`**（自定义全屏网页页 + 内存/日历修复） |
+| CFBundleVersion (build) | **`6`**（行情卡三栏布局：中间放大价） |
 | App Icon | `Images.xcassets/AppIcon.appiconset`（已嵌入） |
 
 Provisioning 细节见 `ios/PROVISIONING-NOTES.txt`。  
@@ -274,7 +274,7 @@ RemotePanel-handoff-20261030/
 
 ## 11b. Android 客户端（P0）
 
-同仓库 `android/`：Kotlin + View，**minSdk 28**，竖屏为主/支持横屏。P0 页：问候、天气（Open-Meteo）、新闻 RSS、本地相册、自定义 Web×N（≤8，全屏无 chrome）。**不依赖** `:9121`；本地 Prefs 管 dwell / 开关 / URL。
+同仓库 `android/`：Kotlin + View，**minSdk 28**，竖屏为主/支持横屏。页：问候、天气（Open-Meteo）、新闻 RSS、国内股票、比特币/加密、本地相册、自定义 Web×N（≤8，全屏无 chrome）。行情卡与 iOS 一致：中间放大现价，左右其它信息。**不依赖** `:9121`；本地 Prefs 管 dwell / 开关 / URL。
 
 ```bash
 cd android && ./gradlew :app:assembleDebug
@@ -295,7 +295,7 @@ cd android && ./gradlew :app:assembleDebug
 
 ## 13. 快速自检清单
 
-- [ ] `ios/RemotePanel/Info.plist` → `CFBundleVersion` == 5  
+- [ ] `ios/RemotePanel/Info.plist` → `CFBundleVersion` == 6  
 - [ ] 存在 `AppIcon.appiconset` 且含 png  
 - [ ] `RPKioskRootVC` roster 含「天气+VPS」，不含启用的 system/weekly/vps  
 - [ ] `curl` TeamC `:9121/api/h5/state` 返回 `weather` / `news.github_items` / `vps`  
