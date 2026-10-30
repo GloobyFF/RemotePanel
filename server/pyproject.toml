@@ -1,0 +1,8 @@
+[project]
+name="remote-panel-eink-studio"
+version="0.1.0"
+description="GUI studio for Odospace Remote Panel e-ink displays"
+requires-python=">=3.10"
+dependencies = [
+  "pillow",
+]

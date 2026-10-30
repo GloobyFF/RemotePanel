@@ -1,0 +1,4425 @@
+from __future__ import annotations
+
+import argparse
+import html
+import io
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import threading
+import time
+from datetime import datetime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import parse_qs, urlparse
+
+APP_ROOT = Path(__file__).resolve().parent.parent
+if str(APP_ROOT) not in sys.path:
+    sys.path.insert(0, str(APP_ROOT))
+
+from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont, ImageOps
+
+from core.hermes_bridge import HermesBridge
+from core.source_settings import find_rss_payload, load_source_settings, looks_like_feed, save_source_settings, source_url, weather_city
+from core.layout_render import render_page
+from core.project_store import load_project, save_project
+from core.scheduler import select_active_template
+from core.utils import get_system_metrics
+
+IPAD_ROOT = Path(__file__).resolve().parent
+PROJECT_PATH = IPAD_ROOT / "ipad.project.json"
+STATE_PATH = IPAD_ROOT / "ipad_state.json"
+BRIDGE_PATH = IPAD_ROOT / "hermes_bridge"
+IPAD_DATA_PATH = IPAD_ROOT / "data"
+IPAD_POSTERS_PATH = IPAD_DATA_PATH / "movie_posters"
+IPAD_MOVIE_BACKDROPS_PATH = IPAD_DATA_PATH / "movie_backdrops"
+IPAD_STEAM_CAPSULES_PATH = IPAD_DATA_PATH / "steam_capsules"
+IPAD_STEAM_HEADERS_PATH = IPAD_DATA_PATH / "steam_headers"
+IPAD_STEAM_SCREENSHOTS_PATH = IPAD_DATA_PATH / "steam_screenshots"
+IPAD_NEWS_IMAGES_PATH = IPAD_DATA_PATH / "news_images"
+IPAD_ASSETS_PATH = IPAD_ROOT / "web_assets"
+PERSON_PHOTO_DIR = IPAD_DATA_PATH / "person_photos"
+PERSON_PHOTO_EXPORT_SCRIPT = APP_ROOT / "tools" / "export_person_photo.py"
+H5_DAILY_PHOTO_EXPORT_SCRIPT = APP_ROOT / "tools" / "export_h5_daily_photos.py"
+H5_DAILY_PHOTO_DIR = IPAD_DATA_PATH / "h5_daily_photos"
+REFRESH_SCRIPT_PATH = IPAD_ROOT / "refresh_ipad_cache.py"
+REFRESH_LOG_PATH = Path("/private/tmp/remote-panel-ipad-refresh.log")
+PENGUIN_ROOT = Path("/Users/teamc/Documents/penguin-balance-monitor")
+PENGUIN_QUERY_PATH = PENGUIN_ROOT / "query.mjs"
+PENGUIN_CACHE_PATH = BRIDGE_PATH / "penguin_balance_cache.json"
+PENGUIN_CACHE_TTL_SECONDS = 300
+SERVER_INFO_PATH = Path("/Users/teamc/Library/Mobile Documents/com~apple~CloudDocs/SERVER_INFO.md")
+IPAD_LOGICAL_SIZE = (1024, 700)
+IPAD_RETINA_SCALE = 2
+IPAD_RENDER_SIZE = tuple(value * IPAD_RETINA_SCALE for value in IPAD_LOGICAL_SIZE)
+FONT_LATIN = APP_ROOT / "fonts" / "fusion-pixel-12px-proportional-latin.ttf"
+FONT_ZH = APP_ROOT / "fonts" / "fusion-pixel-12px-proportional-zh_hans.ttf"
+WEATHER_ICON_FONT = APP_ROOT / "WeatherIcons" / "weathericons-regular-webfont.ttf"
+H5_STAGE_WIDTH = 1080
+H5_STAGE_HEIGHT = 1800
+_REFRESH_LOCK = threading.Lock()
+_REFRESH_LAST_FINISHED = 0.0
+_REFRESH_LAST_RESULT: dict[str, str] = {}
+_PERSON_PHOTO_LOCK = threading.Lock()
+_PENGUIN_REFRESH_LOCK = threading.Lock()
+
+
+def trigger_person_photo_refresh(orientation: str, max_age_seconds: int = 180) -> bool:
+    meta_path = PERSON_PHOTO_DIR / orientation / "current.json"
+    try:
+        if meta_path.exists() and time.time() - meta_path.stat().st_mtime < max_age_seconds:
+            return False
+    except OSError:
+        pass
+    if _PERSON_PHOTO_LOCK.locked():
+        return False
+
+    def worker():
+        if not _PERSON_PHOTO_LOCK.acquire(blocking=False):
+            return
+        try:
+            subprocess.run(
+                [sys.executable, str(PERSON_PHOTO_EXPORT_SCRIPT), "--person", "方宇轩", "--orientation", orientation],
+                cwd=str(APP_ROOT), capture_output=True, text=True, timeout=240, check=False,
+            )
+        finally:
+            _PERSON_PHOTO_LOCK.release()
+
+    threading.Thread(target=worker, name=f"person-photo-refresh-{orientation}", daemon=True).start()
+    return True
+
+
+def penguin_node_executable() -> str:
+    candidates = [
+        os.environ.get("PENGUIN_NODE", ""),
+        shutil.which("node") or "",
+        "/Users/teamc/local/node/bin/node",
+        "/opt/homebrew/bin/node",
+        "/usr/local/bin/node",
+    ]
+    for candidate in candidates:
+        if candidate and Path(candidate).is_file():
+            return candidate
+    raise FileNotFoundError("Node.js executable not found for Penguin query")
+
+
+def get_enabled_templates(project):
+    return [t for t in project.templates if t.enabled and t.pages]
+
+
+def content_refresh_interval_seconds() -> int:
+    try:
+        project = load_project(PROJECT_PATH)
+        minutes = [
+            int(getattr(template, "refresh_minutes", 0) or 0)
+            for template in project.templates
+            if getattr(template, "enabled", False) and getattr(template, "pages", None)
+        ]
+        minutes = [value for value in minutes if value > 0]
+        if not minutes:
+            return 0
+        return max(60, min(minutes) * 60)
+    except Exception:
+        return 300
+
+
+def _write_refresh_log(message: str) -> None:
+    try:
+        REFRESH_LOG_PATH.write_text(message, encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _content_refresh_worker(reason: str) -> None:
+    global _REFRESH_LAST_FINISHED, _REFRESH_LAST_RESULT
+    if not _REFRESH_LOCK.acquire(blocking=False):
+        return
+    started_at = datetime.now().isoformat()
+    try:
+        command = [sys.executable, str(REFRESH_SCRIPT_PATH)]
+        if reason == "auto":
+            command.append("--fast")
+        result = subprocess.run(
+            command,
+            cwd=str(APP_ROOT),
+            capture_output=True,
+            text=True,
+            timeout=240,
+            check=False,
+        )
+        finished_at = datetime.now().isoformat()
+        ok = result.returncode == 0
+        stdout = (result.stdout or "").strip()
+        stderr = (result.stderr or "").strip()
+        _REFRESH_LAST_RESULT = {
+            "reason": reason,
+            "started_at": started_at,
+            "finished_at": finished_at,
+            "status": "ok" if ok else f"exit {result.returncode}",
+            "stdout": stdout[-4000:],
+            "stderr": stderr[-4000:],
+        }
+        _write_refresh_log(json.dumps(_REFRESH_LAST_RESULT, ensure_ascii=False, indent=2))
+        bridge = HermesBridge(BRIDGE_PATH)
+        if ok:
+            bridge.write_state(last_refresh_attempt_at=started_at, last_refresh_finished_at=finished_at, last_refresh_status="ok", last_error="")
+        else:
+            bridge.write_state(last_refresh_attempt_at=started_at, last_refresh_finished_at=finished_at, last_refresh_status=f"exit {result.returncode}", last_error=stderr or stdout)
+    except subprocess.TimeoutExpired as exc:
+        finished_at = datetime.now().isoformat()
+        stdout = (exc.stdout or "").strip() if isinstance(exc.stdout, str) else ""
+        stderr = (exc.stderr or "").strip() if isinstance(exc.stderr, str) else ""
+        _REFRESH_LAST_RESULT = {
+            "reason": reason,
+            "started_at": started_at,
+            "finished_at": finished_at,
+            "status": "timeout",
+            "stdout": stdout[-4000:],
+            "stderr": stderr[-4000:],
+        }
+        _write_refresh_log(json.dumps(_REFRESH_LAST_RESULT, ensure_ascii=False, indent=2))
+        HermesBridge(BRIDGE_PATH).write_state(last_refresh_attempt_at=started_at, last_refresh_finished_at=finished_at, last_refresh_status="timeout", last_error="content refresh timed out")
+    except Exception as exc:
+        finished_at = datetime.now().isoformat()
+        _REFRESH_LAST_RESULT = {
+            "reason": reason,
+            "started_at": started_at,
+            "finished_at": finished_at,
+            "status": f"error: {exc}",
+            "stdout": "",
+            "stderr": str(exc),
+        }
+        _write_refresh_log(json.dumps(_REFRESH_LAST_RESULT, ensure_ascii=False, indent=2))
+        HermesBridge(BRIDGE_PATH).write_state(last_refresh_attempt_at=started_at, last_refresh_finished_at=finished_at, last_refresh_status="error", last_error=str(exc))
+    finally:
+        _REFRESH_LAST_FINISHED = time.time()
+        _REFRESH_LOCK.release()
+
+
+def trigger_content_refresh(reason: str = "manual") -> bool:
+    if _REFRESH_LOCK.locked():
+        return False
+    thread = threading.Thread(target=_content_refresh_worker, args=(reason,), daemon=True)
+    thread.start()
+    return True
+
+
+def start_content_refresh_loop() -> None:
+    def loop() -> None:
+        time.sleep(5)
+        while True:
+            interval = content_refresh_interval_seconds()
+            if interval > 0 and not _REFRESH_LOCK.locked():
+                elapsed = time.time() - _REFRESH_LAST_FINISHED
+                if _REFRESH_LAST_FINISHED <= 0 or elapsed >= interval:
+                    trigger_content_refresh("auto")
+            time.sleep(15)
+
+    threading.Thread(target=loop, daemon=True).start()
+
+
+def resolve_rotating_template(project, rotate: bool, template_id: str | None):
+    enabled = get_enabled_templates(project)
+    if not rotate:
+        if template_id:
+            for candidate in project.templates:
+                if candidate.id == template_id and candidate.pages:
+                    dwell = max(5, int(getattr(candidate, "dwell_seconds", 60) or 60))
+                    return candidate, dwell, 0, max(1, len(enabled))
+        if not enabled:
+            raise ValueError("project has no enabled templates")
+        template = select_active_template(project, forced_template_id=template_id)
+        dwell = max(5, int(getattr(template, "dwell_seconds", 60) or 60))
+        return template, dwell, 0, len(enabled)
+    if not enabled:
+        raise ValueError("project has no enabled templates")
+    cycle = []
+    for template in enabled:
+        dwell = max(5, int(getattr(template, "dwell_seconds", 60) or 60))
+        cycle.append((template, dwell))
+    total = sum(dwell for _, dwell in cycle)
+    now = int(time.time())
+    pos = now % total
+    acc = 0
+    for index, (template, dwell) in enumerate(cycle):
+        acc += dwell
+        if pos < acc:
+            return template, dwell, index, len(cycle)
+    template, dwell = cycle[-1]
+    return template, dwell, len(cycle) - 1, len(cycle)
+
+
+def load_current_page(template_id: str | None = None, page_index: int = 0, rotate: bool = False):
+    project = load_project(PROJECT_PATH)
+    state = load_state()
+    if not rotate:
+        template_id = template_id or str(state.get("active_template_id") or "").strip() or None
+        if page_index == 0:
+            try:
+                page_index = int(state.get("active_page_index", 0) or 0)
+            except Exception:
+                page_index = 0
+    template, dwell, rotate_index, rotate_total = resolve_rotating_template(project, rotate=rotate, template_id=template_id)
+    if not template.pages:
+        raise ValueError("template has no pages")
+    page = template.pages[max(0, min(page_index, len(template.pages) - 1))]
+    return project, template, page, dwell, rotate_index, rotate_total
+
+
+def render_current_png(template_id: str | None = None, page_index: int = 0, rotate: bool = False) -> bytes:
+    project, template, page, _, _, _ = load_current_page(template_id=template_id, page_index=page_index, rotate=rotate)
+    bridge = HermesBridge(BRIDGE_PATH)
+    return render_page(page, project.device, project.global_style, bridge=bridge, live_data=False)
+
+
+def render_current_jpeg(template_id: str | None = None, page_index: int = 0, scale: int = 1, quality: int = 92, rotate: bool = False) -> bytes:
+    body = render_ipad_dashboard_png(template_id=template_id, page_index=page_index, rotate=rotate)
+    img = Image.open(io.BytesIO(body)).convert("RGB")
+    if scale > 1:
+        img = img.resize((img.width * scale, img.height * scale), Image.Resampling.LANCZOS)
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=quality, optimize=False)
+    return buf.getvalue()
+
+
+def _scale_coords(value, scale: int):
+    if isinstance(value, (tuple, list)):
+        return tuple(_scale_coords(item, scale) for item in value)
+    if isinstance(value, (int, float)):
+        return int(round(value * scale))
+    return value
+
+
+class _ScaledImageDraw:
+    """Expose logical 1024x700 coordinates on a Retina-sized PIL canvas."""
+
+    def __init__(self, image: Image.Image, scale: int):
+        self._draw = ImageDraw.Draw(image)
+        self.scale = scale
+
+    def text(self, xy, text, **kwargs):
+        return self._draw.text(_scale_coords(xy, self.scale), text, **kwargs)
+
+    def textbbox(self, xy, text, **kwargs):
+        bbox = self._draw.textbbox(_scale_coords(xy, self.scale), text, **kwargs)
+        return tuple(value / self.scale for value in bbox)
+
+    def rectangle(self, xy, **kwargs):
+        if "width" in kwargs:
+            kwargs["width"] = max(1, int(kwargs["width"] * self.scale))
+        return self._draw.rectangle(_scale_coords(xy, self.scale), **kwargs)
+
+    def rounded_rectangle(self, xy, radius=0, **kwargs):
+        if "width" in kwargs:
+            kwargs["width"] = max(1, int(kwargs["width"] * self.scale))
+        return self._draw.rounded_rectangle(
+            _scale_coords(xy, self.scale),
+            radius=max(0, int(radius * self.scale)),
+            **kwargs,
+        )
+
+    def ellipse(self, xy, **kwargs):
+        if "width" in kwargs:
+            kwargs["width"] = max(1, int(kwargs["width"] * self.scale))
+        return self._draw.ellipse(_scale_coords(xy, self.scale), **kwargs)
+
+    def line(self, xy, **kwargs):
+        if "width" in kwargs:
+            kwargs["width"] = max(1, int(kwargs["width"] * self.scale))
+        return self._draw.line(_scale_coords(xy, self.scale), **kwargs)
+
+
+def _font(size: int, zh: bool = False):
+    path = FONT_ZH if zh else FONT_LATIN
+    try:
+        return ImageFont.truetype(str(path), size=size * IPAD_RETINA_SCALE)
+    except Exception:
+        return ImageFont.load_default()
+
+
+def _fit_text(draw: ImageDraw.ImageDraw, text: str, font_path: Path, max_size: int, min_size: int, max_width: int):
+    text = str(text or "")
+    for size in range(max_size, min_size - 1, -2):
+        try:
+            font = ImageFont.truetype(str(font_path), size=size * IPAD_RETINA_SCALE)
+        except Exception:
+            continue
+        bbox = draw.textbbox((0, 0), text, font=font)
+        if bbox[2] - bbox[0] <= max_width:
+            return font
+    try:
+        return ImageFont.truetype(str(font_path), size=min_size * IPAD_RETINA_SCALE)
+    except Exception:
+        return ImageFont.load_default()
+
+
+def _weather_icon_font(size: int):
+    try:
+        return ImageFont.truetype(str(WEATHER_ICON_FONT), size=size * IPAD_RETINA_SCALE)
+    except Exception:
+        return ImageFont.load_default()
+
+
+def _weather_icon_char(description: str) -> str:
+    desc = str(description or "").lower()
+    if any(k in desc for k in ["冰雹", "hail"]):
+        return "\uf015"
+    if any(k in desc for k in ["强雷暴", "雷暴", "thunder"]):
+        return "\uf01e"
+    if any(k in desc for k in ["暴雨", "大雨", "heavy rain"]):
+        return "\uf019"
+    if any(k in desc for k in ["阵雨", " showers", "shower"]):
+        return "\uf01a"
+    if any(k in desc for k in ["雨", "drizzle", "rain"]):
+        return "\uf008"
+    if any(k in desc for k in ["雪", "snow"]):
+        return "\uf01b"
+    if any(k in desc for k in ["雾", "fog", "霾"]):
+        return "\uf014"
+    if any(k in desc for k in ["阴", "cloud", "多云"]):
+        return "\uf041"
+    if any(k in desc for k in ["晴", "sun", "clear"]):
+        return "\uf00d"
+    return "\uf041"
+
+
+def resolve_ipad_poster_path(raw_path: str | None) -> Path | None:
+    source = str(raw_path or "").strip()
+    if not source:
+        return None
+    source_path = Path(source)
+    ipad_candidate = IPAD_POSTERS_PATH / source_path.name
+    if ipad_candidate.exists():
+        return ipad_candidate
+    if source_path.exists():
+        return source_path
+    return None
+
+
+def resolve_ipad_movie_backdrop_path(raw_path: str | None) -> Path | None:
+    source = str(raw_path or "").strip()
+    if not source:
+        return None
+    source_path = Path(source)
+    ipad_candidate = IPAD_MOVIE_BACKDROPS_PATH / source_path.name
+    if ipad_candidate.exists():
+        return ipad_candidate
+    if source_path.exists():
+        return source_path
+    return None
+
+
+def resolve_ipad_steam_capsule_path(raw_path: str | None) -> Path | None:
+    source = str(raw_path or "").strip()
+    if not source:
+        return None
+    source_path = Path(source)
+    ipad_candidate = IPAD_STEAM_CAPSULES_PATH / source_path.name
+    if ipad_candidate.exists():
+        return ipad_candidate
+    if source_path.exists():
+        return source_path
+    return None
+
+
+def resolve_ipad_steam_header_path(raw_path: str | None) -> Path | None:
+    source = str(raw_path or "").strip()
+    if not source:
+        return None
+    source_path = Path(source)
+    ipad_candidate = IPAD_STEAM_HEADERS_PATH / source_path.name
+    if ipad_candidate.exists():
+        return ipad_candidate
+    if source_path.exists():
+        return source_path
+    return None
+
+
+def resolve_ipad_steam_screenshot_path(raw_path: str | None) -> Path | None:
+    source = str(raw_path or "").strip()
+    if not source:
+        return None
+    source_path = Path(source)
+    ipad_candidate = IPAD_STEAM_SCREENSHOTS_PATH / source_path.name
+    if ipad_candidate.exists():
+        return ipad_candidate
+    if source_path.exists():
+        return source_path
+    return None
+
+
+def resolve_ipad_news_image_path(raw_path: str | None) -> Path | None:
+    source = str(raw_path or "").strip()
+    if not source:
+        return None
+    source_path = Path(source)
+    ipad_candidate = IPAD_NEWS_IMAGES_PATH / source_path.name
+    if ipad_candidate.exists():
+        return ipad_candidate
+    if source_path.exists():
+        return source_path
+    return None
+
+
+def _wrap_text(draw: ImageDraw.ImageDraw, text: str, font, max_width: int, max_lines: int):
+    source = str(text or "").replace("\n", " ").strip()
+    if not source or max_lines <= 0:
+        return []
+    # CJK copy has no word separators, so measure it character by character.
+    # Latin copy stays word-based to avoid breaking words in the middle.
+    tokens = list(source) if re.search(r"[\u2e80-\u9fff]", source) else source.split()
+    separator = "" if tokens and len(tokens[0]) == 1 else " "
+    lines = []
+    current = ""
+    consumed = 0
+    for index, token in enumerate(tokens):
+        candidate = token if not current else current + separator + token
+        bbox = draw.textbbox((0, 0), candidate, font=font)
+        if bbox[2] - bbox[0] <= max_width:
+            current = candidate
+            consumed = index + 1
+            continue
+        if current:
+            lines.append(current)
+            if len(lines) >= max_lines:
+                break
+            current = token
+            consumed = index + 1
+        else:
+            lines.append(token)
+            consumed = index + 1
+            if len(lines) >= max_lines:
+                break
+    if current and len(lines) < max_lines:
+        lines.append(current)
+    if consumed < len(tokens) and lines:
+        last = lines[-1]
+        while last:
+            candidate = last + "…"
+            bbox = draw.textbbox((0, 0), candidate, font=font)
+            if bbox[2] - bbox[0] <= max_width:
+                lines[-1] = candidate
+                break
+            last = last[:-1]
+    return lines
+
+
+def read_json(name: str, default):
+    path = BRIDGE_PATH / name
+    if not path.exists():
+        return default
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return default
+
+
+def _query_penguin_balance() -> dict:
+    now = time.time()
+    if not PENGUIN_QUERY_PATH.exists():
+        raise FileNotFoundError("penguin query script missing")
+    result = subprocess.run(
+        [penguin_node_executable(), str(PENGUIN_QUERY_PATH), "--history", "7"],
+        cwd=str(PENGUIN_ROOT),
+        capture_output=True,
+        text=True,
+        timeout=45,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError((result.stderr or result.stdout or f"exit {result.returncode}").strip())
+    payload = json.loads(result.stdout)
+    if not isinstance(payload, dict):
+        raise ValueError("penguin payload unavailable")
+    payload["_fetched_at"] = now
+    cache_tmp = PENGUIN_CACHE_PATH.with_suffix(".json.tmp")
+    cache_tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(cache_tmp, PENGUIN_CACHE_PATH)
+    return payload
+
+
+def _refresh_penguin_balance() -> None:
+    if not _PENGUIN_REFRESH_LOCK.acquire(blocking=False):
+        return
+    try:
+        _query_penguin_balance()
+    except Exception:
+        pass
+    finally:
+        _PENGUIN_REFRESH_LOCK.release()
+
+
+def load_penguin_balance(force: bool = False) -> dict:
+    now = time.time()
+    cached = None
+    if PENGUIN_CACHE_PATH.exists():
+        try:
+            candidate = json.loads(PENGUIN_CACHE_PATH.read_text(encoding="utf-8"))
+            if isinstance(candidate, dict):
+                cached = candidate
+                fetched_at = float(cached.get("_fetched_at") or 0)
+                if not force and fetched_at > 0 and (now - fetched_at) < PENGUIN_CACHE_TTL_SECONDS:
+                    return cached
+        except Exception:
+            pass
+    if not force:
+        if not _PENGUIN_REFRESH_LOCK.locked():
+            threading.Thread(target=_refresh_penguin_balance, name="penguin-balance-refresh", daemon=True).start()
+        if cached is not None:
+            cached["_stale"] = True
+            cached["_refreshing"] = True
+            return cached
+        return {"error": "penguin payload refreshing", "_refreshing": True}
+    try:
+        return _query_penguin_balance()
+    except Exception as exc:
+        if cached is not None:
+            cached["_stale_error"] = str(exc)
+            return cached
+        return {"error": str(exc)}
+
+
+def load_vps_public_info() -> dict:
+    """Read display-safe VPS facts without exposing credentials from the source."""
+    defaults = {
+        "ip": "162.243.90.110",
+        "hostname": "ubuntu-s-1vcpu-512mb-10gb-nyc2",
+        "primary_domain": "igobeat.com",
+        "secondary_domain": "weelink.xyz",
+        "services": ["nginx", "x-ui", "tinyproxy", "danted", "traffic-api", "vnstat", "clash-sub-http"],
+        "ports": ["22 SSH", "80 HTTP", "443 HTTPS", "2097 订阅", "18080 HTTP代理", "18081 SOCKS5", "8443 x-ui", "2443 Reality", "35420 WS TLS"],
+        "updated_at": "",
+    }
+    if not SERVER_INFO_PATH.exists():
+        return defaults
+    try:
+        source = SERVER_INFO_PATH.read_text(encoding="utf-8")
+    except Exception:
+        return defaults
+
+    def match(pattern, fallback):
+        found = re.search(pattern, source, re.MULTILINE)
+        return found.group(1).strip() if found else fallback
+
+    defaults["ip"] = match(r"^VPS IP:\s*([^\s]+)", defaults["ip"])
+    defaults["hostname"] = match(r"^Hostname:\s*(.+)$", defaults["hostname"])
+    defaults["updated_at"] = match(r"^更新时间：\s*(\d{4}-\d{2}-\d{2})", "")
+    return defaults
+
+
+def _truncate(text: str, limit: int) -> str:
+    text = " ".join(str(text or "").split())
+    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
+
+
+def render_ipad_dashboard_png(template_id: str | None = None, page_index: int = 0, rotate: bool = False) -> bytes:
+    project, template, page, dwell, rotate_index, rotate_total = load_current_page(template_id=template_id, page_index=page_index, rotate=rotate)
+    content_cache = read_json("content_cache.json", {})
+    session = read_json("session_status.json", {})
+    work = read_json("work_status.json", {})
+    alerts = HermesBridge(BRIDGE_PATH).read_inbox()
+    printmana = read_json("printmana.json", {})
+    daily = read_json("daily.json", {})
+    bili = read_json("bilibili.json", {})
+    movies_now = content_cache.get("movies::now_playing::6", {}) if isinstance(content_cache, dict) else {}
+    gamer520_payload = content_cache.get("gamer520::pcplay::10", {}) if isinstance(content_cache, dict) else {}
+    movie_items = movies_now.get("items", []) if isinstance(movies_now, dict) else []
+    gamer520_raw_items = gamer520_payload.get("items", []) if isinstance(gamer520_payload, dict) else []
+    steam_new = content_cache.get("steam::new_releases::6", {}) if isinstance(content_cache, dict) else {}
+    steam_hot = content_cache.get("steam::top_sellers::6", {}) if isinstance(content_cache, dict) else {}
+    metrics = get_system_metrics()
+
+    img = Image.new("RGB", IPAD_RENDER_SIZE, "#0a0f18")
+    draw = ImageDraw.Draw(img)
+
+    px_h1 = _font(24, zh=True)
+    px_h2 = _font(20, zh=True)
+    px_body = _font(16, zh=True)
+    px_small = _font(14, zh=True)
+    px_big = _font(62, zh=True)
+    px_num = _font(54, zh=True)
+    px_tiny = _font(12, zh=True)
+
+    def fit_zh(text_value: str, max_size: int, min_size: int, width: int):
+        return _fit_text(draw, text_value, FONT_ZH, max_size, min_size, width)
+
+    def round_box(x1, y1, x2, y2, fill, outline=None, radius=22, width=2):
+        draw.rounded_rectangle((x1, y1, x2, y2), radius=radius, fill=fill, outline=outline, width=width)
+
+    def text(x, y, value, font, fill, anchor=None):
+        draw.text((x, y), str(value), font=font, fill=fill, anchor=anchor)
+
+    def wrapped(x, y, value, font, fill, width, lines, line_h):
+        out = _wrap_text(draw, str(value or ""), font, width, lines)
+        for i, line in enumerate(out):
+            draw.text((x, y + i * line_h), line, font=font, fill=fill)
+        return len(out)
+
+    def progress_bar(x, y, w, h, pct, bg, fg):
+        pct = max(0, min(100, int(pct or 0)))
+        round_box(x, y, x + w, y + h, bg, radius=h // 2, outline=None, width=1)
+        fill_w = max(h, int(w * pct / 100)) if pct > 0 else 0
+        if fill_w > 0:
+            round_box(x, y, x + fill_w, y + h, fg, radius=h // 2, outline=None, width=1)
+
+    def stat_chip(x, y, w, h, label, value, fill, ink="#081018"):
+        round_box(x, y, x + w, y + h, fill, radius=18, outline=None, width=1)
+        text(x + 12, y + h // 2, label, px_small, ink, anchor="lm")
+        text(x + w - 12, y + h // 2, value, px_h2, ink, anchor="rm")
+
+    def framed_panel(x1, y1, x2, y2, fill, outline, title_text, tone="#ffffff"):
+        round_box(x1, y1, x2, y2, fill, outline=outline, radius=26, width=3)
+        text(x1 + 18, y1 + 16, title_text, px_h2, tone)
+
+    def header(title_text, subtitle, fill, accent="#dbeafe", ink="#ffffff"):
+        round_box(20, 18, 1004, 104, fill, radius=24, outline=None, width=1)
+        title_font = fit_zh(str(title_text), 28, 20, 500)
+        text(40, 22, title_text, title_font, ink)
+        text(42, 74, subtitle, px_small, accent)
+        right = f"{rotate_index + 1}/{rotate_total} · {dwell}s · {datetime.now().strftime('%H:%M')}"
+        bbox = draw.textbbox((0, 0), right, font=px_small)
+        text(986 - (bbox[2] - bbox[0]), 42, right, px_small, accent)
+
+    def banner_stripes(colors):
+        stripe_h = 20
+        for idx, color in enumerate(colors):
+            draw.rectangle((0, 112 + idx * stripe_h, 1024, 112 + (idx + 1) * stripe_h), fill=color)
+
+    def paste_cover(path_value: Path | None, box, bg="#0f172a"):
+        x1, y1, x2, y2 = box
+        round_box(x1, y1, x2, y2, bg, outline="#334155", radius=18, width=2)
+        if not path_value or not path_value.exists():
+            return False
+        try:
+            cover = Image.open(path_value).convert("RGB")
+            cover.thumbnail((x2 - x1 - 12, y2 - y1 - 12), Image.Resampling.LANCZOS)
+            px = x1 + ((x2 - x1) - cover.width) // 2
+            py = y1 + ((y2 - y1) - cover.height) // 2
+            img.paste(cover, (px, py))
+            return True
+        except Exception:
+            return False
+
+    weather = content_cache.get("weather::Shanghai", {}).get("payload", {})
+    weekly = content_cache.get("weather_weekly::Shanghai::6", {}).get("payload", {}).get("days", [])
+    weekly = weekly[1:7] if isinstance(weekly, list) and len(weekly) > 6 else (weekly[:6] if isinstance(weekly, list) else [])
+    temp = str(weather.get("temperature", "--"))
+    desc = str(weather.get("description", "天气"))
+    hi = str(weather.get("temp_max", "--"))
+    lo = str(weather.get("temp_min", "--"))
+    current_task = str(work.get("current_task") or "等待任务")
+    next_task = str(work.get("next_task") or "继续当前项")
+    summary = str(work.get("summary") or session.get("summary") or "最近对话")
+    recent_user = str(session.get("user_last") or "暂无用户消息")
+    recent_assistant = str(session.get("assistant_last") or "暂无助手消息")
+    alerts_list = [m for m in alerts if isinstance(m, dict)][:5]
+    primary = printmana.get("primary", {}) if isinstance(printmana, dict) else {}
+    progress = int(float(primary.get("progress", 0) or 0)) if primary else 0
+    cpu = int((metrics.get("cpu_user") or 0) + (metrics.get("cpu_sys") or 0))
+    mem = int(metrics.get("memory_pressure") or 0)
+    disk = int(metrics.get("disk_used_pct") or 0)
+    tid = template.id
+
+    if tid == "hello":
+        bg = "#061b2d"
+        img.paste(Image.new("RGB", IPAD_RENDER_SIZE, bg))
+        banner_stripes(["#0b2540", "#11395c", "#16618b"])
+        header(template.name, getattr(page, "name", template.name), "#0d4b78", "#c2ecff")
+        framed_panel(32, 156, 570, 654, "#e6f7ff", "#5dd6ff", "HELLO / BOOT", "#0b4d77")
+        framed_panel(594, 156, 990, 330, "#07253a", "#5dd6ff", "STATUS / LIVE", "#d7f4ff")
+        framed_panel(594, 348, 990, 654, "#09121f", "#4cc9f0", "FOCUS / TODAY", "#d7f4ff")
+        greet = "主人们，晚上好"
+        hour = datetime.now().hour
+        if 5 <= hour < 12:
+            greet = "主人们，早上好"
+        elif 12 <= hour < 18:
+            greet = "主人们，下午好"
+        quote = str(daily.get("quote") or "今天继续稳稳推进。")
+        topics = daily.get("news_topics") or []
+        text(58, 214, greet, fit_zh(greet, 44, 28, 430), "#05253a")
+        wrapped(58, 292, quote, px_h2, "#35536a", 450, 4, 28)
+        wrapped(58, 438, "\n".join([f"· {t}" for t in topics[:5]] or [f"· 当前 {current_task}", f"· 下一步 {next_task}"]), px_body, "#0d4b78", 450, 8, 24)
+        text(620, 210, datetime.now().strftime("%H:%M"), px_big, "#ffffff")
+        stat_chip(618, 278, 160, 76, "天气", f"{temp}°", "#b9ecff")
+        stat_chip(804, 278, 160, 76, "状态", str(daily.get("greeting") or "在线")[:6], "#7dd3fc")
+        wrapped(620, 402, f"当前任务\n{current_task}\n\n下一步\n{next_task}\n\n最近\n{recent_user}", px_body, "#d9f8ff", 330, 10, 24)
+
+    elif tid == "weather":
+        bg = "#041f2e"
+        img.paste(Image.new("RGB", IPAD_RENDER_SIZE, bg))
+        header(template.name, getattr(page, "name", template.name), "#0f766e", "#ccfbf1")
+        framed_panel(34, 128, 990, 646, "#052f46", "#67e8f9", "WEATHER RING", "#ccfbf1")
+        draw.ellipse((70, 188, 410, 528), fill="#dff6ff", outline="#67e8f9", width=8)
+        draw.ellipse((132, 250, 348, 466), fill="#0f172a", outline="#a5f3fc", width=3)
+        text(240, 286, _weather_icon_char(desc), _weather_icon_font(92), "#67e8f9", anchor="mm")
+        text(240, 432, f"{temp}°", _font(58, zh=True), "#ffffff", anchor="mm")
+        text(462, 184, desc, fit_zh(desc, 36, 20, 420), "#ffffff")
+        text(462, 236, f"最低 {lo}°  /  最高 {hi}°", px_h2, "#bae6fd")
+        stat_chip(460, 284, 156, 76, "湿度", str(weather.get('humidity', '--')) + '%', "#a5f3fc")
+        stat_chip(632, 284, 156, 76, "风速", str(weather.get('wind_speed', '--')) + 'km/h', "#67e8f9")
+        stat_chip(804, 284, 156, 76, "体感", str(weather.get('feels_like', '--')) + '°', "#22d3ee")
+        draw.line((462, 404, 948, 404), fill="#155e75", width=3)
+        step_x = [478, 558, 638, 718, 798, 878]
+        for idx, item in enumerate(weekly[:6]):
+            x = step_x[idx]
+            draw.ellipse((x - 16, 388, x + 16, 420), fill="#67e8f9", outline=None)
+            text(x, 452, str(item.get('weekday', '--')), px_small, "#cffafe", anchor="mm")
+            text(x, 500, _weather_icon_char(str(item.get('description', ''))), _weather_icon_font(30), "#a5f3fc", anchor="mm")
+            text(x, 556, f"{item.get('temp_max', '--')}°", px_body, "#ffffff", anchor="mm")
+            text(x, 584, f"{item.get('temp_min', '--')}°", px_small, "#94a3b8", anchor="mm")
+
+    elif tid == "weather-weekly":
+        bg = "#1e293b"
+        img.paste(Image.new("RGB", IPAD_RENDER_SIZE, bg))
+        header(template.name, getattr(page, "name", template.name), "#475569", "#e2e8f0")
+        framed_panel(28, 128, 994, 646, "#f8fafc", "#94a3b8", "6-DAY TABLE", "#334155")
+        cols = [52, 192, 332, 472, 612, 752, 892]
+        headers = ["DAY", "DATE", "SKY", "LOW", "HIGH", "ICON", "NOTE"]
+        for x, label in zip(cols, headers):
+            text(x, 176, label, px_small, "#64748b", anchor="mm")
+        for idx, item in enumerate(weekly[:6]):
+            y = 232 + idx * 62
+            fill = "#e2e8f0" if idx % 2 == 0 else "#f1f5f9"
+            round_box(44, y - 22, 970, y + 24, fill, outline=None, radius=10, width=1)
+            text(cols[0], y, str(item.get('weekday', '--')), px_body, "#0f172a", anchor="mm")
+            text(cols[1], y, str(item.get('date', '--')), px_small, "#334155", anchor="mm")
+            wrapped(cols[2] - 48, y - 10, str(item.get('description', '')), px_small, "#0f172a", 110, 2, 18)
+            text(cols[3], y, f"{item.get('temp_min', '--')}°", px_body, "#1d4ed8", anchor="mm")
+            text(cols[4], y, f"{item.get('temp_max', '--')}°", px_body, "#dc2626", anchor="mm")
+            text(cols[5], y, _weather_icon_char(str(item.get('description', ''))), _weather_icon_font(24), "#0ea5e9", anchor="mm")
+            text(cols[6], y, "stable" if idx < 3 else "watch", px_small, "#475569", anchor="mm")
+        text(56, 590, f"当前 {temp}° · {desc}", px_h1, "#0f172a")
+
+    elif tid == "vps":
+        bg = "#071f1b"
+        img.paste(Image.new("RGB", IPAD_RENDER_SIZE, bg))
+        header(template.name, getattr(page, "name", template.name), "#0f766e", "#d1fae5")
+        framed_panel(28, 126, 452, 654, "#ecfdf5", "#34d399", "TRAFFIC HERO", "#047857")
+        framed_panel(474, 126, 996, 360, "#052e2b", "#34d399", "SYSTEM RADAR", "#d1fae5")
+        framed_panel(474, 382, 996, 654, "#0b1514", "#34d399", "FLOW NOTES", "#d1fae5")
+        lines = content_cache.get("traffic::default::default", {}).get("lines", [])
+        percent = (lines[3].replace('Percent:', '').strip() if len(lines) > 3 else '--')
+        used = lines[1] if len(lines) > 1 else '已用 --'
+        remain = lines[2] if len(lines) > 2 else '剩余 --'
+        cycle = lines[5] if len(lines) > 5 else '周期 --'
+        text(58, 216, percent, px_big, "#059669")
+        progress_bar(56, 300, 360, 26, int(float(str(percent).replace('%', '') or 0)) if str(percent).replace('%', '').replace('.', '', 1).isdigit() else 0, "#a7f3d0", "#10b981")
+        stat_chip(58, 354, 166, 78, "已用", used, "#d1fae5")
+        stat_chip(244, 354, 166, 78, "剩余", remain, "#a7f3d0")
+        stat_chip(58, 448, 352, 78, "周期", cycle, "#86efac")
+        stat_chip(502, 182, 142, 72, "CPU", f"{cpu}%", "#d1fae5")
+        stat_chip(662, 182, 142, 72, "MEM", f"{mem}%", "#a7f3d0")
+        stat_chip(822, 182, 142, 72, "DISK", f"{disk}%", "#86efac")
+        wrapped(502, 286, summary, px_body, "#d1fae5", 440, 4, 24)
+        wrapped(502, 430, recent_user + "\n" + recent_assistant, px_body, "#d1fae5", 440, 8, 24)
+
+    elif tid == "daily-news":
+        bg = "#140c08"
+        img.paste(Image.new("RGB", IPAD_RENDER_SIZE, bg))
+        header(template.name, getattr(page, "name", template.name), "#ea580c", "#ffedd5")
+        framed_panel(34, 126, 990, 648, "#fff7ed", "#fb923c", "MORNING PAPER", "#9a3412")
+        lines = content_cache.get("rss::https://www.chinanews.com.cn/rss/scroll-news.xml::4", {}).get("lines", [])[:4]
+        text(62, 182, datetime.now().strftime('%H:%M'), _font(50, zh=True), "#9a3412")
+        text(256, 192, "NEWS DESK", px_h1, "#c2410c")
+        draw.line((60, 236, 960, 236), fill="#fdba74", width=3)
+        y = 278
+        for idx, line in enumerate(lines or ['暂无新闻数据'], 1):
+            text(72, y, f"{idx}.", px_h1, "#ea580c")
+            wrapped(126, y - 4, line, px_body, "#1f2937", 810, 3, 22)
+            draw.line((126, y + 62, 944, y + 62), fill="#fed7aa", width=2)
+            y += 92
+        wrapped(640, 520, str(daily.get('quote') or summary), px_body, "#7c2d12", 300, 4, 22)
+
+    elif tid == "github-news":
+        bg = "#04070d"
+        img.paste(Image.new("RGB", IPAD_RENDER_SIZE, bg))
+        header(template.name, getattr(page, "name", template.name), "#2563eb", "#dbeafe")
+        framed_panel(32, 128, 992, 646, "#0b1220", "#3b82f6", "COMMIT TERMINAL", "#dbeafe")
+        gh_lines = content_cache.get("rss::https://github.blog/changelog/feed/::4", {}).get("lines", [])[:4]
+        hello_lines = content_cache.get("rss::https://hellogithub.com/rss::4", {}).get("lines", [])[:3]
+        for idx, line in enumerate(gh_lines or ['暂无 GitHub 更新']):
+            y = 182 + idx * 86
+            text(58, y, f"> git log --news #{idx+1}", px_small, "#60a5fa")
+            wrapped(58, y + 24, line, px_body, "#e2e8f0", 420, 2, 22)
+        draw.line((520, 164, 520, 620), fill="#1d4ed8", width=3)
+        text(548, 182, "README UPDATES", px_h1, "#93c5fd")
+        y = 240
+        for idx, line in enumerate(hello_lines or [summary]):
+            round_box(548, y, 948, y + 92, "#111827", outline="#2563eb", radius=16, width=2)
+            wrapped(566, y + 16, line, px_body, "#dbeafe", 360, 3, 22)
+            y += 108
+
+    elif tid == "alerts":
+        bg = "#300d1f"
+        img.paste(Image.new("RGB", IPAD_RENDER_SIZE, bg))
+        header(template.name, getattr(page, "name", template.name), "#be123c", "#ffe4e6")
+        framed_panel(28, 124, 596, 654, "#fff1f2", "#fb7185", "ALERT STACK", "#be123c")
+        framed_panel(620, 124, 996, 654, "#190c16", "#fb7185", "RESPONSE LANE", "#ffe4e6")
+        y = 176
+        for item in alerts_list or [{'severity':'info','title':'暂无提醒','body':''}]:
+            sev = str(item.get('severity', 'info')).upper()
+            title = str(item.get('title', '提醒'))
+            body = str(item.get('body', ''))
+            round_box(48, y, 574, y + 96, "#fff7f7", outline="#fda4af", radius=18, width=2)
+            text(64, y + 16, sev, px_small, "#e11d48")
+            wrapped(126, y + 16, title + ' · ' + body, px_body, "#3f3f46", 418, 3, 22)
+            y += 110
+            if y > 540:
+                break
+        wrapped(640, 190, f"当前任务\n{current_task}\n\n下一步\n{next_task}\n\n摘要\n{summary}", px_body, "#ffe4e6", 320, 12, 24)
+
+    elif tid == "dashboard":
+        bg = "#06181f"
+        img.paste(Image.new("RGB", IPAD_RENDER_SIZE, bg))
+        header(template.name, getattr(page, "name", template.name), "#047857", "#d1fae5")
+        framed_panel(30, 126, 494, 654, "#052e2b", "#34d399", "WORK COMMAND", "#d1fae5")
+        framed_panel(516, 126, 996, 360, "#f0fdf4", "#34d399", "LIVE METRICS", "#047857")
+        framed_panel(516, 382, 996, 654, "#0a1415", "#34d399", "SUMMARY FEED", "#d1fae5")
+        text(56, 194, current_task, fit_zh(current_task, 34, 18, 380), "#ffffff")
+        wrapped(56, 286, next_task, px_body, "#bbf7d0", 380, 4, 24)
+        progress_bar(56, 380, 380, 22, 72, "#1f2937", "#34d399")
+        stat_chip(536, 182, 130, 72, "CPU", f"{cpu}%", "#bbf7d0")
+        stat_chip(690, 182, 130, 72, "MEM", f"{mem}%", "#a7f3d0")
+        stat_chip(844, 182, 130, 72, "DISK", f"{disk}%", "#86efac")
+        wrapped(536, 424, summary + "\n\n" + recent_user, px_body, "#d1fae5", 420, 8, 24)
+
+    elif tid == "focus":
+        bg = "#2b1806"
+        img.paste(Image.new("RGB", IPAD_RENDER_SIZE, bg))
+        header(template.name, getattr(page, "name", template.name), "#b45309", "#fef3c7")
+        framed_panel(34, 126, 990, 654, "#111827", "#f59e0b", "FOCUS MODE", "#fef3c7")
+        text(512, 214, datetime.now().strftime('%H:%M'), _font(84, zh=True), "#ffffff", anchor='mm')
+        text(512, 320, current_task[:24], fit_zh(current_task[:24], 34, 20, 760), "#fde68a", anchor='mm')
+        wrapped(150, 400, summary, px_h2, "#fef3c7", 724, 4, 28)
+        text(512, 574, '单任务推进 / 降低干扰 / 保持节奏', px_h2, '#fbbf24', anchor='mm')
+
+    elif tid == "night-shift":
+        bg = "#120b24"
+        img.paste(Image.new("RGB", IPAD_RENDER_SIZE, bg))
+        header(template.name, getattr(page, "name", template.name), "#7c3aed", "#ede9fe")
+        framed_panel(36, 128, 988, 650, "#1b1033", "#a78bfa", "NIGHT WATCH", "#ede9fe")
+        text(84, 184, datetime.now().strftime('%H:%M'), _font(72, zh=True), "#ffffff")
+        wrapped(84, 290, '低干扰值守界面\n保留提醒、聊天、状态。', px_h2, '#ddd6fe', 360, 4, 28)
+        for idx, item in enumerate((alerts_list or [{'title':'暂无提醒','severity':'info'}])[:3]):
+            y = 418 + idx * 74
+            round_box(84, y, 470, y + 56, '#24153f', outline='#8b5cf6', radius=14, width=2)
+            wrapped(102, y + 16, f"{item.get('severity','info')} · {item.get('title','提醒')}", px_body, '#ede9fe', 340, 2, 20)
+        framed_panel(542, 172, 930, 606, '#0b0f1a', '#a78bfa', 'QUIET STREAM', '#ede9fe')
+        wrapped(566, 220, recent_user + '\n\n' + recent_assistant, px_body, '#c4b5fd', 320, 10, 22)
+
+    elif tid == "system":
+        bg = "#0f172a"
+        img.paste(Image.new("RGB", IPAD_RENDER_SIZE, bg))
+        header(template.name, getattr(page, "name", template.name), "#334155", "#e2e8f0")
+        framed_panel(32, 124, 996, 654, "#111827", "#64748b", "SYSTEM CORE", "#e2e8f0")
+        stat_chip(54, 184, 190, 90, 'CPU', f'{cpu}%', '#bfdbfe')
+        stat_chip(262, 184, 190, 90, 'MEM', f'{mem}%', '#cbd5e1')
+        stat_chip(470, 184, 190, 90, 'DISK', f'{disk}%', '#e2e8f0')
+        stat_chip(678, 184, 280, 90, 'THERMAL', str(metrics.get('thermal_status') or '未知'), '#dbeafe')
+        progress_bar(56, 324, 900, 24, cpu, '#1f2937', '#60a5fa')
+        progress_bar(56, 374, 900, 24, mem, '#1f2937', '#94a3b8')
+        progress_bar(56, 424, 900, 24, disk, '#1f2937', '#cbd5e1')
+        wrapped(56, 486, summary + '\n\n' + recent_user, px_body, '#e2e8f0', 900, 6, 24)
+
+    elif tid == "chat":
+        bg = "#081222"
+        img.paste(Image.new("RGB", IPAD_RENDER_SIZE, bg))
+        header(template.name, getattr(page, "name", template.name), "#1d4ed8", "#dbeafe")
+        framed_panel(30, 126, 642, 654, "#0a162b", "#60a5fa", "CHAT STREAM", "#dbeafe")
+        framed_panel(668, 126, 996, 654, "#ffffff", "#60a5fa", "THREAD META", "#1d4ed8")
+        items = session.get('recent_messages') or []
+        y = 176
+        for item in items[-5:] or [{'role':'assistant','content':'暂无对话'}]:
+            is_user = item.get('role') == 'user'
+            bubble_fill = '#1d4ed8' if is_user else '#0f172a'
+            bubble_outline = '#93c5fd' if is_user else '#334155'
+            x1 = 64 if not is_user else 170
+            x2 = 560 if not is_user else 608
+            round_box(x1, y, x2, y + 84, bubble_fill, outline=bubble_outline, radius=18, width=2)
+            wrapped(x1 + 16, y + 16, str(item.get('content', '')), px_body, '#ffffff', x2 - x1 - 32, 3, 22)
+            y += 98
+            if y > 560:
+                break
+        wrapped(694, 180, f"标题\n{session.get('title', 'Hermes')}\n\n摘要\n{summary}\n\n当前任务\n{current_task}", px_body, '#1f2937', 270, 12, 24)
+
+    elif tid == "bilibili":
+        bg = "#3a0d2e"
+        img.paste(Image.new("RGB", IPAD_RENDER_SIZE, bg))
+        header(template.name, getattr(page, "name", template.name), "#db2777", "#fce7f3")
+        framed_panel(34, 126, 394, 654, '#4a1236', '#f472b6', 'BILI STATUS', '#fce7f3')
+        framed_panel(416, 126, 996, 654, '#fff1f8', '#f472b6', 'CHANNEL BEAT', '#be185d')
+        text(58, 196, str(bili.get('account_name') or '未连接'), fit_zh(str(bili.get('account_name') or '未连接'), 28, 18, 300), '#ffffff')
+        stat_chip(58, 280, 134, 74, 'UID', str(bili.get('uid') or '--'), '#fbcfe8')
+        stat_chip(206, 280, 134, 74, '粉丝', str(bili.get('follower') or bili.get('followers') or '--'), '#f9a8d4')
+        wrapped(58, 400, str(bili.get('latest_title') or bili.get('last_dynamic') or '暂无最新内容'), px_body, '#fce7f3', 280, 8, 22)
+        wrapped(442, 190, summary + '\n\n' + recent_user + '\n\n' + recent_assistant, px_body, '#831843', 500, 12, 24)
+
+    elif tid == "print-fleet":
+        bg = "#06110f"
+        img.paste(Image.new("RGB", IPAD_RENDER_SIZE, bg))
+        header(template.name, getattr(page, "name", template.name), "#10b981", "#d1fae5")
+        framed_panel(32, 126, 992, 648, '#0b1514', '#34d399', 'PRINTER COMMAND WALL', '#d1fae5')
+        name = str(primary.get('name') or primary.get('model') or 'Printer')
+        file_name = str(primary.get('fileName') or '暂无任务')
+        status = str(primary.get('statusText') or primary.get('status') or 'UNKNOWN')
+        remain = str(primary.get('remainingMinutes') or '--')
+        text(62, 186, name, fit_zh(name, 34, 18, 420), '#ffffff')
+        text(62, 240, f'{progress}%', _font(72, zh=True), '#34d399')
+        progress_bar(62, 332, 520, 34, progress, '#1f2937', '#10b981')
+        wrapped(62, 392, file_name, px_body, '#bbf7d0', 520, 4, 24)
+        stat_chip(64, 522, 148, 74, '剩余', remain + 'm', '#d1fae5')
+        temps = primary.get('temps') or {}
+        stat_chip(228, 522, 148, 74, '喷嘴', str(temps.get('nozzle', '--')) + '°C', '#a7f3d0')
+        stat_chip(392, 522, 148, 74, '热床', str(temps.get('bed', '--')) + '°C', '#86efac')
+        for idx, (label, val) in enumerate([("状态", status), ("CPU", f"{cpu}%"), ("MEM", f"{mem}%"), ("DISK", f"{disk}%")]):
+            y = 184 + idx * 96
+            round_box(644, y, 944, y + 74, '#111827', outline='#34d399', radius=18, width=2)
+            text(666, y + 14, label, px_small, '#6ee7b7')
+            text(666, y + 38, val, px_h2, '#ffffff')
+
+    elif tid == "print-temps":
+        bg = "#180c2f"
+        img.paste(Image.new("RGB", IPAD_RENDER_SIZE, bg))
+        header(template.name, getattr(page, "name", template.name), "#8b5cf6", "#ede9fe")
+        framed_panel(34, 128, 990, 646, '#120b24', '#a78bfa', 'THERMAL LAB', '#ede9fe')
+        temps = primary.get('temps') or {}
+        bars = [("喷嘴", int(float(temps.get('nozzle', 0) or 0)), '#a78bfa'), ("热床", int(float(temps.get('bed', 0) or 0)), '#c4b5fd'), ("腔体", int(float(temps.get('chamber', 0) or 0)), '#ddd6fe')]
+        base_y = 230
+        for idx, (label, val, tone) in enumerate(bars):
+            y = base_y + idx * 110
+            text(72, y - 12, label, px_h2, '#ede9fe')
+            progress_bar(72, y + 24, 520, 30, min(100, max(0, int(val))), '#312e81', tone)
+            text(612, y + 14, f'{val}°C', px_h1, '#ffffff')
+        text(72, 574, str(primary.get('statusText') or primary.get('status') or 'UNKNOWN'), fit_zh(str(primary.get('statusText') or primary.get('status') or 'UNKNOWN'), 26, 16, 520), '#c4b5fd')
+        slots = []
+        for unit in (primary.get('ams') or []):
+            for slot in (unit.get('slots') or [])[:4]:
+                bound = slot.get('bound') or {}
+                slots.append(f"A{int(unit.get('index',0))+1}-S{int(slot.get('slot',0))+1} {bound.get('name') or slot.get('type') or 'Slot'}")
+        y = 178
+        for item in slots[:8] or ['暂无 AMS 数据']:
+            round_box(704, y, 950, y + 56, '#24153f', outline='#8b5cf6', radius=14, width=2)
+            wrapped(720, y + 16, item, px_small, '#ede9fe', 210, 2, 18)
+            y += 62
+
+    elif tid == "print-filament":
+        bg = "#20100a"
+        img.paste(Image.new("RGB", IPAD_RENDER_SIZE, bg))
+        header(template.name, getattr(page, "name", template.name), "#f59e0b", "#fef3c7")
+        framed_panel(32, 128, 990, 646, '#111827', '#f59e0b', 'FILAMENT PRIORITY QUEUE', '#fef3c7')
+        slots = []
+        for unit in (primary.get('ams') or []):
+            for slot in (unit.get('slots') or []):
+                bound = slot.get('bound') or {}
+                try:
+                    pct = int(round(float(bound.get('remainingPercent', slot.get('remainPercent', 0)) or 0)))
+                except Exception:
+                    pct = 0
+                slots.append((pct, f"A{int(unit.get('index',0))+1}-S{int(slot.get('slot',0))+1}", str(bound.get('name') or slot.get('type') or 'Slot')))
+        slots.sort(key=lambda x: x[0])
+        y = 184
+        for idx, (pct, label, name) in enumerate(slots[:6] or [(0,'--','暂无耗材数据')]):
+            tone = '#ef4444' if pct <= 15 else '#f59e0b' if pct <= 35 else '#22c55e'
+            round_box(58, y, 956, y + 60, '#1f2937', outline=tone, radius=14, width=2)
+            text(78, y + 16, label, px_h2, '#ffffff')
+            wrapped(188, y + 12, name, px_body, '#fde68a', 420, 2, 20)
+            progress_bar(634, y + 18, 210, 18, pct, '#374151', tone)
+            text(892, y + 12, f'{pct}%', px_h1, '#ffffff')
+            y += 76
+
+    elif tid == "print-filament-8":
+        bg = "#0f0f0f"
+        img.paste(Image.new("RGB", IPAD_RENDER_SIZE, bg))
+        header(template.name, getattr(page, "name", template.name), "#ef4444", "#fee2e2")
+        framed_panel(28, 128, 994, 646, '#151515', '#ef4444', 'SLOT MATRIX / 8', '#fee2e2')
+        slots = []
+        for unit in (primary.get('ams') or [])[:2]:
+            for slot in (unit.get('slots') or [])[:4]:
+                bound = slot.get('bound') or {}
+                try:
+                    pct = int(round(float(bound.get('remainingPercent', slot.get('remainPercent', 0)) or 0)))
+                except Exception:
+                    pct = 0
+                slots.append((pct, f"A{int(unit.get('index',0))+1}-S{int(slot.get('slot',0))+1}", str(bound.get('name') or slot.get('type') or 'Slot')))
+        while len(slots) < 8:
+            slots.append((0, f'S{len(slots)+1}', '空槽位'))
+        coords = [(50, 182), (286, 182), (522, 182), (758, 182), (50, 410), (286, 410), (522, 410), (758, 410)]
+        for (pct, label, name), (x, y) in zip(slots[:8], coords):
+            tone = '#ef4444' if pct <= 15 else '#f59e0b' if pct <= 35 else '#22c55e'
+            draw.rectangle((x, y, x + 198, y + 166), fill='#1f2937', outline=tone, width=4)
+            text(x + 14, y + 14, label, px_h2, '#ffffff')
+            text(x + 150, y + 14, f'{pct}%', px_h1, '#ffffff')
+            progress_bar(x + 14, y + 54, 170, 16, pct, '#3b3b3b', tone)
+            wrapped(x + 14, y + 84, name, px_small, '#fef3c7', 170, 4, 18)
+
+    elif tid == "steam-new-releases":
+        bg = '#09111b'
+        img.paste(Image.new('RGB', IPAD_RENDER_SIZE, bg))
+        header(template.name, getattr(page, 'name', template.name), '#22c55e', '#dcfce7')
+        items = (steam_new.get('items') or [])[:3]
+        framed_panel(32, 128, 992, 646, '#07131f', '#22c55e', 'GREENLIGHT BOARD', '#dcfce7')
+        hero = items[0] if items else {'title':'暂无 Steam 新游','summary':'等待缓存刷新'}
+        hero_path = resolve_ipad_steam_header_path(hero.get('header_local_path') or hero.get('header_image_local_path') or hero.get('header_image'))
+        paste_cover(hero_path, (56, 176, 612, 404), '#111827')
+        wrapped(56, 428, str(hero.get('title') or hero.get('name') or 'Untitled'), fit_zh(str(hero.get('title') or hero.get('name') or 'Untitled'), 30, 16, 540), '#ffffff', 540, 2, 28)
+        wrapped(56, 496, str(hero.get('summary') or hero.get('short_description') or '暂无简介'), px_body, '#bbf7d0', 540, 4, 22)
+        y = 188
+        for item in items[1:] or [{'title':'更多新游稍后更新','summary':'刷新后出现'}]:
+            round_box(658, y, 944, y + 182, '#111827', outline='#22c55e', radius=18, width=2)
+            wrapped(676, y + 16, str(item.get('title') or item.get('name') or 'Untitled'), fit_zh(str(item.get('title') or item.get('name') or 'Untitled'), 22, 16, 240), '#ffffff', 240, 2, 24)
+            wrapped(676, y + 82, str(item.get('summary') or item.get('short_description') or '暂无简介'), px_body, '#bbf7d0', 240, 4, 20)
+            y += 198
+
+    elif tid == "steam-new-releases-2":
+        bg = '#1f1208'
+        img.paste(Image.new('RGB', IPAD_RENDER_SIZE, bg))
+        header(template.name, getattr(page, 'name', template.name), '#f97316', '#ffedd5')
+        items = (steam_new.get('items') or [])[:5]
+        framed_panel(34, 128, 990, 646, '#111827', '#f97316', 'CAPSULE SHELF', '#ffedd5')
+        y = 176
+        for item in items or [{'title':'暂无更多新游','summary':'等待刷新'}]:
+            round_box(56, y, 968, y + 82, '#1f2937', outline='#fb923c', radius=14, width=2)
+            cap = resolve_ipad_steam_capsule_path(item.get('capsule_local_path') or item.get('capsule_image_local_path') or item.get('capsule_image'))
+            paste_cover(cap, (68, y + 10, 240, y + 72), '#0f172a')
+            wrapped(260, y + 12, str(item.get('title') or item.get('name') or 'Untitled'), fit_zh(str(item.get('title') or item.get('name') or 'Untitled'), 22, 16, 320), '#ffffff', 320, 2, 22)
+            wrapped(600, y + 12, str(item.get('summary') or item.get('short_description') or '暂无简介'), px_small, '#fed7aa', 340, 3, 18)
+            y += 94
+
+    elif tid == "steam-new-releases-3":
+        bg = '#07131f'
+        img.paste(Image.new('RGB', IPAD_RENDER_SIZE, bg))
+        header(template.name, getattr(page, 'name', template.name), '#06b6d4', '#cffafe')
+        items = (steam_hot.get('items') or steam_new.get('items') or [])[:2]
+        framed_panel(32, 128, 992, 646, '#08121b', '#22d3ee', 'ART SPOTLIGHT', '#cffafe')
+        for idx, item in enumerate(items or [{'title':'暂无热卖新游','summary':'等待刷新'}]):
+            x1 = 54 + idx * 470
+            x2 = x1 + 416
+            hero = resolve_ipad_steam_header_path(item.get('header_local_path') or item.get('header_image_local_path') or item.get('header_image'))
+            shot = resolve_ipad_steam_screenshot_path(item.get('screenshot_local_path') or item.get('first_screenshot_local_path') or item.get('screenshot'))
+            paste_cover(hero, (x1, 172, x2, 330), '#111827')
+            paste_cover(shot, (x1, 348, x2, 504), '#111827')
+            wrapped(x1, 526, str(item.get('title') or item.get('name') or 'Untitled'), fit_zh(str(item.get('title') or item.get('name') or 'Untitled'), 24, 16, 400), '#ffffff', 400, 2, 24)
+            wrapped(x1, 582, str(item.get('summary') or item.get('short_description') or '暂无简介'), px_small, '#c6f6ff', 400, 3, 18)
+
+    elif tid == "movie-now-showing":
+        bg = '#120f1f'
+        img.paste(Image.new('RGB', IPAD_RENDER_SIZE, bg))
+        header(template.name, getattr(page, 'name', template.name), '#7c3aed', '#ede9fe')
+        framed_panel(28, 126, 996, 646, '#1a1330', '#a78bfa', 'NOW SHOWING / CINEMA BOARD', '#ede9fe')
+        if not movie_items:
+            round_box(54, 182, 970, 608, '#23183d', outline='#8b5cf6', radius=26, width=3)
+            text(512, 298, '暂无电影数据', px_big, '#f5f3ff', anchor='mm')
+            wrapped(182, 380, '电影海报与上映信息暂时为空，稍后缓存刷新后会自动恢复。', px_h2, '#ddd6fe', 660, 3, 28)
+        else:
+            hero = movie_items[0]
+            hero_poster = resolve_ipad_poster_path(hero.get('poster_local_path'))
+            paste_cover(hero_poster, (44, 166, 250, 520), '#2e1065')
+            text(270, 176, str(hero.get('title') or 'Untitled'), fit_zh(str(hero.get('title') or 'Untitled'), 28, 16, 180), '#ffffff')
+            text(270, 220, str(hero.get('release_date') or '上映日期待定'), px_small, '#c4b5fd')
+            stat_chip(270, 256, 118, 54, '排位', '01', '#c4b5fd')
+            stat_chip(402, 256, 118, 54, '总数', str(len(movie_items[:6])), '#a78bfa')
+            stat_chip(534, 256, 118, 54, '状态', '上映中', '#8b5cf6', ink='#f5f3ff')
+
+            secondary = movie_items[1:5]
+            poster_positions = [(332, 166), (632, 166), (332, 372), (632, 372)]
+            for idx, (item, (x, y)) in enumerate(zip(secondary, poster_positions), 2):
+                poster_path = resolve_ipad_poster_path(item.get('poster_local_path'))
+                round_box(x, y, x + 266, y + 190, '#1f1236', outline='#8b5cf6', radius=16, width=1)
+                paste_cover(poster_path, (x + 6, y + 6, x + 260, y + 184), '#2a1c46')
+                text(x + 14, y + 14, f'{idx:02d}', px_small, '#f5f3ff')
+
+            round_box(44, 572, 952, 622, '#201233', outline='#6d28d9', radius=14, width=1)
+            for idx, item in enumerate(secondary[:4], 2):
+                col = 0 if idx in (2, 4) else 1
+                row = 0 if idx in (2, 3) else 1
+                x = 62 if col == 0 else 516
+                y = 586 if row == 0 else 606
+                title = str(item.get('title') or 'Untitled')
+                release = str(item.get('release_date') or '上映日期待定')
+                text(x, y, f'{idx:02d}', px_tiny, '#c4b5fd')
+                wrapped(x + 22, y - 2, title, px_tiny, '#ffffff', 190, 1, 14)
+                text(x + 220, y, release, px_tiny, '#a78bfa')
+
+    else:
+        bg = '#111827'
+        img.paste(Image.new('RGB', IPAD_RENDER_SIZE, bg))
+        header(template.name, getattr(page, 'name', template.name), '#475569', '#e2e8f0')
+        framed_panel(32, 126, 992, 654, '#1f2937', '#64748b', 'TEMPLATE FALLBACK', '#e2e8f0')
+        wrapped(64, 200, f'未单独设计模板: {tid}', px_h1, '#ffffff', 860, 2, 28)
+        wrapped(64, 276, summary, px_body, '#cbd5e1', 860, 10, 24)
+
+    text(30, 680, datetime.now().strftime('%Y-%m-%d %H:%M:%S'), px_small, '#94a3b8')
+    text(804, 680, template.id, px_small, '#94a3b8')
+
+    buf = io.BytesIO()
+    img.save(buf, format='JPEG', quality=92, optimize=False)
+    return buf.getvalue()
+
+
+def render_ipad_dashboard_png(template_id: str | None = None, page_index: int = 0, rotate: bool = False) -> bytes:
+    project, template, page, dwell, rotate_index, rotate_total = load_current_page(template_id=template_id, page_index=page_index, rotate=rotate)
+    content_cache = read_json("content_cache.json", {})
+    session = read_json("session_status.json", {})
+    work = read_json("work_status.json", {})
+    alerts = HermesBridge(BRIDGE_PATH).read_inbox()
+    printmana = read_json("printmana.json", {})
+    daily = read_json("daily.json", {})
+    bili = read_json("bilibili.json", {})
+    metrics = get_system_metrics()
+    tid = template.id
+
+    if not isinstance(content_cache, dict):
+        content_cache = {}
+    if not isinstance(session, dict):
+        session = {}
+    if not isinstance(work, dict):
+        work = {}
+    if not isinstance(alerts, list):
+        alerts = []
+    if not isinstance(printmana, dict):
+        printmana = {}
+    if not isinstance(daily, dict):
+        daily = {}
+    if not isinstance(bili, dict):
+        bili = {}
+
+    weather = content_cache.get("weather::Shanghai", {}).get("payload", {})
+    weekly = content_cache.get("weather_weekly::Shanghai::6", {}).get("payload", {}).get("days", [])
+    if not isinstance(weather, dict):
+        weather = {}
+    weekly = weekly if isinstance(weekly, list) else []
+    traffic_entry = content_cache.get("traffic::default::default", {})
+    traffic_entry = traffic_entry if isinstance(traffic_entry, dict) else {}
+    traffic = traffic_entry.get("lines", [])
+    traffic = traffic if isinstance(traffic, list) else []
+    traffic_payload = traffic_entry.get("payload", {})
+    traffic_payload = traffic_payload if isinstance(traffic_payload, dict) else {}
+    solidot_payload = content_cache.get("rss::https://www.chinanews.com.cn/rss/scroll-news.xml::4", {})
+    solidot = solidot_payload.get("lines", []) if isinstance(solidot_payload, dict) else []
+    solidot_items = solidot_payload.get("items", []) if isinstance(solidot_payload, dict) else []
+    solidot_items = solidot_items if isinstance(solidot_items, list) else []
+    github = content_cache.get("rss::https://github.blog/changelog/feed/::4", {}).get("lines", [])
+    hello_github = content_cache.get("rss::https://hellogithub.com/rss::4", {}).get("lines", [])
+    github_ai_payload = content_cache.get("github::ai-trending::4", {})
+    github_ai_items = github_ai_payload.get("items", []) if isinstance(github_ai_payload, dict) else []
+    github_ai_items = github_ai_items if isinstance(github_ai_items, list) else []
+    movies_now = content_cache.get("movies::now_playing::6", {})
+    movie_items = movies_now.get("items", []) if isinstance(movies_now, dict) else []
+    gamer520_payload = content_cache.get("gamer520::pcplay::10", {})
+    gamer520_raw_items = gamer520_payload.get("items", []) if isinstance(gamer520_payload, dict) else []
+    gamer520_raw_items = gamer520_raw_items if isinstance(gamer520_raw_items, list) else []
+    switch_payload = content_cache.get("gamer520::gameswitch::10", {})
+    switch_game_items = switch_payload.get("items", []) if isinstance(switch_payload, dict) else []
+    switch_game_items = switch_game_items if isinstance(switch_game_items, list) else []
+    ps5_payload = content_cache.get("2468c::ps5game::10", {})
+    ps5_game_items = ps5_payload.get("items", []) if isinstance(ps5_payload, dict) else []
+    ps5_game_items = ps5_game_items if isinstance(ps5_game_items, list) else []
+    private_channels = content_cache.get("private_channels::summary", {})
+    private_channels = private_channels if isinstance(private_channels, dict) else {}
+    private_channel_items = private_channels.get("channels", [])
+    private_channel_items = private_channel_items if isinstance(private_channel_items, list) else []
+    private_channel_totals = private_channels.get("totals", {})
+    private_channel_totals = private_channel_totals if isinstance(private_channel_totals, dict) else {}
+    steam_new = content_cache.get("steam::new_releases::6", {})
+    steam_hot = content_cache.get("steam::top_sellers::6", {}) or content_cache.get("steam::new_and_trending::2", {}) or content_cache.get("steam::top_sellers::2", {})
+    steam_new_items = steam_new.get("items", []) if isinstance(steam_new, dict) else []
+    steam_hot_items = steam_hot.get("items", []) if isinstance(steam_hot, dict) else []
+    primary = printmana.get("primary", {}) if isinstance(printmana, dict) else {}
+    primary = primary if isinstance(primary, dict) else {}
+    person_photo_portrait = read_json("../data/person_photos/portrait/current.json", {})
+    person_photo_landscape = read_json("../data/person_photos/landscape/current.json", {})
+    if not isinstance(person_photo_portrait, dict):
+        person_photo_portrait = {}
+    if not isinstance(person_photo_landscape, dict):
+        person_photo_landscape = {}
+    vps_info = load_vps_public_info()
+
+    img = Image.new("RGB", IPAD_RENDER_SIZE, "#07111f")
+    draw = _ScaledImageDraw(img, IPAD_RETINA_SCALE)
+    fonts = {
+        "tiny": _font(18, zh=True),
+        "small": _font(20, zh=True),
+        "body": _font(24, zh=True),
+        "body2": _font(27, zh=True),
+        "h2": _font(31, zh=True),
+        "h1": _font(38, zh=True),
+        "hero": _font(78, zh=True),
+        "mega": _font(96, zh=True),
+    }
+
+    def clean(value, fallback="--"):
+        text_value = str(value if value not in (None, "") else fallback)
+        return " ".join(text_value.split())
+
+    def clamp_text(value, limit=54):
+        text_value = clean(value, "")
+        return text_value if len(text_value) <= limit else text_value[: max(1, limit - 1)].rstrip() + "..."
+
+    def wrap_lines(value, font, width, max_lines):
+        raw = str(value if value not in (None, "") else "")
+        lines = []
+        for para in raw.splitlines() or [raw]:
+            para = " ".join(para.split())
+            if not para:
+                continue
+            cjk = any(ord(ch) > 127 for ch in para)
+            units = list(para) if cjk else para.split(" ")
+            sep = "" if cjk else " "
+            current = ""
+            for unit in units:
+                candidate = unit if not current else current + sep + unit
+                bbox = draw.textbbox((0, 0), candidate, font=font)
+                if bbox[2] - bbox[0] <= width or not current:
+                    current = candidate
+                    continue
+                lines.append(current)
+                current = unit
+                if len(lines) >= max_lines:
+                    break
+            if current and len(lines) < max_lines:
+                lines.append(current)
+            if len(lines) >= max_lines:
+                break
+        if len(lines) == max_lines and lines:
+            last = lines[-1]
+            if len(last) > 3:
+                lines[-1] = last[:-1] + "..."
+        return lines[:max_lines]
+
+    def text(x, y, value, font, fill="#f8fafc", anchor=None):
+        draw.text((x, y), clean(value, ""), font=font, fill=fill, anchor=anchor)
+
+    def box(x1, y1, x2, y2, fill, outline="#334155", radius=18, width=2):
+        draw.rounded_rectangle((x1, y1, x2, y2), radius=radius, fill=fill, outline=outline, width=width)
+
+    def title_box(x1, y1, x2, y2, title, fill, outline, title_color="#ffffff"):
+        box(x1, y1, x2, y2, fill, outline, 20, 2)
+        text(x1 + 18, y1 + 14, title, fonts["h2"], title_color)
+        return y1 + 58
+
+    def wrapped_text(x, y, value, font, fill, width, max_lines, line_h=None):
+        line_h = line_h or int((font.size / IPAD_RETINA_SCALE) * 1.18)
+        for index, line in enumerate(wrap_lines(value, font, width, max_lines)):
+            draw.text((x, y + index * line_h), line, font=font, fill=fill)
+
+    def bullet_list(x, y, items, font, fill, width, max_items=5, line_h=31, prefix=""):
+        source = [clean(item, "") for item in items if clean(item, "")]
+        if not source:
+            source = ["暂无数据"]
+        cy = y
+        for index, item in enumerate(source[:max_items], 1):
+            marker = prefix or f"{index:02d}"
+            text(x, cy, marker, fonts["small"], fill)
+            wrapped_text(x + 48, cy - 2, item, font, fill, width - 52, 2, line_h)
+            cy += line_h * 2 + 8
+
+    def stat(x, y, w, label, value, fill="#e0f2fe", ink="#0f172a"):
+        box(x, y, x + w, y + 72, fill, None, 16, 1)
+        text(x + 14, y + 10, label, fonts["small"], ink)
+        text(x + w - 14, y + 38, value, fonts["h2"], ink, anchor="rm")
+
+    def pct_value(value):
+        try:
+            return max(0, min(100, int(round(float(str(value).replace("%", ""))))))
+        except Exception:
+            return 0
+
+    def meter(x, y, w, label, value, color="#38bdf8"):
+        pct = pct_value(value)
+        text(x, y, label, fonts["body"], "#e2e8f0")
+        text(x + w, y, f"{pct}%", fonts["body"], "#ffffff", anchor="ra")
+        box(x, y + 34, x + w, y + 54, "#152033", None, 10, 1)
+        if pct:
+            box(x, y + 34, x + max(22, int(w * pct / 100)), y + 54, color, None, 10, 1)
+
+    def temp_meter(x, y, w, label, value, max_temp, color="#a78bfa"):
+        try:
+            temp_val = float(value or 0)
+        except Exception:
+            temp_val = 0
+        pct = max(0, min(100, int(round(temp_val * 100 / max(1, max_temp)))))
+        text(x, y, label, fonts["body"], "#e2e8f0")
+        text(x + w, y, f"{clean(value)}°", fonts["body"], "#ffffff", anchor="ra")
+        box(x, y + 34, x + w, y + 54, "#251640", None, 10, 1)
+        if pct:
+            box(x, y + 34, x + max(22, int(w * pct / 100)), y + 54, color, None, 10, 1)
+
+    def steam_summary(item):
+        raw = clean(item.get("summary") or item.get("short_description") or item.get("description") or item.get("about_the_game"), "")
+        banned = {
+            "新上架，建议进一步观察口碑与题材。",
+            "热销中，建议优先看题材与口碑。",
+        }
+        if raw in banned:
+            raw = ""
+        if not raw:
+            pieces = [clean(item.get("genres") or item.get("genres_text"), ""), clean(item.get("review"), ""), clean(item.get("price"), "")]
+            pieces = [part for part in pieces if part and part != "--" and part != "类型待补充"]
+            raw = " / ".join(pieces) or "暂无商店简介，等待下一次缓存刷新补充。"
+        return clamp_text(raw, 92)
+
+    def steam_title(item):
+        return clean(item.get("title") or item.get("name"), "Untitled")
+
+    def steam_meta(item):
+        pieces = []
+        for key in ("genres", "genres_text", "price", "review"):
+            value = clean(item.get(key), "")
+            if value and value not in {"类型待补充", "新作观察中"}:
+                pieces.append(value)
+        release = item.get("release_date")
+        if isinstance(release, dict):
+            date_text = clean(release.get("date"), "")
+            if date_text:
+                pieces.append(date_text)
+        elif clean(release, ""):
+            pieces.append(clean(release, ""))
+        return "  |  ".join(pieces[:3]) or "Steam 商店数据"
+
+    def steam_meta_parts(item):
+        genre = clean(item.get("genres") or item.get("genres_text"), "类型待补充")
+        price = clean(item.get("price"), "价格待补充")
+        release = item.get("release_date")
+        if isinstance(release, dict):
+            release = release.get("date")
+        date_value = compact_movie_date(release) if release else "日期待补充"
+        return genre, price, date_value
+
+    def steam_is_allowed(item):
+        hay = " ".join(
+            [
+                steam_title(item),
+                clean(item.get("summary") or item.get("short_description") or item.get("description"), ""),
+                clean(item.get("genres") or item.get("genres_text"), ""),
+                " ".join(str(tag) for tag in (item.get("tags") or [])),
+            ]
+        ).lower()
+        blocked = [
+            "adult",
+            "nsfw",
+            "hentai",
+            "eroge",
+            "erotic",
+            "porn",
+            "sexual",
+            "nudity",
+            "18+",
+            "成人",
+            "色情",
+            "性爱",
+            "性内容",
+            "裸露",
+            "裸体",
+            "黄油",
+            "绅士",
+            "你妈真漂亮",
+        ]
+        if any(word in hay for word in blocked):
+            return False
+        low_signal = ["soundtrack", "ost", "artbook", "demo", "playtest", "skin", "avatar", "bundle", "合集", "捆绑包", "资料片", "终极版", "wallpaper", "壁纸"]
+        if any(word in hay for word in low_signal):
+            return False
+        return True
+
+    def steam_image(item, kind="header"):
+        if kind == "screenshot":
+            shots = item.get("screenshots") if isinstance(item.get("screenshots"), list) else []
+            for shot in shots:
+                if not isinstance(shot, dict):
+                    continue
+                path = resolve_ipad_steam_screenshot_path(shot.get("local_path") or shot.get("path") or shot.get("url"))
+                if path and path.exists():
+                    return path
+            return resolve_ipad_steam_screenshot_path(item.get("screenshot_local_path") or item.get("first_screenshot_local_path") or item.get("screenshot"))
+        if kind == "capsule":
+            return resolve_ipad_steam_capsule_path(item.get("capsule_local_path") or item.get("capsule_image_local_path") or item.get("capsule_image"))
+        return resolve_ipad_steam_header_path(item.get("header_local_path") or item.get("header_image_local_path") or item.get("header_image"))
+
+    def steam_card(x, y, w, h, item, accent, index=1, image_kind="header"):
+        box(x, y, x + w, y + h, "#101827", accent, 16, 2)
+        img_h = 104 if h < 170 else 132
+        paste_cover(steam_image(item, image_kind), (x + 12, y + 12, x + w - 12, y + img_h), "#0f172a")
+        text(x + 18, y + img_h + 16, f"{index:02d}", fonts["small"], accent)
+        wrapped_text(x + 62, y + img_h + 12, steam_title(item), fonts["body2"], "#ffffff", w - 82, 2, 31)
+        wrapped_text(x + 18, y + img_h + 76, steam_summary(item), fonts["small"], "#dbeafe", w - 36, max(1, (h - img_h - 88) // 24), 24)
+
+    def paste_cover(path_value: Path | None, rect, fallback="#111827"):
+        x1, y1, x2, y2 = rect
+        box(x1, y1, x2, y2, fallback, "#475569", 16, 2)
+        if not path_value or not path_value.exists():
+            return False
+        try:
+            cover = Image.open(path_value).convert("RGB")
+            target_w = (x2 - x1 - 10) * IPAD_RETINA_SCALE
+            target_h = (y2 - y1 - 10) * IPAD_RETINA_SCALE
+            cover.thumbnail((target_w, target_h), Image.Resampling.LANCZOS)
+            px = x1 * IPAD_RETINA_SCALE + (((x2 - x1) * IPAD_RETINA_SCALE) - cover.width) // 2
+            py = y1 * IPAD_RETINA_SCALE + (((y2 - y1) * IPAD_RETINA_SCALE) - cover.height) // 2
+            img.paste(cover, (px, py))
+            return True
+        except Exception:
+            return False
+
+    def paste_fill(path_value: Path | None, rect, fallback="#111827", outline="#475569", radius=14):
+        x1, y1, x2, y2 = rect
+        box(x1, y1, x2, y2, fallback, outline, radius, 2)
+        if not path_value or not path_value.exists():
+            return False
+        try:
+            target_size = ((x2 - x1) * IPAD_RETINA_SCALE, (y2 - y1) * IPAD_RETINA_SCALE)
+            source = Image.open(path_value).convert("RGB")
+            fitted = ImageOps.fit(source, target_size, method=Image.Resampling.LANCZOS)
+            mask = Image.new("L", target_size, 0)
+            mask_draw = ImageDraw.Draw(mask)
+            mask_draw.rounded_rectangle(
+                (0, 0, target_size[0] - 1, target_size[1] - 1),
+                radius=radius * IPAD_RETINA_SCALE,
+                fill=255,
+            )
+            img.paste(fitted, (x1 * IPAD_RETINA_SCALE, y1 * IPAD_RETINA_SCALE), mask)
+            box(x1, y1, x2, y2, None, outline, radius, 2)
+            return True
+        except Exception:
+            return False
+
+    def paste_contain(path_value: Path | None, rect, fallback="#111827", outline="#475569", radius=14):
+        x1, y1, x2, y2 = rect
+        box(x1, y1, x2, y2, fallback, outline, radius, 2)
+        if not path_value or not path_value.exists():
+            return False
+        try:
+            max_size = ((x2 - x1 - 8) * IPAD_RETINA_SCALE, (y2 - y1 - 8) * IPAD_RETINA_SCALE)
+            source = Image.open(path_value).convert("RGB")
+            source.thumbnail(max_size, Image.Resampling.LANCZOS)
+            px = x1 * IPAD_RETINA_SCALE + (((x2 - x1) * IPAD_RETINA_SCALE) - source.width) // 2
+            py = y1 * IPAD_RETINA_SCALE + (((y2 - y1) * IPAD_RETINA_SCALE) - source.height) // 2
+            img.paste(source, (px, py))
+            return True
+        except Exception:
+            return False
+
+    def compact_movie_date(value):
+        raw = clean(value, "待定")
+        numbers = re.findall(r"\d+", raw)
+        if len(numbers) >= 3:
+            return f"{int(numbers[0]):04d}-{int(numbers[1]):02d}-{int(numbers[2]):02d}"
+        return raw
+
+    def channel_money(value, fallback="--"):
+        if value is None:
+            return fallback
+        try:
+            amount = float(value)
+        except (TypeError, ValueError):
+            return fallback
+        return f"${amount:,.2f}"
+
+    def channel_count(value, fallback="--"):
+        if value is None:
+            return fallback
+        try:
+            number = int(float(value))
+        except (TypeError, ValueError):
+            return fallback
+        if number >= 1_000_000:
+            return f"{number / 1_000_000:.1f}M"
+        if number >= 1_000:
+            return f"{number / 1_000:.1f}K"
+        return f"{number:,}"
+
+    def header(bg, accent, subtitle=None):
+        img.paste(Image.new("RGB", IPAD_RENDER_SIZE, bg))
+        draw.rectangle((0, 0, 1024, 72), fill=accent)
+
+        # One-line shared header: page title on the left, status/date on the
+        # right. Both groups are anchored to the true vertical center.
+        title = clean(template.name or tid)
+        title_font = _fit_text(draw, title, FONT_ZH, 38, 30, 390)
+        text(28, 36, title, title_font, "#ffffff", anchor="lm")
+
+        meta = f"{rotate_index + 1}/{rotate_total} · {dwell}s · {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+        meta_font = _fit_text(draw, meta, FONT_ZH, 26, 22, 550)
+        text(990, 36, meta, meta_font, "#ffffff", anchor="rm")
+
+    def footer(color="#94a3b8"):
+        # Date/time now lives in the header. Keep the lower edge completely
+        # free so compact iPad pages can use the full content height.
+        return
+
+    current_task = clean(work.get("current_task"), "等待任务")
+    next_task = clean(work.get("next_task"), "继续当前项")
+    summary = clean(work.get("summary") or session.get("summary"), "暂无摘要")
+    recent_user = clean(session.get("user_last"), "暂无用户消息")
+    recent_assistant = clean(session.get("assistant_last"), "暂无助手消息")
+    cpu = pct_value((metrics.get("cpu_user") or 0) + (metrics.get("cpu_sys") or 0))
+    mem = pct_value(metrics.get("memory_pressure") or 0)
+    disk = pct_value(metrics.get("disk_used_pct") or 0)
+    temp = clean(weather.get("temperature"))
+    desc = clean(weather.get("description"), "天气")
+
+    if tid == "hello":
+        header("#071d2b", "#0f5f87", clean(template.name or "今日总览"))
+        hour = datetime.now().hour
+        greet = "早上好" if 5 <= hour < 12 else "下午好" if 12 <= hour < 18 else "晚上好"
+        box(28, 88, 620, 680, "#e6f7ff", "#7dd3fc", 22, 2)
+        text(54, 110, "HELLO / 今日行动", fonts["h2"], "#075985")
+        greet_font = _fit_text(draw, f"主人们，{greet}", FONT_ZH, 66, 40, 526)
+        draw.text((54, 174), f"主人们，{greet}", font=greet_font, fill="#083344")
+        wrapped_text(54, 272, clean(daily.get("quote"), "今天继续稳稳推进。"), fonts["h2"], "#155e75", 526, 3, 40)
+        box(54, 414, 594, 510, "#cffafe", "#67e8f9", 16, 2)
+        text(72, 430, "当前任务", fonts["tiny"], "#0e7490")
+        wrapped_text(72, 460, current_task, fonts["body2"], "#164e63", 496, 2, 32)
+        box(54, 528, 594, 650, "#bae6fd", "#38bdf8", 16, 2)
+        text(72, 544, "下一步", fonts["tiny"], "#0369a1")
+        wrapped_text(72, 576, next_task, fonts["body2"], "#0c4a6e", 496, 2, 32)
+        box(640, 88, 996, 374, "#082f49", "#38bdf8", 22, 2)
+        text(666, 110, "LIVE", fonts["h2"], "#bae6fd")
+        text(818, 210, datetime.now().strftime("%H:%M"), fonts["mega"], "#ffffff", anchor="mm")
+        stat(666, 286, 132, "天气", f"{temp}°", "#bae6fd")
+        stat(824, 286, 132, "CPU", f"{cpu}%", "#67e8f9")
+        box(640, 394, 996, 680, "#0b1523", "#38bdf8", 22, 2)
+        text(666, 416, "状态摘要", fonts["h2"], "#bae6fd")
+        wrapped_text(666, 474, summary, fonts["body"], "#e0f2fe", 304, 4, 40)
+
+    elif tid == "weather":
+        header("#04212e", "#0f766e", clean(template.name or "上海天气"))
+        box(28, 88, 410, 680, "#e0fbff", "#67e8f9", 22, 2)
+        text(52, 110, "NOW / 上海实况", fonts["h2"], "#0e7490")
+        text(219, 224, _weather_icon_char(desc), _weather_icon_font(104), "#0891b2", anchor="mm")
+        text(219, 362, f"{temp}°", fonts["mega"], "#0f172a", anchor="mm")
+        desc_font = _fit_text(draw, desc, FONT_ZH, 38, 24, 316)
+        draw.text((219, 446), desc, font=desc_font, fill="#164e63", anchor="mm")
+        weather_stats = [("最低", weather.get("temp_min")), ("最高", weather.get("temp_max")), ("湿度", weather.get("humidity"))]
+        for idx, (label, value) in enumerate(weather_stats):
+            sx = 50 + idx * 116
+            box(sx, 520, sx + 100, 634, "#cffafe", "#67e8f9", 14, 2)
+            text(sx + 14, 538, label, fonts["tiny"], "#0e7490")
+            suffix = "%" if label == "湿度" else "°"
+            text(sx + 50, 590, f"{clean(value)}{suffix}", fonts["h2"], "#164e63", anchor="mm")
+        box(432, 88, 996, 216, "#062f3f", "#22d3ee", 20, 2)
+        details = [("风速", f"{clean(weather.get('wind_speed'))} km/h"), ("观测", clean(weather.get("observed_at"), "实时")), ("来源", clean(weather.get("source"), "中国天气网"))]
+        for idx, (label, value) in enumerate(details):
+            dx = 458 + idx * 176
+            text(dx, 110, label, fonts["tiny"], "#a5f3fc")
+            text(dx, 154, clamp_text(value, 12), fonts["body2"], "#ffffff")
+        box(432, 236, 996, 680, "#e6fffb", "#2dd4bf", 20, 2)
+        text(456, 254, "未来六日", fonts["h2"], "#0f766e")
+        for index, item in enumerate((weekly[:6] or [{}] * 6)):
+            col, row = index % 3, index // 3
+            x, y = 450 + col * 174, 302 + row * 174
+            box(x, y, x + 160, y + 156, "#f0fdfa", "#5eead4", 14, 2)
+            text(x + 16, y + 14, clean(item.get("weekday"), "--"), fonts["small"], "#0f766e")
+            text(x + 126, y + 50, _weather_icon_char(clean(item.get("description"))), _weather_icon_font(38), "#0891b2", anchor="mm")
+            text(x + 16, y + 62, clamp_text(clean(item.get("description"), "天气"), 6), fonts["small"], "#164e63")
+            text(x + 16, y + 112, f"{clean(item.get('temp_min'))}° / {clean(item.get('temp_max'))}°", fonts["small"], "#0f172a")
+
+    elif tid == "weather-weekly":
+        # Single-line compact header; use the reclaimed vertical space for a
+        # larger 3 × 2 forecast wall sized for the 1024 × 700 iPad canvas.
+        header("#0f172a", "#475569", clean(template.name or "本周天气"))
+        for index, item in enumerate((weekly[:6] or [{}] * 6)):
+            col = index % 3
+            row = index // 3
+            x = 28 + col * 328
+            y = 88 + row * 290
+            card_w = 312
+            card_h = 274
+            box(x, y, x + card_w, y + card_h, "#f8fafc", "#94a3b8", 20, 2)
+            weekday = clean(item.get("weekday"), f"D{index+1}")
+            date_value = clean(item.get("date"), "")
+            date_short = date_value[5:] if len(date_value) >= 10 else date_value
+            text(x + 22, y + 20, weekday, fonts["h1"], "#0f172a")
+            if date_short:
+                text(x + card_w - 20, y + 32, date_short, fonts["small"], "#64748b", anchor="ra")
+            text(x + card_w - 50, y + 100, _weather_icon_char(clean(item.get("description"))), _weather_icon_font(48), "#0284c7", anchor="mm")
+            wrapped_text(x + 22, y + 92, clean(item.get("description"), "暂无天气"), fonts["h2"], "#334155", 200, 2, 38)
+            draw.line((x + 22, y + 176, x + card_w - 22, y + 176), fill="#cbd5e1", width=2)
+            text(x + 22, y + 194, "最低", fonts["tiny"], "#64748b")
+            text(x + 22, y + 222, f"{clean(item.get('temp_min'))}°", fonts["h2"], "#0369a1")
+            text(x + 164, y + 194, "最高", fonts["tiny"], "#64748b")
+            text(x + card_w - 22, y + 222, f"{clean(item.get('temp_max'))}°", fonts["h2"], "#0f766e", anchor="ra")
+
+    elif tid == "vps":
+        header("#071914", "#047857", clean(template.name or "VPS 信息"))
+
+        monthly = traffic_payload.get("monthly") if isinstance(traffic_payload.get("monthly"), dict) else {}
+        cycle = traffic_payload.get("cycle") if isinstance(traffic_payload.get("cycle"), dict) else {}
+        alert = traffic_payload.get("alert") if isinstance(traffic_payload.get("alert"), dict) else {}
+        used_pct = pct_value(monthly.get("percent_used", 0))
+        used_human = clean(monthly.get("used_human"), "--")
+        remaining_human = clean(monthly.get("remaining_human"), "--")
+        quota_human = clean(monthly.get("quota_human"), "500.00 GB")
+        rx_human = clean(monthly.get("rx_human"), "--")
+        tx_human = clean(monthly.get("tx_human"), "--")
+        cycle_start = clean(cycle.get("start"), "")[5:10].replace("-", "/") or "--"
+        cycle_end = clean(cycle.get("end"), "")[5:10].replace("-", "/") or "--"
+        status_ok = clean(alert.get("level"), "ok").lower() == "ok"
+
+        # Left column: remote VPS identity and live monthly traffic. No local
+        # macOS resource metrics or credentials are allowed on this page.
+        box(28, 88, 410, 680, "#ecfdf5", "#34d399", 22, 2)
+        text(54, 110, "REMOTE VPS", fonts["small"], "#047857")
+        text(54, 148, vps_info["ip"], fonts["h1"], "#064e3b")
+        wrapped_text(54, 198, vps_info["hostname"], fonts["small"], "#0f766e", 326, 2, 25)
+        box(54, 254, 384, 300, "#d1fae5", "#6ee7b7", 13, 1)
+        spec_text = "NYC2 · Ubuntu · 1C / 512M / 10G"
+        spec_font = _fit_text(draw, spec_text, FONT_ZH, 18, 14, 298)
+        draw.text((70, 277), spec_text, font=spec_font, fill="#065f46", anchor="lm")
+
+        text(54, 330, "本月流量已用", fonts["small"], "#047857")
+        pct_font = _fit_text(draw, f"{used_pct}%", FONT_ZH, 78, 56, 280)
+        draw.text((54, 356), f"{used_pct}%", font=pct_font, fill="#065f46")
+        box(54, 452, 384, 478, "#bbf7d0", None, 13, 1)
+        if used_pct:
+            bar_color = "#f59e0b" if used_pct >= 80 else "#10b981"
+            box(54, 452, 54 + max(24, int(330 * used_pct / 100)), 478, bar_color, None, 13, 1)
+
+        traffic_stats = [
+            ("已用", used_human),
+            ("剩余", remaining_human),
+            ("额度", quota_human),
+            ("周期", f"{cycle_start} - {cycle_end}"),
+        ]
+        for idx, (label, value) in enumerate(traffic_stats):
+            x = 54 + (idx % 2) * 170
+            y = 506 + (idx // 2) * 78
+            text(x, y, label, fonts["tiny"], "#047857")
+            value_font = _fit_text(draw, value, FONT_ZH, 24, 18, 150)
+            draw.text((x, y + 28), value, font=value_font, fill="#064e3b")
+
+        # Right top: public endpoints and network roles from SERVER_INFO.md.
+        box(432, 88, 996, 330, "#052e2b", "#34d399", 22, 2)
+        text(458, 110, "站点 / 网络", fonts["h2"], "#d1fae5")
+        endpoints = [
+            ("主站 · HTTPS", vps_info["primary_domain"]),
+            ("站点 · Nginx", vps_info["secondary_domain"]),
+            ("HTTP 代理 · 18080", vps_info["ip"]),
+            ("SOCKS5 · 18081", vps_info["ip"]),
+        ]
+        for idx, (label, value) in enumerate(endpoints):
+            x = 458 + (idx % 2) * 258
+            y = 166 + (idx // 2) * 74
+            box(x, y, x + 238, y + 60, "#0d4036", "#166534", 12, 1)
+            text(x + 12, y + 9, label, fonts["tiny"], "#6ee7b7")
+            value_font = _fit_text(draw, value, FONT_ZH, 21, 16, 214)
+            draw.text((x + 12, y + 34), value, font=value_font, fill="#ffffff")
+
+        # Right bottom: only services that run on the VPS. Status reflects the
+        # latest traffic API response; credentials and private panel paths stay hidden.
+        box(432, 350, 996, 680, "#0a1514", "#34d399", 22, 2)
+        text(458, 372, "VPS 服务矩阵", fonts["h2"], "#d1fae5")
+        box(852, 370, 970, 410, "#064e3b" if status_ok else "#7c2d12", "#34d399", 12, 1)
+        text(911, 390, "流量 API 正常" if status_ok else "流量 API 异常", fonts["tiny"], "#d1fae5", anchor="mm")
+        service_labels = [
+            ("WEB", "nginx", "80 / 443"),
+            ("流量 API", "traffic-api", "127.0.0.1:2098"),
+            ("HTTP 代理", "tinyproxy", "18080"),
+            ("SOCKS5", "danted", "18081"),
+            ("订阅", "clash-sub", "2097"),
+            ("节点", "x-ui / Xray", "8443 / 2443"),
+        ]
+        for idx, (kind, service, port) in enumerate(service_labels):
+            x = 458 + (idx % 3) * 170
+            y = 430 + (idx // 3) * 106
+            box(x, y, x + 154, y + 90, "#11302a", "#166534", 14, 1)
+            text(x + 12, y + 10, kind, fonts["tiny"], "#6ee7b7")
+            service_font = _fit_text(draw, service, FONT_ZH, 20, 15, 130)
+            draw.text((x + 12, y + 38), service, font=service_font, fill="#ffffff")
+            port_font = _fit_text(draw, port, FONT_ZH, 17, 13, 130)
+            draw.text((x + 142, y + 62), port, font=port_font, fill="#a7f3d0", anchor="ra")
+
+        footer_text = f"RX+TX 计入额度 · RX {rx_human} · TX {tx_human} · 文档 {clean(vps_info.get('updated_at'), '--')}"
+        footer_font = _fit_text(draw, footer_text, FONT_ZH, 18, 14, 500)
+        draw.text((458, 642), footer_text, font=footer_font, fill="#6ee7b7")
+
+    elif tid == "daily-news":
+        header("#241006", "#ea580c", clean(template.name or "每日新闻"))
+        news_cards = [item for item in solidot_items if isinstance(item, dict)]
+        if not news_cards:
+            news_cards = [{"title": line, "summary": "", "image_local_path": ""} for line in (solidot or ["暂无新闻缓存"])]
+        hero = news_cards[0] if news_cards else {"title": "暂无新闻缓存", "summary": ""}
+        hero_title = clean(hero.get("title"), "暂无新闻标题")
+        hero_summary = clean(hero.get("summary"), "")
+        if hero_summary and (hero_summary == hero_title or (hero_summary.startswith(hero_title) and len(hero_summary) - len(hero_title) < 20)):
+            hero_summary = ""
+
+        # News is an information page, not a decorative poster: the page title
+        # already lives in the shared header, so the whole canvas is devoted to
+        # the headline and readable story excerpts.
+        box(28, 88, 996, 252, "#fff7ed", "#fb923c", 20, 2)
+        box(50, 110, 124, 160, "#ea580c", None, 12, 1)
+        text(87, 135, "头条", fonts["small"], "#ffffff", anchor="mm")
+        text(954, 118, "01", fonts["h2"], "#ea580c", anchor="ra")
+
+        # Keep the headline on the same row as the label.  Its summary follows
+        # the actual wrapped title height instead of starting at a fixed, low Y.
+        hero_title_lines = wrap_lines(hero_title, fonts["h1"], 760, 2)
+        for line_index, line in enumerate(hero_title_lines):
+            draw.text((144, 108 + line_index * 42), line, font=fonts["h1"], fill="#1f2937")
+        if hero_summary:
+            summary_y = 108 + len(hero_title_lines) * 42 + 10
+            wrapped_text(144, summary_y, hero_summary, fonts["small"], "#9a3412", 810, 3, 23)
+
+        cards = news_cards[1:4]
+        while len(cards) < 3:
+            cards.append({"title": "暂无更多新闻", "summary": "等待下一次内容刷新。"})
+        for idx, item in enumerate(cards, 2):
+            y = 266 + (idx - 2) * 132
+            box(28, y, 996, y + 120, "#fffaf0", "#fdba74", 14, 2)
+            box(46, y + 18, 104, y + 102, "#ffedd5", "#fb923c", 12, 2)
+            text(75, y + 60, f"{idx:02d}", fonts["h2"], "#c2410c", anchor="mm")
+            title_value = clean(item.get("title"), "暂无标题")
+            summary_value = clean(item.get("summary"), "")
+            wrapped_text(124, y + 12, title_value, fonts["body2"], "#1f2937", 830, 2, 30)
+            if summary_value and summary_value != title_value:
+                wrapped_text(124, y + 58, summary_value, fonts["tiny"], "#9a3412", 830, 2, 18)
+
+    elif tid == "github-news":
+        header("#050816", "#4f46e5", "GitHub 热门 AI 项目")
+        projects = [item for item in github_ai_items if isinstance(item, dict)][:4]
+        if not projects:
+            box(28, 88, 996, 680, "#0f172a", "#6366f1", 20, 2)
+            text(512, 350, "正在刷新 GitHub AI 热榜", fonts["h1"], "#ffffff", anchor="mm")
+        else:
+            accents = ["#22d3ee", "#a78bfa", "#f472b6", "#f59e0b"]
+            for idx, item in enumerate(projects):
+                y = 92 + idx * 146
+                accent = accents[idx]
+                box(28, y, 996, y + 132, "#101827", accent, 16, 2)
+                box(46, y + 20, 104, y + 76, "#172554", accent, 13, 1)
+                text(75, y + 48, f"{idx + 1:02d}", fonts["h2"], accent, anchor="mm")
+
+                full_name = clean(item.get("full_name"), "unknown/project")
+                name_font = _fit_text(draw, full_name, FONT_ZH, 29, 22, 520)
+                text(126, y + 16, full_name, name_font, "#ffffff")
+                language = clean(item.get("language"), "--")
+                stars = int(item.get("stars") or 0)
+                forks = int(item.get("forks") or 0)
+                meta = f"★ {stars:,}   Fork {forks:,}   {language}"
+                meta_font = _fit_text(draw, meta, FONT_ZH, 20, 16, 280)
+                text(968, y + 22, meta, meta_font, accent, anchor="ra")
+
+                description = clean(item.get("description"), "暂无项目简介")
+                desc_font = _fit_text(draw, description, FONT_ZH, 20, 17, 820)
+                wrapped_text(126, y + 62, description, desc_font, "#cbd5e1", 820, 2, 25)
+
+    elif tid == "alerts":
+        header("#2a0c1a", "#be123c", "提醒队列")
+        live_alerts = [item for item in alerts if isinstance(item, dict)][:5]
+        title_box(32, 122, 620, 634, "ALERT STACK", "#fff1f2", "#fb7185", "#be123c")
+        if not live_alerts:
+            live_alerts = [{"severity": "info", "title": "暂无提醒", "body": "当前没有未处理提醒。"}]
+        y = 190
+        for item in live_alerts[:4]:
+            box(62, y, 586, y + 84, "#ffffff", "#fda4af", 16, 2)
+            text(82, y + 16, clean(item.get("severity"), "info").upper(), fonts["small"], "#e11d48")
+            wrapped_text(176, y + 14, f"{clean(item.get('title'), '提醒')}  {clean(item.get('body'), '')}", fonts["body"], "#3f3f46", 378, 2, 30)
+            y += 100
+        title_box(646, 122, 996, 634, "ACTION", "#170a13", "#fb7185")
+        wrapped_text(674, 192, f"当前任务\n{current_task}\n\n下一步\n{next_task}\n\n摘要\n{summary}", fonts["body2"], "#ffe4e6", 286, 10, 33)
+
+    elif tid == "dashboard":
+        header("#06181f", "#047857", "工作仪表盘")
+        title_box(32, 122, 620, 382, "CURRENT TASK", "#052e2b", "#34d399")
+        wrapped_text(62, 198, current_task, fonts["h1"], "#ffffff", 500, 3, 44)
+        wrapped_text(62, 318, next_task, fonts["body2"], "#bbf7d0", 500, 2, 34)
+        title_box(646, 122, 996, 382, "METRICS", "#f0fdf4", "#34d399", "#047857")
+        meter(680, 198, 260, "CPU", cpu, "#22c55e")
+        meter(680, 272, 260, "MEM", mem, "#84cc16")
+        title_box(32, 408, 996, 634, "RECENT CONTEXT", "#0b1514", "#34d399")
+        wrapped_text(62, 478, summary + "\n" + recent_user, fonts["body2"], "#d1fae5", 880, 4, 34)
+
+    elif tid == "focus":
+        header("#2b1806", "#b45309", "专注模式")
+        box(38, 128, 986, 632, "#111827", "#f59e0b", 24, 3)
+        text(512, 224, datetime.now().strftime("%H:%M"), fonts["mega"], "#ffffff", anchor="mm")
+        wrapped_text(142, 308, current_task, fonts["h1"], "#fde68a", 740, 3, 44)
+        wrapped_text(142, 454, clean(daily.get("quote"), summary), fonts["h2"], "#fef3c7", 740, 3, 38)
+        text(512, 584, "单任务推进 / 降低干扰 / 保持节奏", fonts["h2"], "#fbbf24", anchor="mm")
+
+    elif tid == "night-shift":
+        header("#120b24", "#6d28d9", "夜间值守")
+        title_box(34, 122, 460, 634, "QUIET STATUS", "#1b1033", "#a78bfa")
+        text(78, 196, datetime.now().strftime("%H:%M"), fonts["mega"], "#ffffff")
+        wrapped_text(80, 314, current_task, fonts["h2"], "#ddd6fe", 330, 3, 38)
+        title_box(488, 122, 996, 372, "ALERTS", "#24153f", "#8b5cf6")
+        bullet_list(520, 194, [clean(item.get("title"), "提醒") for item in alerts if isinstance(item, dict)] or ["暂无提醒"], fonts["body"], "#ede9fe", 420, 3, 30, "!")
+        title_box(488, 396, 996, 634, "CHAT", "#0b0f1a", "#8b5cf6")
+        wrapped_text(520, 466, recent_user + "\n" + recent_assistant, fonts["body"], "#c4b5fd", 420, 5, 30)
+
+    elif tid == "system":
+        header("#0f172a", "#334155", "系统状态")
+        title_box(32, 88, 996, 674, "SYSTEM CORE", "#111827", "#64748b")
+        stat(72, 150, 190, "CPU", f"{cpu}%", "#bfdbfe")
+        stat(292, 150, 190, "MEM", f"{mem}%", "#cbd5e1")
+        stat(512, 150, 190, "DISK", f"{disk}%", "#e2e8f0")
+        stat(732, 150, 190, "THERMAL", clean(metrics.get("thermal_status"), "未知"), "#dbeafe")
+        meter(80, 275, 840, "CPU LOAD", cpu, "#60a5fa")
+        meter(80, 365, 840, "MEMORY", mem, "#94a3b8")
+        meter(80, 455, 840, "DISK", disk, "#cbd5e1")
+        text(80, 590, "系统核心状态 · 数据持续刷新", fonts["small"], "#94a3b8")
+
+    elif tid == "chat":
+        header("#071326", "#1d4ed8", "聊天摘要")
+        title_box(32, 122, 640, 634, "RECENT MESSAGES", "#0a162b", "#60a5fa")
+        messages = session.get("recent_messages") if isinstance(session.get("recent_messages"), list) else []
+        y = 188
+        for item in (messages[-4:] or [{"role": "assistant", "content": summary}]):
+            is_user = item.get("role") == "user"
+            fill = "#1d4ed8" if is_user else "#111827"
+            box(62 if not is_user else 142, y, 600 if not is_user else 608, y + 92, fill, "#93c5fd", 18, 2)
+            wrapped_text((84 if not is_user else 164), y + 18, clean(item.get("content"), ""), fonts["body"], "#ffffff", 474 if not is_user else 410, 2, 31)
+            y += 108
+        title_box(670, 122, 996, 634, "META", "#ffffff", "#60a5fa", "#1d4ed8")
+        wrapped_text(700, 196, f"{clean(session.get('title'), 'Hermes')}\n\n{summary}\n\n{current_task}", fonts["body2"], "#1f2937", 250, 9, 33)
+
+    elif tid == "bilibili":
+        header("#330d28", "#db2777", "B站状态")
+        title_box(34, 122, 430, 634, "ACCOUNT", "#4a1236", "#f472b6")
+        text(70, 202, clean(bili.get("account_name"), "未连接"), fonts["h1"], "#ffffff")
+        stat(70, 294, 140, "UID", clean(bili.get("uid")), "#fbcfe8")
+        stat(238, 294, 140, "粉丝", clean(bili.get("follower") or bili.get("followers")), "#f9a8d4")
+        wrapped_text(70, 414, clean(bili.get("latest_title") or bili.get("last_dynamic"), "暂无最新内容"), fonts["body2"], "#fce7f3", 300, 5, 33)
+        title_box(458, 122, 996, 634, "CHANNEL BEAT", "#fff1f8", "#f472b6", "#be185d")
+        wrapped_text(492, 196, summary + "\n\n" + recent_user + "\n\n" + recent_assistant, fonts["body2"], "#831843", 460, 10, 33)
+
+    elif tid == "print-fleet":
+        header("#06110f", "#059669", clean(template.name or "打印机总览"))
+        name = clean(primary.get("name") or primary.get("model"), "Printer")
+        progress = pct_value(primary.get("progress", 0))
+        temps = primary.get("temps") if isinstance(primary.get("temps"), dict) else {}
+        status_text = clean(primary.get("statusText") or primary.get("status"), "UNKNOWN")
+        file_name = clean(primary.get("fileName"), "暂无任务")
+        remain_raw = primary.get("remainingMinutes")
+        try:
+            remain_minutes = max(0, int(float(remain_raw)))
+            remain_text = f"{remain_minutes // 60}小时{remain_minutes % 60}分" if remain_minutes >= 60 else f"{remain_minutes}分钟"
+        except Exception:
+            remain_text = "--"
+        layer = clean(primary.get("layer"), "--")
+        total_layers = clean(primary.get("totalLayers"), "--")
+
+        # Compact task strip: the object name is intentionally omitted here;
+        # it is shown once inside the progress panel below.
+        box(28, 88, 996, 206, "#0b1514", "#34d399", 20, 2)
+        text(54, 108, "PRINT JOB / 打印任务", fonts["small"], "#6ee7b7")
+        text(54, 146, clamp_text(name, 18), fonts["h1"], "#ffffff")
+        box(470, 116, 620, 180, "#064e3b", "#34d399", 18, 2)
+        text(545, 148, f"● {status_text}", fonts["body2"], "#d1fae5", anchor="mm")
+        text(700, 108, "预计剩余", fonts["small"], "#a7f3d0")
+        text(970, 140, remain_text, fonts["h1"], "#ffffff", anchor="ra")
+
+        # Left: printer mission, progress and all machine temperatures.
+        box(28, 224, 650, 680, "#0b1514", "#34d399", 22, 2)
+        text(54, 246, "打印进度", fonts["h2"], "#d1fae5")
+        text(68, 326, f"{progress}%", fonts["hero"], "#34d399")
+        text(300, 302, "当前对象", fonts["small"], "#6ee7b7")
+        text(300, 338, clamp_text(file_name, 17), fonts["h2"], "#ffffff")
+        text(300, 382, f"层数 {layer} / {total_layers}", fonts["body"], "#a7f3d0")
+        box(68, 422, 610, 448, "#16302b", None, 13, 1)
+        if progress:
+            box(68, 422, 68 + max(24, int(542 * progress / 100)), 448, "#10b981", None, 13, 1)
+
+        nozzle_value = clean(temps.get("nozzle"), "--")
+        bed_value = clean(temps.get("bed"), "--")
+        chamber_value = clean(temps.get("chamber"), "--")
+        temp_cards = [
+            ("喷嘴", nozzle_value, "#0e2c27"),
+            ("热床", bed_value, "#12342d"),
+            ("腔体", chamber_value, "#153c33"),
+        ]
+        for idx, (label, value, card_fill) in enumerate(temp_cards):
+            tx = 54 + idx * 190
+            box(tx, 482, tx + 172, 650, card_fill, "#34d399", 18, 2)
+            text(tx + 18, 500, f"{label}温度", fonts["small"], "#a7f3d0")
+            text(tx + 86, 568, f"{value}°C", fonts["h1"], "#ffffff", anchor="mm")
+            text(tx + 86, 622, "实时", fonts["tiny"], "#6ee7b7", anchor="mm")
+
+        # Right: dedicated AMS HT inventory panel using only fields exposed by
+        # PrintMana (no invented humidity/drying values).
+        ams_units = [unit for unit in (primary.get("ams") or []) if isinstance(unit, dict)]
+        ams_ht = next((unit for unit in ams_units if "HT" in clean(unit.get("type"), "").upper()), None)
+        if ams_ht is None:
+            ams_ht = next((unit for unit in ams_units if int(unit.get("index", -1) or -1) == 2), None)
+        ht_slots = [slot for slot in ((ams_ht or {}).get("slots") or []) if isinstance(slot, dict)]
+        ht_slot = ht_slots[0] if ht_slots else {}
+        ht_bound = ht_slot.get("bound") if isinstance(ht_slot.get("bound"), dict) else {}
+        ht_pct = pct_value(ht_bound.get("remainingPercent", ht_slot.get("remainPercent", 0)))
+        ht_grams_raw = ht_bound.get("remainingGram")
+        try:
+            ht_grams = f"{float(ht_grams_raw):.0f}g"
+        except Exception:
+            ht_grams = "--"
+        ht_material = clean(ht_bound.get("name") or ht_slot.get("type"), "暂无耗材")
+        ht_type = clean(ht_bound.get("type") or ht_slot.get("type"), "--")
+        ht_index = int((ams_ht or {}).get("index", 2) or 2)
+        ht_slot_no = int(ht_slot.get("slot", 0) or 0)
+        ht_active = clean(primary.get("activeTray"), "") == f"{ht_index}-{ht_slot_no}"
+        color_hex = clean(ht_bound.get("colorHex") or ht_slot.get("colorHex"), "FFFFFFFF")[:6]
+        swatch = f"#{color_hex}" if re.fullmatch(r"[0-9A-Fa-f]{6}", color_hex) else "#f8fafc"
+
+        box(670, 224, 996, 680, "#ecfdf5", "#34d399", 22, 2)
+        text(696, 246, "AMS HT", fonts["h1"], "#065f46")
+        box(862, 244, 970, 282, "#d1fae5", "#34d399", 14, 2)
+        text(916, 263, "使用中" if ht_active else "待机", fonts["small"], "#047857", anchor="mm")
+        text(696, 306, "当前耗材", fonts["small"], "#047857")
+        draw.ellipse((936, 304, 964, 332), fill=swatch, outline="#065f46", width=2)
+        wrapped_text(696, 344, ht_material, fonts["body2"], "#064e3b", 264, 3, 33)
+        text(696, 452, f"{ht_type} · HT-S{ht_slot_no + 1}", fonts["small"], "#047857")
+        text(696, 494, "剩余量", fonts["small"], "#047857")
+        text(970, 498, f"{ht_pct}%", fonts["h2"], "#065f46", anchor="ra")
+        box(696, 538, 970, 564, "#bbf7d0", None, 13, 1)
+        if ht_pct:
+            box(696, 538, 696 + max(24, int(274 * ht_pct / 100)), 564, "#10b981", None, 13, 1)
+        box(696, 584, 970, 652, "#d1fae5", "#6ee7b7", 16, 2)
+        text(714, 600, "剩余重量", fonts["small"], "#047857")
+        text(950, 600, ht_grams, fonts["h2"], "#065f46", anchor="ra")
+
+    elif tid == "print-temps":
+        header("#160b2d", "#7c3aed", "AMS3 / AMS HT")
+        temps = primary.get("temps") if isinstance(primary.get("temps"), dict) else {}
+        ams_units = [unit for unit in (primary.get("ams") or []) if isinstance(unit, dict)]
+        ams_ht = None
+        for unit in ams_units:
+            if "HT" in clean(unit.get("type"), "").upper() or int(unit.get("index", -1) or -1) == 2:
+                ams_ht = unit
+                break
+        if ams_ht is None and ams_units:
+            ams_ht = ams_units[-1]
+        ht_index = int((ams_ht or {}).get("index", 2) or 2)
+        ht_slots = (ams_ht or {}).get("slots") or []
+        active_tray = clean(primary.get("activeTray"), "")
+
+        all_slots = []
+        for unit in (primary.get("ams") or []):
+            if not isinstance(unit, dict):
+                continue
+            unit_index = int(unit.get("index", 0) or 0)
+            unit_label = f"AMS{unit_index + 1}"
+            for slot in (unit.get("slots") or []):
+                if not isinstance(slot, dict):
+                    continue
+                bound = slot.get("bound") or {}
+                slot_no = int(slot.get("slot", 0) or 0)
+                pct = pct_value(bound.get("remainingPercent", slot.get("remainPercent", 0)))
+                name = clean(bound.get("name") or slot.get("type"), "空槽位")
+                all_slots.append(
+                    {
+                        "unit_index": unit_index,
+                        "unit_label": unit_label,
+                        "slot_no": slot_no,
+                        "label": f"{unit_label}-S{slot_no + 1}",
+                        "pct": pct,
+                        "name": name,
+                        "type": clean(slot.get("type"), ""),
+                        "active": active_tray == f"{unit_index}-{slot_no}",
+                        "is_ht": unit_index == ht_index,
+                    }
+                )
+
+        ht_slot_cards = [slot for slot in all_slots if slot["unit_index"] == ht_index]
+        other_slot_cards = [slot for slot in all_slots if slot["unit_index"] != ht_index][:8]
+        low_slots = sorted(other_slot_cards, key=lambda item: item["pct"])[:3]
+        active_slot = next((slot for slot in all_slots if slot["active"]), None)
+        ht_pct = ht_slot_cards[0]["pct"] if ht_slot_cards else 0
+
+        # Compact cross-system summary. The AMS HT single-slot detail already
+        # lives on the previous page, so this page prioritizes all 8 AMS slots.
+        box(28, 86, 996, 154, "#211337", "#8b5cf6", 18, 2)
+        summary_items = [
+            ("在线槽位", f"{len(other_slot_cards)}/8"),
+            ("活动槽位", clean(active_slot["label"] if active_slot else active_tray or "--").replace("AMS", "A")),
+            ("低余量", str(len([slot for slot in other_slot_cards if slot["pct"] <= 25]))),
+            ("打印进度", f"{pct_value(primary.get('progress', 0))}%"),
+            ("HT主仓", f"{ht_pct}%"),
+        ]
+        for idx, (label, value) in enumerate(summary_items):
+            sx = 52 + idx * 190
+            text(sx, 94, label, fonts["tiny"], "#c4b5fd")
+            text(sx, 118, value, fonts["body2"], "#ffffff")
+
+        # Main focus: roomy 2 × 4 AMS1/AMS2 slot wall.
+        box(28, 164, 674, 556, "#120b24", "#8b5cf6", 20, 2)
+        text(52, 182, "AMS1 / AMS2 · 八槽总览", fonts["h2"], "#ede9fe")
+        while len(other_slot_cards) < 8:
+            other_slot_cards.append({"label": f"S{len(other_slot_cards)+1}", "pct": 0, "name": "空槽位", "type": "", "active": False})
+        for idx, slot in enumerate(other_slot_cards[:8]):
+            col = idx % 2
+            row = idx // 2
+            x = 50 + col * 304
+            y = 228 + row * 78
+            pct = slot["pct"]
+            color = "#ef4444" if pct <= 15 else "#f59e0b" if pct <= 30 else "#22c55e"
+            box(x, y, x + 286, y + 68, "#211337", color if slot.get("active") else "#4c1d95", 14, 2)
+            label = clean(slot["label"]).replace("AMS", "A")
+            text(x + 14, y + 10, label, fonts["small"], "#ffffff")
+            if slot.get("active"):
+                text(x + 92, y + 10, "使用中", fonts["tiny"], "#6ee7b7")
+            text(x + 270, y + 10, f"{pct}%", fonts["small"], color, anchor="ra")
+            detail = clean(slot.get("name"), "空槽位")
+            # Reserve the right-hand 112px for the independent progress bar.
+            # A short material label cannot run underneath it.
+            text(x + 14, y + 36, clamp_text(detail, 10), fonts["tiny"], "#ddd6fe")
+            box(x + 174, y + 42, x + 270, y + 54, "#2e2050", None, 6, 1)
+            if pct:
+                box(x + 174, y + 42, x + 174 + max(8, int(96 * pct / 100)), y + 54, color, None, 6, 1)
+
+        # Low-stock rail adds severity and readable material names rather than
+        # merely repeating the percentages from the slot wall.
+        box(692, 164, 996, 556, "#0f1022", "#a78bfa", 20, 2)
+        text(716, 182, "低余量提醒", fonts["h2"], "#ede9fe")
+        alert_y = 230
+        for slot in low_slots or [{"label": "--", "pct": 0, "name": "暂无耗材数据"}]:
+            pct = slot["pct"]
+            color = "#ef4444" if pct <= 15 else "#f59e0b"
+            severity = "危险" if pct <= 15 else "偏低"
+            box(714, alert_y, 974, alert_y + 88, "#211337", color, 14, 2)
+            text(730, alert_y + 12, severity, fonts["tiny"], color)
+            text(798, alert_y + 10, clean(slot["label"]).replace("AMS", "A"), fonts["small"], "#ffffff")
+            text(956, alert_y + 10, f"{pct}%", fonts["small"], color, anchor="ra")
+            text(730, alert_y + 42, clamp_text(clean(slot.get("name"), "耗材"), 17), fonts["small"], "#ede9fe")
+            alert_y += 102
+
+        # One compact bottom strip for the print mission and machine temps.
+        box(28, 574, 996, 680, "#1b1230", "#8b5cf6", 18, 2)
+        status = clean(primary.get("statusText") or primary.get("status"), "UNKNOWN")
+        job_name = clean(primary.get("fileName"), "暂无任务")
+        progress = pct_value(primary.get("progress", 0))
+        text(52, 594, f"{status} · {job_name}", fonts["body2"], "#ffffff")
+        text(52, 638, f"{progress}%", fonts["h2"], "#34d399")
+        box(132, 646, 454, 664, "#2e2050", None, 9, 1)
+        if progress:
+            box(132, 646, 132 + max(16, int(322 * progress / 100)), 664, "#34d399", None, 9, 1)
+        remain = clean(primary.get("remainingMinutes"), "--")
+        text(478, 638, f"剩余 {remain}分钟", fonts["small"], "#c4b5fd")
+        temp_values = [
+            ("喷嘴", temps.get("nozzle")),
+            ("热床", temps.get("bed")),
+            ("腔体", temps.get("chamber")),
+        ]
+        for idx, (label, value) in enumerate(temp_values):
+            tx = 650 + idx * 108
+            text(tx, 596, label, fonts["tiny"], "#c4b5fd")
+            text(tx, 632, f"{clean(value)}°", fonts["h2"], "#ffffff")
+
+    elif tid == "print-filament":
+        header("#20100a", "#d97706", clean(template.name or "耗材料仓监控"))
+        slots = []
+        for unit in (primary.get("ams") or []):
+            if not isinstance(unit, dict):
+                continue
+            unit_index = int(unit.get("index", 0) or 0)
+            for slot in (unit.get("slots") or []):
+                if not isinstance(slot, dict) or slot.get("isEmpty"):
+                    continue
+                bound = slot.get("bound") if isinstance(slot.get("bound"), dict) else {}
+                pct = pct_value(bound.get("remainingPercent", slot.get("remainPercent", 0)))
+                grams_raw = bound.get("remainingGram")
+                total_raw = bound.get("totalGram")
+                try:
+                    grams = float(grams_raw)
+                except Exception:
+                    grams = None
+                try:
+                    total_grams = float(total_raw)
+                except Exception:
+                    total_grams = None
+                slot_no = int(slot.get("slot", 0) or 0)
+                slots.append({
+                    "pct": pct,
+                    "label": f"A{unit_index + 1}-S{slot_no + 1}",
+                    "name": clean(bound.get("name") or slot.get("type"), "未知耗材"),
+                    "type": clean(bound.get("type") or slot.get("type"), "--"),
+                    "grams": grams,
+                    "total": total_grams,
+                })
+        slots.sort(key=lambda item: item["pct"])
+        priority_slots = slots[:4]
+        urgent_count = len([item for item in slots if item["pct"] <= 15])
+        risk_count = len([item for item in slots if item["pct"] <= 30])
+        lowest = priority_slots[0] if priority_slots else {"pct": 0, "label": "--"}
+        known_refill = sum(
+            max(0.0, item["total"] * 0.8 - item["grams"])
+            for item in priority_slots
+            if item.get("grams") is not None and item.get("total") is not None
+        )
+
+        # Decision KPIs: this page answers what to refill next, rather than
+        # repeating the complete 8-slot wall from the previous screen.
+        box(28, 88, 996, 166, "#2a160a", "#f59e0b", 18, 2)
+        kpis = [
+            ("最低余量", f"{lowest['pct']}%", lowest.get("label", "--")),
+            ("紧急补料", f"{urgent_count}仓", "P0 / P1"),
+            ("容量风险", f"{risk_count}仓", "0-30%"),
+            ("补至80%", f"{known_refill / 1000:.2f}kg", "已知重量"),
+        ]
+        for idx, (label, value, note) in enumerate(kpis):
+            kx = 52 + idx * 236
+            text(kx, 98, label, fonts["tiny"], "#fed7aa")
+            text(kx, 124, value, fonts["h2"], "#ffffff")
+            text(kx + 126, 134, note, fonts["tiny"], "#fdba74")
+
+        # Four replenishment cards, ordered by urgency. Each card carries
+        # weight/capacity and a concrete top-up target.
+        if not priority_slots:
+            priority_slots = [{"pct": 0, "label": "--", "name": "暂无耗材数据", "type": "--", "grams": None, "total": None}]
+        while len(priority_slots) < 4:
+            priority_slots.append({"pct": 100, "label": "--", "name": "暂无更多低余量仓", "type": "--", "grams": None, "total": None})
+        for idx, item in enumerate(priority_slots[:4]):
+            col = idx % 2
+            row = idx // 2
+            x = 28 + col * 492
+            y = 184 + row * 174
+            pct = item["pct"]
+            if pct <= 5:
+                priority, action, color = "P0", "立即补料", "#ef4444"
+            elif pct <= 15:
+                priority, action, color = "P1", "本班补料", "#f97316"
+            elif pct <= 25:
+                priority, action, color = "P2", "尽快安排", "#f59e0b"
+            else:
+                priority, action, color = "P3", "计划补料", "#eab308"
+            box(x, y, x + 472, y + 154, "#1f2937", color, 18, 2)
+            box(x + 18, y + 18, x + 76, y + 52, color, None, 12, 1)
+            text(x + 47, y + 35, priority, fonts["small"], "#ffffff", anchor="mm")
+            text(x + 92, y + 18, item["label"], fonts["h2"], "#ffffff")
+            text(x + 448, y + 20, f"{pct}%", fonts["h2"], color, anchor="ra")
+            text(x + 20, y + 66, clamp_text(item["name"], 21), fonts["small"], "#fde68a")
+            grams, total_grams = item.get("grams"), item.get("total")
+            if grams is not None and total_grams is not None:
+                weight_text = f"{grams:.0f}g / {total_grams:.0f}g"
+                refill = max(0.0, total_grams * 0.8 - grams)
+                refill_text = f"建议补 {refill:.0f}g"
+            else:
+                weight_text = "重量数据待同步"
+                refill_text = "建议量 --"
+            text(x + 20, y + 100, weight_text, fonts["tiny"], "#d1d5db")
+            text(x + 244, y + 100, refill_text, fonts["tiny"], "#fdba74")
+            text(x + 448, y + 98, action, fonts["small"], color, anchor="ra")
+            box(x + 20, y + 130, x + 448, y + 142, "#374151", None, 6, 1)
+            if pct:
+                fill_width = max(4, int(428 * pct / 100))
+                box(x + 20, y + 130, x + 20 + fill_width, y + 142, color, None, 6, 1)
+
+        # Bottom operational policy turns percentages into an actionable queue.
+        box(28, 540, 996, 680, "#2a160a", "#f59e0b", 18, 2)
+        text(52, 560, "补料优先级", fonts["h2"], "#fff7ed")
+        rules = [
+            ("P0", "0-5%", "立即处理", "#ef4444"),
+            ("P1", "6–15%", "本班完成", "#f97316"),
+            ("P2", "16–25%", "尽快安排", "#f59e0b"),
+            ("P3", "26–30%", "计划补料", "#eab308"),
+        ]
+        for idx, (level, threshold, action, color) in enumerate(rules):
+            rx = 52 + idx * 230
+            box(rx, 606, rx + 206, 658, "#1f2937", color, 14, 2)
+            text(rx + 16, 620, level, fonts["small"], color)
+            text(rx + 66, 620, threshold, fonts["tiny"], "#ffffff")
+            text(rx + 126, 620, action, fonts["tiny"], "#fed7aa")
+
+    elif tid == "private-channels-overview":
+        header("#071724", "#0f766e", clean(template.name or "AI 渠道总览"))
+        channels = [item for item in private_channel_items if isinstance(item, dict)][:3]
+        totals = private_channel_totals
+        online = int(totals.get("online") or 0)
+
+        box(28, 92, 410, 438, "#e6fffb", "#14b8a6", 20, 2)
+        text(52, 116, "渠道总余额", fonts["h2"], "#0f766e")
+        total_balance = channel_money(totals.get("balance_usd"))
+        balance_font = _fit_text(draw, total_balance, FONT_ZH, 66, 42, 330)
+        text(52, 180, total_balance, balance_font, "#042f2e")
+        text(54, 268, f"{online} / {len(channels)} 渠道在线", fonts["body2"], "#0f766e")
+        box(52, 320, 386, 392, "#ccfbf1", "#5eead4", 16, 2)
+        delayed_today = sum(item.get("today_status") == "delayed" for item in channels)
+        text(70, 334, "今日暂计", fonts["small"], "#0f766e")
+        text(368, 338, channel_money(totals.get("today_usd")), fonts["h2"], "#134e4a", anchor="ra")
+
+        box(28, 456, 410, 680, "#0c2733", "#0d9488", 20, 2)
+        text(52, 480, "本月概览", fonts["h2"], "#ccfbf1")
+        text(52, 540, "消费", fonts["small"], "#5eead4")
+        text(386, 536, channel_money(totals.get("month_usd")), fonts["h2"], "#ffffff", anchor="ra")
+        text(52, 600, "请求", fonts["small"], "#5eead4")
+        text(386, 596, channel_count(totals.get("requests")), fonts["h2"], "#ffffff", anchor="ra")
+        text(52, 650, f"{delayed_today} 个渠道今日统计延迟", fonts["tiny"], "#99f6e4")
+
+        accents = ["#22d3ee", "#f59e0b", "#f43f5e"]
+        card_y = [92, 290, 488] if len(channels) >= 3 else [150, 430]
+        for index, item in enumerate(channels):
+            y = card_y[index]
+            accent = accents[index]
+            online_item = item.get("status") == "online"
+            box(438, y, 996, y + 180, "#0b2233", accent, 18, 2)
+            text(462, y + 20, clean(item.get("name"), f"渠道 {index + 1}"), fonts["h2"], "#ffffff")
+            text(462, y + 60, clean(item.get("domain"), "--"), fonts["tiny"], "#bae6fd")
+            badge_fill = "#064e3b" if online_item else "#4c0519"
+            badge_ink = "#6ee7b7" if online_item else "#fda4af"
+            box(862, y + 18, 972, y + 54, badge_fill, badge_ink, 12, 1)
+            text(917, y + 36, "在线" if online_item else "不可用", fonts["tiny"], badge_ink, anchor="mm")
+            text(462, y + 100, "余额", fonts["tiny"], "#94a3b8")
+            text(526, y + 94, channel_money(item.get("balance_usd")), fonts["body2"], accent)
+            text(694, y + 100, "今日", fonts["tiny"], "#94a3b8")
+            today_value = "延迟" if item.get("today_status") == "delayed" else channel_money(item.get("today_usd"))
+            text(754, y + 96, today_value, fonts["body"], "#ffffff")
+            text(462, y + 146, f"历史累计 {channel_money(item.get('total_used_usd'))}", fonts["tiny"], "#cbd5e1")
+            text(972, y + 146, f"累计请求 {channel_count(item.get('requests'))}", fonts["tiny"], "#cbd5e1", anchor="ra")
+
+    elif tid == "private-channels-matrix":
+        header("#17120b", "#b45309", clean(template.name or "AI 渠道矩阵"))
+        channels = [item for item in private_channel_items if isinstance(item, dict)][:3]
+        accents = ["#06b6d4", "#f59e0b", "#ef4444"]
+
+        box(28, 92, 996, 174, "#fff7ed", "#f59e0b", 18, 2)
+        summary_cells = [
+            ("在线渠道", f"{int(private_channel_totals.get('online') or 0)}/{len(channels)}"),
+            ("总余额", channel_money(private_channel_totals.get("balance_usd"))),
+            ("今日暂计", channel_money(private_channel_totals.get("today_usd"))),
+            ("总 Token", channel_count(private_channel_totals.get("tokens"))),
+        ]
+        for idx, (label, value) in enumerate(summary_cells):
+            x = 52 + idx * 232
+            text(x, 108, label, fonts["tiny"], "#9a3412")
+            value_font = _fit_text(draw, value, FONT_ZH, 27, 20, 198)
+            text(x, 140, value, value_font, "#431407")
+
+        card_gap = 18
+        card_width = (968 - card_gap * max(0, len(channels) - 1)) // max(1, len(channels))
+        for index, item in enumerate(channels):
+            x = 28 + index * (card_width + card_gap)
+            accent = accents[index]
+            online_item = item.get("status") == "online"
+            box(x, 194, x + card_width, 680, "#21170f", accent, 18, 2)
+            text(x + 20, 216, f"0{index + 1}", fonts["small"], accent)
+            name = clean(item.get("name"), f"渠道 {index + 1}")
+            name_font = _fit_text(draw, name, FONT_ZH, 28, 22, card_width - 100)
+            text(x + 76, 212, name, name_font, "#ffffff")
+            text(x + 20, 258, clean(item.get("domain"), "--"), fonts["tiny"], "#fed7aa")
+            text(x + card_width - 24, 258, "ONLINE" if online_item else "ERROR", fonts["tiny"], "#6ee7b7" if online_item else "#fda4af", anchor="ra")
+
+            metrics_grid = [
+                ("余额", channel_money(item.get("balance_usd"))),
+                ("今日", "延迟" if item.get("today_status") == "delayed" else channel_money(item.get("today_usd"))),
+                ("历史累计", channel_money(item.get("total_used_usd"))),
+                ("累计请求", channel_count(item.get("requests"))),
+                ("Token", channel_count(item.get("tokens"))),
+                ("瞬时 RPM/TPM", f"{channel_count(item.get('rpm'))} / {channel_count(item.get('tpm'))}"),
+            ]
+            for row, (label, value) in enumerate(metrics_grid):
+                y = 310 + row * 54
+                text(x + 20, y, label, fonts["tiny"], "#a8a29e")
+                value_font = _fit_text(draw, value, FONT_ZH, 23, 17, card_width - 130)
+                text(x + card_width - 24, y, value, value_font, "#ffffff", anchor="ra")
+                draw.line((x + 20, y + 35, x + card_width - 24, y + 35), fill="#443127", width=1)
+            runway = item.get("runway_days")
+            footer_text = f"预计 {runway:.1f} 天" if isinstance(runway, (int, float)) else "未提供可用天数"
+            text(x + 20, 646, footer_text, fonts["tiny"], accent)
+
+    elif tid == "movie-now-showing":
+        header("#120f1f", "#6d28d9", clean(template.name or "最近上映"))
+        items = [item for item in movie_items if isinstance(item, dict)][:6]
+        box(28, 88, 996, 680, "#1a1330", "#a78bfa", 20, 2)
+        if not items:
+            text(512, 360, "暂无电影数据", fonts["mega"], "#f5f3ff", anchor="mm")
+        else:
+            hero = items[0]
+            hero_poster = resolve_ipad_poster_path(hero.get("poster_local_path"))
+            hero_backdrop_paths = [
+                resolve_ipad_movie_backdrop_path(path_value)
+                for path_value in (hero.get("backdrop_local_paths") or [hero.get("backdrop_local_path")])
+                if path_value
+            ]
+
+            # Media wall: the main frame follows the poster's true 2:3 ratio.
+            paste_cover(hero_poster, (48, 112, 286, 469), "#2e1065")
+            text(60, 126, "01", fonts["tiny"], "#ffffff")
+            text(48, 486, "主推影片横版画面", fonts["tiny"], "#c4b5fd")
+            hero_backdrop = hero_backdrop_paths[0] if hero_backdrop_paths else None
+            paste_contain(hero_backdrop, (48, 516, 286, 650), "#261842", "#6d28d9", 12)
+
+            text(312, 116, "01 / 本期主推", fonts["h2"], "#c4b5fd")
+            hero_title = clean(hero.get("title"), "Untitled")
+            hero_title_font = _fit_text(draw, hero_title, FONT_ZH, 38, 28, 376)
+            wrapped_text(312, 168, hero_title, hero_title_font, "#ffffff", 376, 2, 42)
+            hero_date = f"上映 · {compact_movie_date(hero.get('release_date'))}"
+            date_font = _fit_text(draw, hero_date, FONT_ZH, 20, 16, 250)
+            date_bbox = draw.textbbox((0, 0), hero_date, font=date_font)
+            date_width = min(270, int(date_bbox[2] - date_bbox[0]) + 32)
+            box(312, 266, 312 + date_width, 310, "#4c1d95", "#8b5cf6", 12, 1)
+            text(328, 288, hero_date, date_font, "#ede9fe", anchor="lm")
+            overview = clean(hero.get("overview"), "详情页暂无简介")
+            wrapped_text(312, 338, overview, fonts["body"], "#ddd6fe", 376, 8, 29)
+            text(312, 626, "TMDb · NOW PLAYING", fonts["tiny"], "#8b5cf6")
+
+            y = 112
+            for idx, item in enumerate(items[1:6], 2):
+                box(714, y, 974, y + 100, "#23183d", "#6d28d9", 14, 2)
+                paste_fill(resolve_ipad_poster_path(item.get("poster_local_path")), (724, y + 10, 790, y + 90), "#2e1065", "#4c1d95", 10)
+                text(804, y + 10, f"{idx:02d}", fonts["tiny"], "#a78bfa")
+                title_value = clean(item.get("title"), "Untitled")
+                title_font = _fit_text(draw, title_value, FONT_ZH, 20, 16, 154)
+                wrapped_text(804, y + 34, title_value, title_font, "#ffffff", 154, 2, 22)
+                date_text = compact_movie_date(item.get("release_date"))
+                text(958, y + 66, date_text, fonts["tiny"], "#c4b5fd", anchor="ra")
+                y += 108
+
+    elif tid in {"gamer520-pc-latest", "gamer520-switch-latest", "ps5-games-latest"}:
+        game_page = {
+            "gamer520-pc-latest": (gamer520_raw_items, "#08111f", "#f97316", "PC 游戏上新", r"\s*(?:非虚拟机|解压即撸)\s*"),
+            "gamer520-switch-latest": (switch_game_items, "#09191a", "#22d3ee", "Switch 游戏上新", r"\s*(?:本体|整合版|中文版)\s*"),
+            "ps5-games-latest": (ps5_game_items, "#071426", "#60a5fa", "PS5 游戏上新", r"$^"),
+        }[tid]
+        raw_items, header_bg, accent, fallback_name, cleanup_pattern = game_page
+        header(header_bg, accent, clean(template.name or fallback_name))
+        items = [item for item in raw_items if isinstance(item, dict)][:4]
+        if not items:
+            box(28, 88, 996, 680, "#111827", accent, 20, 2)
+            text(512, 350, f"正在刷新最新 {fallback_name.replace('游戏上新', '游戏')}", fonts["h1"], "#ffffff", anchor="mm")
+        else:
+            for idx, item in enumerate(items):
+                col, row = idx % 2, idx // 2
+                x = 28 + col * 492
+                y = 96 + row * 292
+                box(x, y, x + 476, y + 276, "#111827", accent, 18, 2)
+                image_path = resolve_ipad_news_image_path(item.get("image_local_path"))
+                paste_fill(image_path, (x + 10, y + 10, x + 466, y + 222), "#1f2937", header_bg, 12)
+                raw_game_title = clean(item.get("title"), "未命名游戏")
+                game_title = raw_game_title.split("|")[0].strip()
+                game_title = re.sub(cleanup_pattern, " ", game_title).strip()
+                title_font = _fit_text(draw, game_title, FONT_ZH, 27, 18, 390)
+                text(x + 18, y + 240, f"{idx + 1:02d}", fonts["tiny"], accent)
+                text(x + 62, y + 238, game_title, title_font, "#ffffff")
+
+    elif tid in {"person-photo-fang-yuxuan-portrait", "person-photo-fang-yuxuan-landscape"}:
+        photo_orientation = "portrait" if tid.endswith("portrait") else "landscape"
+        person_photo = person_photo_portrait if photo_orientation == "portrait" else person_photo_landscape
+        trigger_person_photo_refresh(photo_orientation, max_age_seconds=3600)
+        photo_path = Path(str(person_photo.get("image_path") or ""))
+        if photo_path.exists():
+            try:
+                source = Image.open(photo_path).convert("RGB")
+                canvas_size = IPAD_RENDER_SIZE
+                # A blurred cover fills the stage; a contained foreground keeps
+                # faces and full-body compositions intact across portrait/square/landscape photos.
+                backdrop = ImageOps.fit(source, canvas_size, method=Image.Resampling.LANCZOS)
+                backdrop = backdrop.filter(ImageFilter.GaussianBlur(28 * IPAD_RETINA_SCALE))
+                shade = Image.new("RGBA", canvas_size, (3, 8, 18, 72))
+                merged = Image.alpha_composite(backdrop.convert("RGBA"), shade).convert("RGB")
+                if photo_orientation == "portrait":
+                    # Intentionally zoom portrait photos beyond a strict contain.
+                    # A 610x700 window trims only the top/bottom fringe of common
+                    # 3:4 photos and cuts the empty side rails by about 20%.
+                    foreground = ImageOps.fit(
+                        source,
+                        (610 * IPAD_RETINA_SCALE, 700 * IPAD_RETINA_SCALE),
+                        method=Image.Resampling.LANCZOS,
+                        centering=(0.5, 0.48),
+                    )
+                else:
+                    foreground = source.copy()
+                    foreground.thumbnail((1000 * IPAD_RETINA_SCALE, 680 * IPAD_RETINA_SCALE), Image.Resampling.LANCZOS)
+                px = (canvas_size[0] - foreground.width) // 2
+                py = (canvas_size[1] - foreground.height) // 2
+                radius = 16 * IPAD_RETINA_SCALE
+                mask = Image.new("L", foreground.size, 0)
+                mask_draw = ImageDraw.Draw(mask)
+                mask_draw.rounded_rectangle((0, 0, foreground.width - 1, foreground.height - 1), radius=radius, fill=255)
+                # Soft shadow removes the hard vertical seam between the contained
+                # photo and its blurred, darkened backdrop.
+                shadow_mask = Image.new("L", canvas_size, 0)
+                shadow_draw = ImageDraw.Draw(shadow_mask)
+                shadow_draw.rounded_rectangle(
+                    (px - 8 * IPAD_RETINA_SCALE, py - 8 * IPAD_RETINA_SCALE,
+                     px + foreground.width + 8 * IPAD_RETINA_SCALE,
+                     py + foreground.height + 8 * IPAD_RETINA_SCALE),
+                    radius=radius + 8 * IPAD_RETINA_SCALE, fill=150,
+                )
+                shadow_mask = shadow_mask.filter(ImageFilter.GaussianBlur(14 * IPAD_RETINA_SCALE))
+                shadow_layer = Image.new("RGB", canvas_size, "#020611")
+                merged.paste(shadow_layer, (0, 0), shadow_mask)
+                merged.paste(foreground, (px, py), mask)
+                img.paste(merged)
+
+                date_display = clean(person_photo.get("date_display"), "日期未记录")
+                weekday_match = re.search(r"星期([一二三四五六日天])", date_display)
+                weekday_display = f"星期{weekday_match.group(1)}" if weekday_match else ""
+                date_display = re.sub(r"\s*星期[一二三四五六日天]\s*", " ", date_display)
+                date_display = re.sub(r":\d{2}$", "", date_display).strip()
+                date_match = re.search(r"(\d{4})年(\d{1,2})月(\d{1,2})日\s+(\d{1,2}:\d{2})", date_display)
+                if date_match:
+                    date_display = f"{date_match.group(1)}-{int(date_match.group(2)):02d}-{int(date_match.group(3)):02d} {date_match.group(4)}"
+                place_display = clean(person_photo.get("place_display"), "")
+                place_parts = [part.strip() for part in place_display.split("·") if part.strip()]
+                if len(place_parts) > 2:
+                    place_display = " · ".join(place_parts[-2:])
+
+                primary_parts = [clean(person_photo.get("person"), "方宇轩")]
+                if place_display:
+                    primary_parts.append(place_display)
+                if person_photo.get("favorite"):
+                    primary_parts.append("★ 收藏")
+                primary_meta = "  ·  ".join(primary_parts)
+
+                detail_parts = []
+                raw_title = clean(person_photo.get("title") or person_photo.get("description"), "")
+                title_value = "" if raw_title.lower() in {"missing value", "default", "none", "null"} else raw_title
+                if title_value:
+                    detail_parts.append(clamp_text(title_value, 24))
+                camera_make = clean(person_photo.get("camera_make"), "")
+                camera_model = clean(person_photo.get("camera_model"), "")
+                if camera_make and camera_model.lower().startswith(camera_make.lower() + " "):
+                    camera = camera_model
+                else:
+                    camera = " ".join(part for part in (camera_make, camera_model) if part)
+                if camera:
+                    detail_parts.append(camera)
+                try:
+                    f_number = float(person_photo.get("f_number"))
+                    if f_number > 0:
+                        detail_parts.append(f"f/{f_number:g}")
+                except (TypeError, ValueError):
+                    pass
+                try:
+                    exposure = float(person_photo.get("exposure_seconds"))
+                    if exposure > 0:
+                        detail_parts.append(f"1/{round(1 / exposure)}s" if exposure < 1 else f"{exposure:g}s")
+                except (TypeError, ValueError, ZeroDivisionError):
+                    pass
+                try:
+                    iso = int(float(person_photo.get("iso")))
+                    if iso > 0:
+                        detail_parts.append(f"ISO {iso}")
+                except (TypeError, ValueError):
+                    pass
+                try:
+                    focal = float(person_photo.get("focal_length_mm"))
+                    if focal > 0:
+                        detail_parts.append(f"{focal:g}mm")
+                except (TypeError, ValueError):
+                    pass
+                width_value = int(person_photo.get("width") or person_photo.get("pixel_width") or 0)
+                height_value = int(person_photo.get("height") or person_photo.get("pixel_height") or 0)
+                if width_value and height_value:
+                    detail_parts.append(f"{width_value}×{height_value}")
+                detail_meta = "  ·  ".join(detail_parts)
+
+                # Give the capture year its own visual role instead of burying
+                # it in the metadata sentence. The date block is deliberately
+                # independent from person/place/camera information.
+                date_parts_match = re.search(
+                    r"(\d{4})-(\d{2})-(\d{2})\s+(\d{1,2}:\d{2})",
+                    date_display,
+                )
+                if date_parts_match:
+                    capture_year = date_parts_match.group(1)
+                    capture_day = f"{date_parts_match.group(2)} / {date_parts_match.group(3)}"
+                    capture_time = date_parts_match.group(4)
+                else:
+                    capture_year, capture_day, capture_time = "----", "-- / --", ""
+                date_font_year = _font(82, zh=True)
+                date_font_day = _font(28, zh=True)
+                date_font_time = _font(18, zh=True)
+                date_x, date_y = (250, 26) if photo_orientation == "portrait" else (740, 28)
+                date_label = "CAPTURE DATE"
+                draw.text((date_x + 2, date_y + 2), date_label, font=_font(15, zh=True), fill=(0, 0, 0, 170))
+                draw.text((date_x, date_y), date_label, font=_font(15, zh=True), fill="#FFD54F")
+                draw.text((date_x + 2, date_y + 23), capture_year, font=date_font_year, fill=(0, 0, 0, 170))
+                draw.text((date_x, date_y + 21), capture_year, font=date_font_year, fill="#ffffff")
+                draw.text((date_x, date_y + 108), capture_day, font=date_font_day, fill="#FFD54F")
+                capture_time_meta = " · ".join(part for part in (capture_time, weekday_display) if part)
+                if capture_time_meta:
+                    draw.text((date_x, date_y + 143), capture_time_meta, font=date_font_time, fill="#e2e8f0")
+
+                asset_seed = sum(ord(ch) for ch in str(person_photo.get("asset_id") or ""))
+                place_focus = place_parts[-1] if place_parts else "这一天"
+                quote_options = [
+                    f"在{place_focus}，把这一刻轻轻收好。",
+                    "有些日子，回头看依然很亮。",
+                    "照片留住的，是当时的心情。",
+                    "平常的一天，也值得被记住。",
+                    "时间向前，记忆仍有温度。",
+                ]
+                caption_asset_id = clean(person_photo.get("caption_asset_id"), "")
+                caption_matches = not caption_asset_id or caption_asset_id == clean(person_photo.get("asset_id"), "")
+                ai_caption = clean(person_photo.get("ai_caption"), "") if caption_matches else ""
+                poster_title = clean(person_photo.get("poster_title"), "") if caption_matches else ""
+                poster_english = clean(person_photo.get("poster_english"), "") if caption_matches else ""
+                memory_line = ai_caption or title_value or quote_options[asset_seed % len(quote_options)]
+                try:
+                    accent_hex = clean(person_photo.get("poster_accent"), "#FFD54F") if caption_matches else "#FFD54F"
+                    if not re.fullmatch(r"#[0-9A-Fa-f]{6}", accent_hex):
+                        raise ValueError("invalid accent")
+                except Exception:
+                    accent_hex = "#FFD54F"
+
+                if photo_orientation == "portrait":
+                    # Portrait/square photos have a real blurred side rail. Put
+                    # metadata there instead of covering the subject.
+                    card_x = 14
+                    card_y = 430
+                    foreground_left = px / IPAD_RETINA_SCALE
+                    card_width = max(170, min(225, int(foreground_left) + 18))
+                    cy = card_y + 16
+                    side_rows = [clean(person_photo.get("person"), "方宇轩")]
+                    if place_display:
+                        side_rows.extend(part.strip() for part in place_display.split("·") if part.strip())
+                    if person_photo.get("favorite"):
+                        side_rows.append("★ 收藏")
+                    for row in side_rows[:6]:
+                        row_font = _fit_text(draw, row, FONT_ZH, 18, 12, card_width - 28)
+                        text(card_x + 14, cy, row, row_font, "#ffffff")
+                        cy += 28
+                    if detail_parts:
+                        cy = max(cy + 8, card_y + 110)
+                        for row in detail_parts[:4]:
+                            row_font = _fit_text(draw, row, FONT_ZH, 15, 10, card_width - 28)
+                            text(card_x + 14, cy, row, row_font, "#cbd5e1")
+                            cy += 23
+                    # Portrait uses a magazine-spine treatment on the right edge:
+                    # vertical CJK title, rotated English deck, horizontal caption.
+                    quote_title = poster_title or "照片回忆"
+                    vertical_title_font = _font(75, zh=True)
+                    # The enlarged Chinese spine stays left of the rotated
+                    # English deck, leaving a deliberate clear channel.
+                    title_right = 796
+                    title_y = 20
+                    for title_char in quote_title[:8]:
+                        char_box = draw.textbbox((0, 0), title_char, font=vertical_title_font, anchor="lt")
+                        char_width = char_box[2] - char_box[0]
+                        draw.text((title_right - char_width + 3, title_y + 4), title_char, font=vertical_title_font, fill=(0, 0, 0, 178), anchor="lt")
+                        draw.text(
+                            (title_right - char_width, title_y), title_char,
+                            font=vertical_title_font, fill=accent_hex, anchor="lt",
+                        )
+                        title_y += (char_box[3] - char_box[1]) + 7
+
+                    if poster_english:
+                        english_font = _fit_text(draw, poster_english, FONT_LATIN, 24, 16, 360)
+                        english_box = draw.textbbox((0, 0), poster_english, font=english_font, anchor="lt")
+                        english_width = max(1, int((english_box[2] - english_box[0]) * IPAD_RETINA_SCALE))
+                        english_height = max(1, int((english_box[3] - english_box[1]) * IPAD_RETINA_SCALE))
+                        english_layer = Image.new("RGBA", (english_width + 12, english_height + 12), (0, 0, 0, 0))
+                        english_draw = ImageDraw.Draw(english_layer)
+                        english_draw.text((5, 5), poster_english, font=english_font, fill="#ffffff", anchor="lt")
+                        english_vertical = english_layer.rotate(90, expand=True, resample=Image.Resampling.BICUBIC)
+                        img.paste(english_vertical, (844 * IPAD_RETINA_SCALE, 22 * IPAD_RETINA_SCALE), english_vertical)
+
+                    caption_x = 755
+                    caption_y = 500
+                    caption_width = 240
+                    caption_font = _font(18, zh=True)
+                    caption_parts = [part.strip() for part in re.split(r"[，,]", memory_line) if part.strip()]
+                    caption_lines = []
+                    for part in caption_parts[:2]:
+                        part_font = caption_font
+                        while part_font.size > 24:
+                            bbox = draw.textbbox((0, 0), part, font=part_font, anchor="lt")
+                            if bbox[2] - bbox[0] <= caption_width:
+                                break
+                            next_size = max(12, part_font.size // IPAD_RETINA_SCALE - 1)
+                            part_font = _font(next_size, zh=True)
+                        caption_lines.append((part, part_font))
+                    if photo_orientation == "portrait":
+                        # Classic portrait layout: the two poetic clauses become a
+                        # large right-side vertical annotation, separate from metadata.
+                        poem_font = _font(36, zh=True)
+                        poem_xs = (880, 938)
+                        poem_y = 150
+                        for column_index, clause in enumerate(caption_parts[:2]):
+                            clause = re.sub(r"[。！？.!?]+$", "", clause).strip()
+                            x = poem_xs[column_index]
+                            for char_index, char in enumerate(clause[:12]):
+                                y = poem_y + char_index * 42
+                                draw.text((x + 2, y + 3), char, font=poem_font, fill=(0, 0, 0, 178), anchor="lt")
+                                draw.text((x, y), char, font=poem_font, fill="#ffffff", anchor="lt")
+                    else:
+                        for line_index, line in enumerate(caption_lines):
+                            line_y = caption_y + line_index * 26
+                            line_text, line_font = line
+                            draw.text((caption_x + 2, line_y + 3), line_text, font=line_font, fill=(0, 0, 0, 178), anchor="lt")
+                            draw.text((caption_x, line_y), line_text, font=line_font, fill="#ffffff", anchor="lt")
+                else:
+                    # Landscape photos get a shallow lower-right card.
+                    primary_font = _fit_text(draw, primary_meta, FONT_ZH, 20, 15, 760)
+                    detail_font = _fit_text(draw, detail_meta, FONT_ZH, 16, 12, 760)
+                    primary_bbox = draw.textbbox((0, 0), primary_meta, font=primary_font)
+                    detail_bbox = draw.textbbox((0, 0), detail_meta, font=detail_font)
+                    card_width = min(800, max(int(primary_bbox[2] - primary_bbox[0]), int(detail_bbox[2] - detail_bbox[0])) + 40)
+                    card_top = 601 if detail_meta else 629
+                    card_left = 1010 - card_width
+                    card = Image.new("RGBA", canvas_size, (0, 0, 0, 0))
+                    card_draw = ImageDraw.Draw(card)
+                    card_draw.rounded_rectangle(
+                        (card_left * IPAD_RETINA_SCALE, card_top * IPAD_RETINA_SCALE,
+                         1010 * IPAD_RETINA_SCALE, 675 * IPAD_RETINA_SCALE),
+                        radius=12 * IPAD_RETINA_SCALE,
+                        fill=(2, 8, 18, 148),
+                    )
+                    img.paste(Image.alpha_composite(img.convert("RGBA"), card).convert("RGB"))
+                    text(card_left + 20, card_top + 22, primary_meta, primary_font, "#ffffff", anchor="lm")
+                    if detail_meta:
+                        text(card_left + 20, card_top + 54, detail_meta, detail_font, "#cbd5e1", anchor="lm")
+
+                    # Scene-aware title and caption at the opposite corner.
+                    landscape_quote_width = 500
+                    quote_title = poster_title or "照片回忆"
+                    landscape_title_font = _fit_text(draw, quote_title, FONT_ZH, 58, 40, landscape_quote_width)
+                    landscape_title_y = 16
+                    draw.text((31, landscape_title_y + 4), quote_title, font=landscape_title_font, fill=(0, 0, 0, 178), anchor="lt")
+                    draw.text((28, landscape_title_y), quote_title, font=landscape_title_font, fill="#FFD54F", anchor="lt")
+                    title_box = draw.textbbox((0, 0), quote_title, font=landscape_title_font, anchor="lt")
+                    copy_y = landscape_title_y + (title_box[3] - title_box[1]) + 8
+                    if poster_english:
+                        english_font = _fit_text(draw, poster_english, FONT_LATIN, 25, 16, landscape_quote_width)
+                        draw.text((30, copy_y + 3), poster_english, font=english_font, fill=(0, 0, 0, 178), anchor="lt")
+                        draw.text((28, copy_y), poster_english, font=english_font, fill="#ffffff", anchor="lt")
+                        english_box = draw.textbbox((0, 0), poster_english, font=english_font, anchor="lt")
+                        copy_y += (english_box[3] - english_box[1]) + 9
+                    caption_font = _font(23, zh=True)
+                    landscape_quote_lines = _wrap_text(draw, memory_line, caption_font, landscape_quote_width, 2)
+                    caption_y = copy_y
+                    for line_index, line in enumerate(landscape_quote_lines):
+                        quote_y = caption_y + line_index * 32
+                        draw.text((31, quote_y + 3), line, font=caption_font, fill=(0, 0, 0, 178), anchor="lt")
+                        draw.text((28, quote_y), line, font=caption_font, fill="#ffffff", anchor="lt")
+            except Exception:
+                header("#07111f", "#334155", "照片回忆")
+                text(512, 330, "照片暂时无法显示", fonts["hero"], "#ffffff", anchor="mm")
+        else:
+            header("#07111f", "#334155", "照片回忆")
+            text(512, 310, "正在准备随机照片", fonts["hero"], "#ffffff", anchor="mm")
+            text(512, 402, "首次导出完成后会自动显示", fonts["h2"], "#cbd5e1", anchor="mm")
+
+    elif tid in {"steam-new-releases", "steam-new-releases-2", "steam-new-releases-3"}:
+        theme = {
+            "steam-new-releases": ("#07131f", "#16a34a", "Steam 新游精选"),
+            "steam-new-releases-2": ("#1f1208", "#ea580c", "Steam 新游清单"),
+            "steam-new-releases-3": ("#07131f", "#0891b2", "Steam 新品热图"),
+        }[tid]
+        header(theme[0], theme[1], theme[2])
+        source = steam_hot_items if tid == "steam-new-releases-3" else steam_new_items
+        items = [item for item in source if isinstance(item, dict) and steam_is_allowed(item)][:6]
+        box(28, 88, 996, 680, "#111827", theme[1], 20, 2)
+        if not items:
+            text(512, 304, "暂无合适 Steam 数据", fonts["hero"], "#ffffff", anchor="mm")
+            wrapped_text(210, 390, "当前缓存没有通过成人内容与低质量条目过滤的游戏。刷新缓存后会自动补充。", fonts["h2"], "#cbd5e1", 620, 3, 38)
+        elif tid in {"steam-new-releases", "steam-new-releases-2"}:
+            page_items = items[:3] if tid == "steam-new-releases" else items[3:6]
+            if not page_items:
+                text(512, 330, "本批次暂无更多新游", fonts["hero"], "#ffffff", anchor="mm")
+            for idx, item in enumerate(page_items):
+                x, y = 48 + idx * 312, 106
+                box(x, y, x + 292, 664, "#101827", theme[1], 16, 2)
+                # The feed currently provides 616x353 capsules. Give each game one
+                # ratio-matched 268x154 hero instead of reserving two empty/mismatched
+                # header/screenshot slots.
+                visual = steam_image(item, "screenshot") or steam_image(item, "header") or steam_image(item, "capsule")
+                paste_fill(visual, (x + 12, y + 12, x + 280, y + 166), "#0f172a", theme[1], 12)
+                number = idx + (1 if tid == "steam-new-releases" else 4)
+                text(x + 16, y + 190, f"{number:02d}", fonts["small"], theme[1])
+                wrapped_text(x + 58, y + 184, steam_title(item), fonts["body2"], "#ffffff", 212, 3, 30)
+                box(x + 16, y + 278, x + 276, y + 280, theme[1], None, 1, 1)
+                box(x + 16, y + 296, x + 276, y + 454, "#0c1624", "#263548", 12, 1)
+                wrapped_text(x + 28, y + 310, steam_summary(item), fonts["small"], "#dcfce7" if tid == "steam-new-releases" else "#fed7aa", 236, 5, 24)
+                genre, price, release = steam_meta_parts(item)
+                text(x + 20, y + 476, genre, _fit_text(draw, genre, FONT_ZH, 18, 14, 248), "#cbd5e1")
+                price_font = _fit_text(draw, price, FONT_ZH, 20, 14, 136)
+                date_font = _fit_text(draw, release, FONT_ZH, 17, 13, 116)
+                text(x + 20, y + 514, price, price_font, "#86efac" if tid == "steam-new-releases" else "#fdba74")
+                text(x + 272, y + 514, release, date_font, "#94a3b8", anchor="ra")
+        else:
+            for idx, item in enumerate(items[:2]):
+                x = 40 + idx * 484
+                box(x, 102, x + 460, 668, "#101827", theme[1], 18, 2)
+                # Two-column spotlight uses a single near-16:9 source at its natural
+                # visual ratio, eliminating the former empty header band.
+                visual = steam_image(item, "screenshot") or steam_image(item, "header") or steam_image(item, "capsule")
+                paste_fill(visual, (x + 14, 116, x + 446, 364), "#0f172a", theme[1], 14)
+                text(x + 20, 390, f"0{idx + 1}", fonts["small"], theme[1])
+                wrapped_text(x + 66, 384, steam_title(item), fonts["h2"], "#ffffff", 350, 2, 36)
+                box(x + 20, 474, x + 440, 476, theme[1], None, 1, 1)
+                box(x + 20, 490, x + 440, 592, "#0c1624", "#263548", 12, 1)
+                wrapped_text(x + 32, 504, steam_summary(item), fonts["small"], "#cffafe", 396, 3, 24)
+                genre, price, release = steam_meta_parts(item)
+                text(x + 22, 614, genre, _fit_text(draw, genre, FONT_ZH, 18, 14, 154), "#cbd5e1")
+                text(x + 224, 614, price, _fit_text(draw, price, FONT_ZH, 18, 13, 126), "#67e8f9")
+                text(x + 438, 614, release, _fit_text(draw, release, FONT_ZH, 17, 13, 126), "#94a3b8", anchor="ra")
+
+    else:
+        header("#111827", "#475569", "通用模板")
+        title_box(32, 122, 996, 634, "TEMPLATE", "#1f2937", "#64748b")
+        wrapped_text(64, 200, f"{template.name}\n{summary}\n\n当前任务: {current_task}\n下一步: {next_task}", fonts["h1"], "#ffffff", 860, 8, 44)
+
+    footer()
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=92, optimize=False)
+    return buf.getvalue()
+
+
+def list_templates() -> list[dict[str, str]]:
+    project = load_project(PROJECT_PATH)
+    result = []
+    for template in project.templates:
+        result.append(
+            {
+                "id": template.id,
+                "name": template.name,
+                "enabled": "true" if template.enabled else "false",
+                "dwell_seconds": str(max(5, int(getattr(template, "dwell_seconds", 20) or 20))),
+            }
+        )
+    return result
+
+
+def load_state() -> dict:
+    if STATE_PATH.exists():
+        try:
+            return json.loads(STATE_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    bridge_state = BRIDGE_PATH / "state.json"
+    if bridge_state.exists():
+        try:
+            return json.loads(bridge_state.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {}
+
+
+def save_state_patch(**kwargs):
+    current = load_state()
+    current.update(kwargs)
+    current.setdefault("updated_at", datetime.now().isoformat())
+    if "updated_at" not in kwargs:
+        current["updated_at"] = datetime.now().isoformat()
+    STATE_PATH.write_text(json.dumps(current, ensure_ascii=False, indent=2), encoding="utf-8")
+    bridge = HermesBridge(BRIDGE_PATH)
+    bridge.write_state(**current)
+    return current
+
+
+def _refresh_controls(refresh_minutes: int) -> tuple[int, str]:
+    minutes = max(0, int(refresh_minutes or 0))
+    if minutes == 0:
+        return 0, "分钟"
+    if minutes == 1:
+        return 60, "秒"
+    if minutes % 1440 == 0:
+        return minutes // 1440, "天"
+    if minutes % 60 == 0:
+        return minutes // 60, "小时"
+    return minutes, "分钟"
+
+
+def _refresh_minutes_from_controls(value, unit: str) -> int:
+    try:
+        amount = max(0, int(value or 0))
+    except Exception:
+        amount = 0
+    unit = str(unit or "分钟")
+    if amount <= 0:
+        return 0
+    if unit == "秒":
+        return max(1, int(round(amount / 60.0)))
+    if unit == "小时":
+        return amount * 60
+    if unit == "天":
+        return amount * 1440
+    return amount
+
+
+def ipad_control_payload() -> dict:
+    project = load_project(PROJECT_PATH)
+    state = load_state()
+    active_template_id = str(state.get("active_template_id", "") or "") if isinstance(state, dict) else ""
+    active_page_index = int(state.get("active_page_index", 0) or 0) if isinstance(state, dict) else 0
+    templates = []
+    for index, template in enumerate(project.templates):
+        refresh_minutes = int(max(0, int(getattr(template, "refresh_minutes", 0) or 0)))
+        refresh_value, refresh_unit = _refresh_controls(refresh_minutes)
+        pages = []
+        for page_idx, page in enumerate(getattr(template, "pages", []) or []):
+            pages.append(
+                {
+                    "page_index": page_idx,
+                    "name": getattr(page, "name", f"页面 {page_idx + 1}"),
+                    "open_url": f"/ipad?template={template.id}&page={page_idx}&rotate=0&mode=image",
+                    "is_active": template.id == active_template_id and page_idx == active_page_index,
+                }
+            )
+        templates.append(
+            {
+                "index": index,
+                "id": template.id,
+                "name": template.name,
+                "enabled": bool(template.enabled),
+                "dwell_seconds": int(max(5, int(getattr(template, "dwell_seconds", 20) or 20))),
+                "refresh_minutes": refresh_minutes,
+                "refresh_value": refresh_value,
+                "refresh_unit": refresh_unit,
+                "page_count": len(getattr(template, "pages", []) or []),
+                "preview_url": f"/ipad-panel.jpg?template={template.id}&page=0&rotate=0",
+                "open_url": f"/ipad?template={template.id}&page=0&rotate=0&mode=image",
+                "is_active": template.id == active_template_id,
+                "pages": pages,
+            }
+        )
+    return {
+        "active_template_id": active_template_id,
+        "active_page_index": active_page_index,
+        "last_sent_at": str(state.get("last_sent_at", "") or "") if isinstance(state, dict) else "",
+        "last_switch_at": str(state.get("last_switch_at", "") or "") if isinstance(state, dict) else "",
+        "last_content_refresh_at": str(state.get("last_content_refresh_at", "") or "") if isinstance(state, dict) else "",
+        "last_refresh_attempt_at": str(state.get("last_refresh_attempt_at", "") or "") if isinstance(state, dict) else "",
+        "last_refresh_finished_at": str(state.get("last_refresh_finished_at", "") or "") if isinstance(state, dict) else "",
+        "last_refresh_status": str(state.get("last_refresh_status", "") or "") if isinstance(state, dict) else "",
+        "refresh_running": _REFRESH_LOCK.locked(),
+        "refresh_interval_seconds": content_refresh_interval_seconds(),
+        "last_refresh_result": dict(_REFRESH_LAST_RESULT),
+        "templates": templates,
+    }
+
+
+def render_ipad_control_html() -> bytes:
+    payload = build_h5_state(rotate=True)
+    state_json = json.dumps(payload, ensure_ascii=False)
+    return f'''<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>H5 Lite 控制台</title>
+<style>
+body {{ margin:0; font-family:-apple-system,BlinkMacSystemFont,Helvetica,Arial,sans-serif; background:#07111f; color:#e5e7eb; }}
+.wrap {{ max-width:1680px; margin:0 auto; padding:22px; }}
+.top {{ display:flex; gap:16px; flex-wrap:wrap; align-items:flex-start; justify-content:space-between; margin-bottom:20px; }}
+.hero {{ background:linear-gradient(135deg, rgba(59,130,246,.20), rgba(168,85,247,.14)); border:1px solid rgba(148,163,184,.28); border-radius:20px; padding:18px 20px; box-shadow:0 20px 50px rgba(0,0,0,.22); }}
+.grid {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(440px,1fr)); gap:16px; }}
+.card {{ background:linear-gradient(180deg, rgba(17,24,39,.96), rgba(15,23,42,.88)); border:1px solid #334155; border-radius:18px; padding:16px; box-shadow:0 18px 40px rgba(0,0,0,.24); }}
+.btn {{ border:0; border-radius:10px; padding:10px 14px; cursor:pointer; background:#2563eb; color:#fff; font-weight:700; }}
+.btn.alt {{ background:#334155; }}
+.btn.warn {{ background:#7c3aed; }}
+.btn.ghost {{ background:#0f172a; border:1px solid #475569; color:#e5e7eb; }}
+.row {{ display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-top:12px; }}
+.title {{ font-size:30px; font-weight:800; }}
+.small {{ color:#94a3b8; font-size:13px; line-height:1.45; }}
+.code {{ color:#93c5fd; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:12px; }}
+.badges {{ display:flex; flex-wrap:wrap; gap:8px; margin-top:10px; }}
+.badge {{ display:inline-block; padding:6px 10px; border-radius:999px; background:rgba(255,255,255,.08); border:1px solid rgba(255,255,255,.10); font-size:12px; color:#e2e8f0; }}
+.active-badge {{ display:inline-block; margin-left:8px; padding:4px 10px; border-radius:999px; background:#14532d; color:#dcfce7; font-size:11px; }}
+.preview-shell {{ margin-top:14px; border-radius:14px; overflow:hidden; border:1px solid #334155; background:#020617; aspect-ratio:1080/1800; position:relative; }}
+.preview-shell iframe {{ width:1080px; height:1800px; border:0; transform:scale(.265); transform-origin:top left; pointer-events:none; background:#020617; }}
+.preview-cover {{ position:absolute; inset:0; border-radius:14px; box-shadow:inset 0 0 0 1px rgba(255,255,255,.04); pointer-events:none; }}
+.link {{ color:#93c5fd; text-decoration:none; }}
+.section-title {{ font-size:20px; font-weight:750; }}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="top">
+    <div class="hero" style="flex:1 1 720px;">
+      <div class="title">H5 Lite 专用控制台</div>
+      <div class="small" id="metaLine">当前屏幕：- ｜ 上次切换：- ｜ 上次内容刷新：-</div>
+      <div class="badges">
+        <span class="badge">1080×1800</span>
+        <span class="badge">h5-lite</span>
+        <span class="badge" id="screenCount">0 screens</span>
+      </div>
+    </div>
+    <div class="row">
+      <button class="btn alt" onclick="reloadState()">刷新状态</button>
+      <button class="btn alt" onclick="refreshContent()">刷新内容</button>
+      <button class="btn warn" onclick="enableRotate()">恢复自动轮播</button>
+      <a class="btn ghost link" href="/h5-lite" target="_blank" rel="noreferrer">打开总预览</a>
+    </div>
+  </div>
+  <div id="screenGrid" class="grid"></div>
+</div>
+<script>
+let state = {state_json};
+function esc(value) {{ return String(value ?? ''); }}
+function h5Url(screen) {{ return '/h5-lite?screen=' + encodeURIComponent(screen); }}
+function previewUrl(screen) {{ return h5Url(screen) + '&t=' + Date.now(); }}
+function refreshMeta() {{
+  const active = state.active_screen || '-';
+  const lastSwitch = (state.device || {{}}).last_switch_at || '-';
+  const refreshAt = (state.device || {{}}).last_content_refresh_at || '-';
+  document.getElementById('metaLine').textContent = '当前屏幕：' + active + ' ｜ 上次切换：' + lastSwitch + ' ｜ 上次内容刷新：' + refreshAt;
+  document.getElementById('screenCount').textContent = String((state.screens || []).length) + ' screens';
+}}
+function render() {{
+  refreshMeta();
+  const grid = document.getElementById('screenGrid');
+  grid.innerHTML = '';
+  for (const screen of (state.screens || [])) {{
+    const active = screen.id === state.active_screen;
+    const card = document.createElement('div');
+    card.className = 'card';
+    card.innerHTML = `
+      <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:10px;">
+        <div>
+          <div style="font-size:22px;font-weight:800;">${{esc(screen.title)}}${{active ? '<span class="active-badge">当前显示</span>' : ''}}</div>
+          <div class="code">${{esc(screen.id)}}</div>
+          <div class="small">${{esc(screen.subtitle || '')}} · family=${{esc(screen.family || '')}}</div>
+        </div>
+        <div class="badges">
+          <span class="badge">${{esc(screen.family || 'screen')}}</span>
+        </div>
+      </div>
+      <div class="preview-shell">
+        <iframe loading="lazy" src="${{previewUrl(screen.id)}}" title="${{esc(screen.title)}} preview"></iframe>
+        <div class="preview-cover"></div>
+      </div>
+      <div class="row">
+        <button class="btn" onclick="showScreen('${{esc(screen.id)}}')">立即显示</button>
+        <a class="link small" href="${{h5Url(screen.id)}}" target="_blank" rel="noreferrer">打开单页</a>
+        <a class="link small" href="/h5-lite" target="_blank" rel="noreferrer">打开轮播</a>
+      </div>
+    `;
+    grid.appendChild(card);
+  }}
+}}
+async function reloadState() {{
+  const res = await fetch('/api/h5/state');
+  state = await res.json();
+  render();
+}}
+async function showScreen(screenId) {{
+  const res = await fetch('/api/h5/control/show', {{method:'POST', headers:{{'Content-Type':'application/json'}}, body:JSON.stringify({{screen:screenId}})}});
+  const data = await res.json();
+  if (data && data.active_h5_screen) state.active_screen = data.active_h5_screen;
+  await reloadState();
+}}
+async function enableRotate() {{
+  await fetch('/api/ipad/control/rotate', {{method:'POST', headers:{{'Content-Type':'application/json'}}, body:JSON.stringify({{enabled:true}})}});
+  await reloadState();
+}}
+async function refreshContent() {{
+  await fetch('/api/ipad/control/refresh', {{method:'POST', headers:{{'Content-Type':'application/json'}}, body:JSON.stringify({{force:true}})}});
+  await reloadState();
+}}
+render();
+</script>
+</body>
+</html>'''.encode("utf-8")
+
+
+def normalize_media_url(path: str, template_id: str | None = None, page_index: int = 0, rotate: bool = False) -> str:
+    sep = "&" if "?" in path else "?"
+    return f"{path}{sep}template={html.escape(template_id or 'auto')}&page={page_index}&rotate={'1' if rotate else '0'}&t={int(time.time())}"
+
+
+def _safe_items(source, limit=6):
+    if not isinstance(source, list):
+        return []
+    return [item for item in source if isinstance(item, dict)][:limit]
+
+
+def build_h5_state(template_id: str | None = None, page_index: int = 0, rotate: bool = False) -> dict:
+    project, template, page, dwell, rotate_index, rotate_total = load_current_page(template_id=template_id, page_index=page_index, rotate=rotate)
+    content_cache = read_json("content_cache.json", {})
+    session = read_json("session_status.json", {})
+    work = read_json("work_status.json", {})
+    alerts = HermesBridge(BRIDGE_PATH).read_inbox()
+    printmana = read_json("printmana.json", {})
+    daily = read_json("daily.json", {})
+    bili = read_json("bilibili.json", {})
+    schedule = read_json("schedule.json", {})
+    state = load_state()
+    metrics = get_system_metrics()
+
+    source_settings = load_source_settings()
+    city_name = weather_city(source_settings)
+    weather = {}
+    weekly = []
+    if isinstance(content_cache, dict):
+        weather = (content_cache.get(f"weather::{city_name}") or content_cache.get("weather::Shanghai") or {}).get("payload", {})
+        weekly_payload = content_cache.get(f"weather_weekly::{city_name}::6") or content_cache.get("weather_weekly::Shanghai::6") or {}
+        weekly = (weekly_payload.get("payload") or {}).get("days", []) if isinstance(weekly_payload, dict) else []
+    traffic_lines = content_cache.get("traffic::default::default", {}).get("lines", []) if isinstance(content_cache, dict) else []
+    solidot_payload = find_rss_payload(content_cache, source_url("daily-news", source_settings))
+    news_lines = solidot_payload.get("lines", []) if isinstance(solidot_payload, dict) else []
+    hello_payload = find_rss_payload(content_cache, source_url("hello", source_settings))
+    hello_lines = hello_payload.get("lines", []) if isinstance(hello_payload, dict) else []
+    x_payload = find_rss_payload(content_cache, source_url("x-news", source_settings))
+    github_source = source_url("github-news", source_settings)
+    github_feed = find_rss_payload(content_cache, github_source) if looks_like_feed(github_source) else {}
+    github_lines = github_feed.get("lines", []) if github_feed else (
+        content_cache.get("rss::https://github.blog/changelog/feed/::4", {}).get("lines", []) if isinstance(content_cache, dict) else []
+    )
+    if isinstance(content_cache, dict):
+        github_ai_payload = content_cache.get("github::ai-trending::12") or content_cache.get("github::ai-trending::4") or {}
+    else:
+        github_ai_payload = {}
+    if not isinstance(github_ai_payload, dict):
+        github_ai_payload = {}
+    github_ai_raw = github_ai_payload.get("items", []) if isinstance(github_ai_payload.get("items", []), list) else []
+    if github_feed:
+        github_ai_raw = []
+        for feed_item in github_feed.get("items") or []:
+            if not isinstance(feed_item, dict):
+                continue
+            title = str(feed_item.get("title") or "").strip()
+            if not title:
+                continue
+            github_ai_raw.append({
+                "full_name": title,
+                "name": title,
+                "description": str(feed_item.get("summary") or ""),
+                "url": str(feed_item.get("link") or ""),
+                "stars": 0,
+                "forks": 0,
+                "language": "RSS",
+                "topics": [],
+            })
+    movies_payload = content_cache.get("movies::now_playing::6", {}) if isinstance(content_cache, dict) else {}
+    gamer520_payload = content_cache.get("gamer520::pcplay::10", {}) if isinstance(content_cache, dict) else {}
+    switch_payload = content_cache.get("gamer520::gameswitch::10", {}) if isinstance(content_cache, dict) else {}
+    ps5_payload = content_cache.get("2468c::ps5game::10", {}) if isinstance(content_cache, dict) else {}
+    steam_payload = content_cache.get("steam::new_releases::6", {}) if isinstance(content_cache, dict) else {}
+    top_sellers_payload = (content_cache.get("steam::top_sellers::6", {}) or content_cache.get("steam::top_sellers::2", {})) if isinstance(content_cache, dict) else {}
+    trending_payload = content_cache.get("steam::new_and_trending::2", {}) if isinstance(content_cache, dict) else {}
+
+    weekly_items = []
+    for item in weekly[:6]:
+        if not isinstance(item, dict):
+            continue
+        weekly_items.append(
+            {
+                "weekday": str(item.get("weekday") or "--"),
+                "description": str(item.get("description") or "天气"),
+                "temp_min": item.get("temp_min"),
+                "temp_max": item.get("temp_max"),
+                "icon": _weather_icon_char(str(item.get("description") or "")),
+            }
+        )
+
+    movie_items = []
+    for item in _safe_items(movies_payload.get("items", []), 6):
+        poster_path = resolve_ipad_poster_path(item.get("poster_local_path"))
+        movie_items.append(
+            {
+                "title": str(item.get("title") or "Untitled"),
+                "release_date": str(item.get("release_date") or "待定"),
+                "overview": str(item.get("overview") or "暂无简介"),
+                "poster_url": f"/assets/ipad/poster/{poster_path.name}" if poster_path and poster_path.exists() else "",
+            }
+        )
+
+    gamer520_raw_items = gamer520_payload.get("items", []) if isinstance(gamer520_payload, dict) else []
+
+    def build_steam_items(source_items):
+        items = []
+        for item in _safe_items(source_items, 6):
+            header_path = resolve_ipad_steam_header_path(item.get("header_local_path") or item.get("header_image_local_path") or item.get("header_image"))
+            capsule_path = resolve_ipad_steam_capsule_path(item.get("capsule_local_path") or item.get("capsule_image_local_path") or item.get("capsule_image"))
+            screenshot_path = resolve_ipad_steam_screenshot_path(item.get("screenshot_local_path") or item.get("first_screenshot_local_path") or item.get("screenshot"))
+            items.append(
+                {
+                    "title": str(item.get("title") or item.get("name") or "Untitled"),
+                    "subtitle": str(item.get("subtitle") or item.get("genres_text") or item.get("review_summary") or ""),
+                    "summary": str(item.get("summary") or item.get("short_description") or item.get("description") or "暂无简介"),
+                    "header_url": f"/assets/ipad/steam-header/{header_path.name}" if header_path and header_path.exists() else "",
+                    "capsule_url": f"/assets/ipad/steam-capsule/{capsule_path.name}" if capsule_path and capsule_path.exists() else "",
+                    "screenshot_url": f"/assets/ipad/steam-screenshot/{screenshot_path.name}" if screenshot_path and screenshot_path.exists() else "",
+                }
+            )
+        return items
+
+    steam_new = build_steam_items(steam_payload.get("items", []))
+    steam_hot = build_steam_items(top_sellers_payload.get("items", []))
+    steam_trending = build_steam_items(trending_payload.get("items", []))
+
+    schedule_items = schedule.get("items", []) if isinstance(schedule, dict) else []
+    today_iso = datetime.now().date().isoformat()
+    upcoming_items = []
+    today_date = datetime.now().date()
+    for raw_item in schedule_items:
+        if not isinstance(raw_item, dict):
+            continue
+        item_id = str(raw_item.get("id") or "").strip().lower()
+        title = str(raw_item.get("title") or "").strip()
+        if item_id.startswith("demo_") or title.startswith("示例：") or title.startswith("示例:"):
+            continue
+        date_str = str(raw_item.get("date") or "").strip()
+        if not date_str:
+            continue
+        try:
+            item_date = datetime.fromisoformat(date_str).date()
+        except Exception:
+            continue
+        if item_date < today_date:
+            continue
+        upcoming_items.append(
+            {
+                "id": str(raw_item.get("id") or ""),
+                "date": item_date.isoformat(),
+                "time": str(raw_item.get("time") or "").strip(),
+                "title": str(raw_item.get("title") or "未命名日程"),
+                "notes": str(raw_item.get("notes") or ""),
+                "priority": str(raw_item.get("priority") or "medium"),
+            }
+        )
+    upcoming_items.sort(key=lambda item: (item.get("date") or "9999-12-31", item.get("time") or "99:99", item.get("title") or ""))
+    today_schedule = [item for item in upcoming_items if item.get("date") == today_iso]
+    week_schedule = upcoming_items[:18]
+    reminder_items = []
+    raw_reminders = schedule.get("reminders", []) if isinstance(schedule, dict) else []
+    for raw_reminder in raw_reminders:
+        if not isinstance(raw_reminder, dict) or raw_reminder.get("done"):
+            continue
+        due = str(raw_reminder.get("due") or "").strip()
+        if due:
+            try:
+                if datetime.fromisoformat(due).date() < today_date:
+                    continue
+            except Exception:
+                due = ""
+        reminder_items.append({
+            "id": str(raw_reminder.get("id") or ""),
+            "title": str(raw_reminder.get("title") or "未命名提醒"),
+            "due": due,
+            "time": str(raw_reminder.get("time") or "").strip(),
+            "notes": str(raw_reminder.get("notes") or ""),
+        })
+    reminder_items = reminder_items[:12]
+
+    # Parse VPS / traffic lines into structured fields for the System screen.
+    def _vps_fields(lines):
+        out = {"used": "", "remain": "", "percent": 0.0, "cycle": "", "status": ""}
+        for line in lines or []:
+            s = str(line)
+            if s.startswith("Used:"):
+                out["used"] = s.replace("Used:", "").strip()
+            elif s.startswith("Remain:"):
+                out["remain"] = s.replace("Remain:", "").strip()
+            elif s.startswith("Percent:"):
+                raw = s.replace("Percent:", "").replace("%", "").strip()
+                try:
+                    out["percent"] = round(float(raw), 1)
+                except Exception:
+                    out["percent"] = 0.0
+            elif s.startswith("Cycle:"):
+                out["cycle"] = s.replace("Cycle:", "").strip()
+            elif "Traffic" in s:
+                out["status"] = s.strip()
+        return out
+
+    vps = _vps_fields(traffic_lines)
+    penguin = load_penguin_balance()
+    penguin_account = penguin.get("account") if isinstance(penguin, dict) else {}
+    penguin_usage = penguin.get("usage") if isinstance(penguin, dict) else {}
+    penguin_history = penguin.get("history") if isinstance(penguin, dict) else {}
+    penguin_days = penguin_history.get("days") if isinstance(penguin_history, dict) else []
+    penguin_models = penguin_history.get("models") if isinstance(penguin_history, dict) else []
+    bili_data = bili if isinstance(bili, dict) else {}
+
+    def _map_game_items(raw_items, prefix_fallback=""):
+        mapped = []
+        for idx, item in enumerate(raw_items[:10], 1):
+            if not isinstance(item, dict):
+                continue
+            image_path = resolve_ipad_news_image_path(item.get("image_local_path"))
+            image_url = f"/assets/ipad/news-image/{image_path.name}" if image_path and image_path.exists() else ""
+            if not image_url:
+                remote = str(item.get("image_url") or "").strip()
+                if remote.startswith("http"):
+                    image_url = remote
+                elif remote.startswith("/"):
+                    image_url = remote
+            mapped.append(
+                {
+                    "title": str(item.get("title") or "Untitled"),
+                    "link": str(item.get("link") or ""),
+                    "image_url": image_url,
+                }
+            )
+        return mapped
+
+    gamer520_items = _map_game_items(gamer520_raw_items)
+    switch_raw_items = switch_payload.get("items", []) if isinstance(switch_payload, dict) else []
+    switch_raw_items = switch_raw_items if isinstance(switch_raw_items, list) else []
+    switch_items = _map_game_items(switch_raw_items)
+    ps5_raw_items = ps5_payload.get("items", []) if isinstance(ps5_payload, dict) else []
+    ps5_raw_items = ps5_raw_items if isinstance(ps5_raw_items, list) else []
+    ps5_items = _map_game_items(ps5_raw_items)
+
+    github_items = []
+    for item in github_ai_raw[:12]:
+        if not isinstance(item, dict):
+            continue
+        github_items.append(
+            {
+                "full_name": str(item.get("full_name") or ""),
+                "name": str(item.get("name") or item.get("full_name") or ""),
+                "owner": str(item.get("owner") or ""),
+                "description": str(item.get("description") or ""),
+                "stars": int(item.get("stars") or 0),
+                "forks": int(item.get("forks") or 0),
+                "language": str(item.get("language") or "--"),
+                "url": str(item.get("url") or ""),
+                "topics": [str(t) for t in (item.get("topics") or [])[:8]],
+                "created_at": str(item.get("created_at") or ""),
+                "pushed_at": str(item.get("pushed_at") or ""),
+            }
+        )
+
+    screens = [
+        {"id": "work-cockpit", "title": "工作作战台", "subtitle": "Cockpit", "family": "work", "accent": "#4fd1c5", "accent2": "#0ea5e9"},
+        {"id": "penguin-balance", "title": "Penguin Balance", "subtitle": "Quota / Spend", "family": "ops", "accent": "#f472b6", "accent2": "#38bdf8"},
+        {"id": "schedule-board", "title": "未来日程", "subtitle": "Agenda", "family": "news", "accent": "#fb7185", "accent2": "#f59e0b"},
+        {"id": "weather-today", "title": "今日天气", "subtitle": "Weather", "family": "weather", "accent": "#38bdf8", "accent2": "#818cf8"},
+        {"id": "system", "title": "系统信息 / VPS流量", "subtitle": "System + VPS", "family": "ops", "accent": "#34d399", "accent2": "#10b981"},
+        {"id": "news", "title": "今日要闻", "subtitle": "Editorial", "family": "news", "accent": "#a78bfa", "accent2": "#c084fc"},
+        {"id": "gamer520", "title": "PC 新游墙", "subtitle": "Gamer520", "family": "entertainment", "accent": "#fb7185", "accent2": "#f59e0b"},
+        {"id": "steam", "title": "Steam 速递", "subtitle": "Games", "family": "entertainment", "accent": "#f59e0b", "accent2": "#fbbf24"},
+        {"id": "movies", "title": "正在热映", "subtitle": "Cinema", "family": "entertainment", "accent": "#8b5cf6", "accent2": "#d946ef"},
+        {"id": "print-ops", "title": "打印机舰队", "subtitle": "Print / AMS", "family": "making", "accent": "#38bdf8", "accent2": "#0284c7"},
+    ]
+
+    active_screen = state.get("active_h5_screen") or state.get("active_template_id") or "work-cockpit"
+    if active_screen not in {item["id"] for item in screens}:
+        active_screen = "work-cockpit"
+
+    return {
+        "updated_at": datetime.now().isoformat(),
+        "stage": {"width": H5_STAGE_WIDTH, "height": H5_STAGE_HEIGHT},
+        "mode": "rotate" if rotate else "fixed",
+        "template": {
+            "id": template.id,
+            "name": template.name,
+            "page_name": getattr(page, "name", template.name),
+            "page_index": page_index,
+            "dwell_seconds": dwell,
+            "rotate_index": rotate_index,
+            "rotate_total": rotate_total,
+        },
+        "device": {
+            "active_template_id": state.get("active_template_id") or template.id,
+            "last_switch_at": state.get("last_switch_at") or "",
+            "last_content_refresh_at": state.get("last_content_refresh_at") or "",
+            "last_sent_at": state.get("last_sent_at") or "",
+            "device_online": bool(state.get("device_online", True)),
+            "last_error": str(state.get("last_error") or ""),
+        },
+        "screens": screens,
+        "active_screen": active_screen,
+        "photo_gallery": load_h5_daily_photos(),
+        "weather": {
+            "city": str(weather.get("name") or weather.get("city") or "Shanghai"),
+            "temperature": weather.get("temperature"),
+            "description": str(weather.get("description") or "天气"),
+            "temp_min": weather.get("temp_min"),
+            "temp_max": weather.get("temp_max"),
+            "wind_speed": weather.get("wind_speed"),
+            "icon": _weather_icon_char(str(weather.get("description") or "")),
+            "weekly": weekly_items,
+        },
+        "work": {
+            "current_task": str(work.get("current_task") or "等待任务"),
+            "next_task": str(work.get("next_task") or "继续当前项"),
+            "summary": str(work.get("summary") or session.get("summary") or "最近对话"),
+            "blocked": bool(work.get("blocked", False)),
+            "blocker": str(work.get("blocker") or ""),
+        },
+        "session": {
+            "title": str(session.get("title") or "Hermes Session"),
+            "summary": str(session.get("summary") or "最近对话"),
+            "user_last": str(session.get("user_last") or ""),
+            "assistant_last": str(session.get("assistant_last") or ""),
+            "recent_messages": session.get("recent_messages") or [],
+        },
+        "alerts": _safe_items(alerts, 6),
+        "daily": {
+            "greeting": str(daily.get("greeting") or ""),
+            "quote": str(daily.get("quote") or ""),
+            "news_topics": [str(item) for item in (daily.get("news_topics") or [])[:6]],
+        },
+        "schedule": {
+            "today": today_schedule,
+            "week": week_schedule,
+            "reminders": reminder_items,
+            "source_url": str(schedule.get("source_url") or "") if isinstance(schedule, dict) else "",
+            "sync_error": str(schedule.get("sync_error") or "") if isinstance(schedule, dict) else "",
+            "updated_at": str(schedule.get("updated_at") or "") if isinstance(schedule, dict) else "",
+        },
+        "news": {
+            "daily": [str(item) for item in news_lines[:8]],
+            "daily_items": [
+                {
+                    "title": str(item.get("title") or item.get("summary") or ""),
+                    "summary": str(item.get("summary") or ""),
+                    "link": str(item.get("link") or ""),
+                    "image_url": (
+                        f"/assets/ipad/news-image/{Path(str(item.get('image_local_path') or '')).name}"
+                        if str(item.get("image_local_path") or "").strip()
+                        else str(item.get("image_url") or "")
+                    ),
+                }
+                for item in _safe_items(solidot_payload.get("items", []), 10)
+            ],
+            "github": [str(item) for item in github_lines[:8]],
+            "github_items": github_items,
+            "github_meta": {
+                "source": str(github_ai_payload.get("source") or "GitHub Search API"),
+                "method": str(github_ai_payload.get("method") or ""),
+                "window_start": str(github_ai_payload.get("window_start") or ""),
+                "updated_at": str(github_ai_payload.get("updated_at") or ""),
+            },
+            "hello": [str(item) for item in hello_lines[:8]],
+            "hello_items": [{"title": str(line), "summary": "", "link": ""} for line in hello_lines[:8]],
+            "x": [str(item.get("title") or "") for item in _safe_items(x_payload.get("items", []) if isinstance(x_payload, dict) else [], 8)],
+            "x_items": [
+                {
+                    "title": str(item.get("title") or item.get("summary") or ""),
+                    "summary": str(item.get("summary") or ""),
+                    "link": str(item.get("link") or ""),
+                    "image_url": str(item.get("image_url") or ""),
+                }
+                for item in _safe_items(x_payload.get("items", []) if isinstance(x_payload, dict) else [], 10)
+            ],
+        },
+        "gamer520": {
+            "items": gamer520_items,
+            "switch_items": switch_items,
+            "ps5_items": ps5_items,
+            "updated_at": str(gamer520_payload.get("updated_at") or "") if isinstance(gamer520_payload, dict) else "",
+        },
+        "ps5_games": ps5_items,
+        "switch_games": switch_items,
+        "ops": {
+            "traffic_lines": [str(item) for item in traffic_lines[:6]],
+            "cpu_pct": int((metrics.get("cpu_user") or 0) + (metrics.get("cpu_sys") or 0)),
+            "mem_pct": int(metrics.get("memory_pressure") or 0),
+            "disk_pct": int(metrics.get("disk_used_pct") or 0),
+            "load_1m": metrics.get("load_1m"),
+            "memory_used_gb": metrics.get("memory_used_gb"),
+            "memory_total_gb": metrics.get("memory_total_gb"),
+            "disk_free_gb": metrics.get("disk_free_gb"),
+            "host": str(metrics.get("host") or ""),
+            "os": str(metrics.get("os") or ""),
+            "thermal_status": str(metrics.get("thermal_status") or "未知"),
+        },
+        "penguin": {
+            "queried_at": str(penguin.get("queriedAt") or ""),
+            "source": str(penguin.get("source") or ""),
+            "error": str(penguin.get("error") or penguin.get("_stale_error") or ""),
+            "username": str(penguin_account.get("username") or ""),
+            "group": str(penguin_account.get("group") or ""),
+            "balance_usd": penguin_account.get("balanceUsd"),
+            "balance_cny": penguin_account.get("balanceCny"),
+            "balance_quota": penguin_account.get("balanceQuota"),
+            "total_used_usd": penguin_account.get("totalUsedUsd"),
+            "request_count": penguin_account.get("requestCount"),
+            "today_usd": penguin_usage.get("todayUsd"),
+            "last24_usd": penguin_usage.get("last24HoursUsd"),
+            "month_usd": penguin_usage.get("monthUsd"),
+            "rpm": penguin_usage.get("rpm"),
+            "tpm": penguin_usage.get("tpm"),
+            "days_remaining": penguin_usage.get("estimatedDaysRemaining"),
+            "history_days": penguin_days[:7] if isinstance(penguin_days, list) else [],
+            "history_models": penguin_models[:5] if isinstance(penguin_models, list) else [],
+        },
+        "vps": vps,
+        "print": {
+            "primary": printmana.get("primary") or {},
+            "printers": printmana.get("printers") or [],
+        },
+        "bilibili": bili_data,
+        "movies": movie_items,
+        "steam": {
+            "new_releases": steam_new,
+            "top_sellers": steam_hot,
+            "trending": steam_trending,
+        },
+        "media": {
+            "panel_png": normalize_media_url("/panel.png", template.id, page_index, rotate),
+            "panel_jpg": normalize_media_url("/panel.jpg?scale=2", template.id, page_index, rotate),
+            "ipad_jpg": normalize_media_url("/ipad-panel.jpg", template.id, page_index, rotate),
+            "legacy_ipad": f"/ipad?template={template.id}&page={page_index}&rotate={'1' if rotate else '0'}",
+        },
+    }
+
+
+def load_h5_daily_photos() -> dict:
+    today = datetime.now().date().isoformat()
+    manifest_path = H5_DAILY_PHOTO_DIR / today / "manifest.json"
+    try:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if isinstance(payload, dict) and payload.get("items"):
+            payload['editorial_updated_at'] = str(payload.get('editorial_updated_at') or '') + '|type-v1'
+            return payload
+    except Exception:
+        pass
+    # Keep the previous successful batch visible while today's export finishes.
+    manifests = sorted(H5_DAILY_PHOTO_DIR.glob("*/manifest.json"), reverse=True)
+    for path in manifests:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(payload, dict) and payload.get("items"):
+                return payload
+        except Exception:
+            continue
+    return {"date": today, "person": "方宇轩", "count": 0, "items": []}
+
+
+def _h5_photo_font(size: int, rounded_bold: bool = False):
+    if rounded_bold:
+        yuanti_paths = list(Path("/System/Library/AssetsV2").glob("**/AssetData/Yuanti.ttc"))
+        for path in yuanti_paths:
+            try:
+                # Yuanti SC Bold is face index 2 in Apple's TTC.
+                return ImageFont.truetype(str(path), size=size, index=2)
+            except Exception:
+                continue
+    for path in [Path("/System/Library/Fonts/PingFang.ttc"), Path("/System/Library/Fonts/STHeiti Medium.ttc"), FONT_ZH]:
+        try:
+            return ImageFont.truetype(str(path), size=size)
+        except Exception:
+            continue
+    return ImageFont.load_default()
+
+
+def _h5_date_font(size: int, style: int):
+    """Choose a stable decorative date face while retaining Chinese glyphs."""
+    if style % 3 == 0:
+        return _h5_photo_font(size, rounded_bold=True)
+    candidates = [
+        Path("/System/Library/Fonts/PingFang.ttc"),
+        Path("/System/Library/Fonts/STHeiti Medium.ttc"),
+        FONT_ZH,
+    ]
+    path = candidates[(style - 1) % len(candidates)]
+    try:
+        return ImageFont.truetype(str(path), size=size)
+    except Exception:
+        return _h5_photo_font(size, rounded_bold=style % 2 == 0)
+
+
+def _h5_poster_english_font(size: int):
+    for path in [
+        Path("/System/Library/Fonts/Supplemental/Arial Rounded Bold.ttf"),
+        Path("/System/Library/Fonts/SFNSRounded.ttf"),
+    ]:
+        try:
+            return ImageFont.truetype(str(path), size=size)
+        except Exception:
+            continue
+    return _h5_photo_font(size)
+
+
+def _h5_photo_text(value) -> str:
+    value = str(value or "").strip()
+    return "" if value.lower() in {"missing value", "default", "none", "null"} else value
+
+
+def _wrap_h5_title(draw, text: str, font, max_width: int) -> str:
+    """Keep short copy on one line; balance long CJK/Latin copy across two."""
+    text = _h5_photo_text(text)
+    if not text:
+        return ""
+    bbox = draw.textbbox((0, 0), text, font=font)
+    if bbox[2] - bbox[0] <= max_width:
+        return text
+    tokens = text.split() if " " in text else list(text)
+    separator = " " if " " in text else ""
+    if len(tokens) < 2:
+        return text
+    candidates: list[tuple[int, str]] = []
+    for split_at in range(1, len(tokens)):
+        first = separator.join(tokens[:split_at])
+        second = separator.join(tokens[split_at:])
+        widths = [draw.textbbox((0, 0), line, font=font)[2] for line in (first, second)]
+        candidates.append((max(widths), first + "\n" + second))
+    return min(candidates, key=lambda candidate: candidate[0])[1]
+
+
+def render_h5_photo_frame(index: int, weekly: bool = False) -> bytes | None:
+    """Serve approved typography; weekly edition is limited to port 9121."""
+    if weekly:
+        from h5_photo_weekly_20261019 import render
+    else:
+        from h5_photo_type import render
+    payload = load_h5_daily_photos()
+    items = payload.get('items') or []
+    if not items:
+        return None
+    index %= len(items)
+    source = Path(str(items[index].get('image_path') or ''))
+    if not source.is_file():
+        return None
+    directory = H5_DAILY_PHOTO_DIR / str(payload.get('date') or 'unknown')
+    cache = directory / ('rendered-weekly-20261019' if weekly else 'rendered-type-v1') / f'frame-{index+1:02d}.jpg'
+    inputs = [source, directory / 'manifest.json', Path(__file__),
+              Path(__file__).with_name('h5_photo_weekly_20261019.py' if weekly else 'h5_photo_type.py'), Path(__file__).with_name('h5_photo_palette.py')]
+    changed = max(p.stat().st_mtime for p in inputs if p.exists())
+    if cache.exists() and cache.stat().st_mtime >= changed:
+        return cache.read_bytes()
+    body, _audit = render(items[index], index)
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    cache.write_bytes(body)
+    return body
+
+
+def render_h5_photo_frame_legacy_v24(index: int) -> bytes | None:
+    """Preserved previous renderer for rollback; not used by the live route."""
+    payload = load_h5_daily_photos()
+    items = payload.get("items") or []
+    if not items:
+        return None
+    index %= len(items)
+    item = items[index]
+    source_path = Path(str(item.get("image_path") or ""))
+    if not source_path.exists():
+        return None
+    cache_dir = H5_DAILY_PHOTO_DIR / str(payload.get("date") or "unknown") / "rendered-v24"
+    cache_path = cache_dir / f"frame-{index + 1:02d}.jpg"
+    manifest_path = H5_DAILY_PHOTO_DIR / str(payload.get("date") or "unknown") / "manifest.json"
+    try:
+        inputs_mtime = max(
+            source_path.stat().st_mtime,
+            Path(__file__).stat().st_mtime,
+            manifest_path.stat().st_mtime if manifest_path.exists() else 0,
+        )
+        if cache_path.exists() and cache_path.stat().st_mtime >= inputs_mtime:
+            return cache_path.read_bytes()
+    except OSError:
+        pass
+
+    with Image.open(source_path) as opened:
+        source = ImageOps.exif_transpose(opened).convert("RGB")
+    frame = ImageOps.fit(source, (H5_STAGE_WIDTH, H5_STAGE_HEIGHT), method=Image.Resampling.LANCZOS)
+    frame = ImageEnhance.Brightness(frame.filter(ImageFilter.GaussianBlur(42))).enhance(0.48)
+    landscape = str(item.get("orientation")) == "landscape"
+    if landscape:
+        fitted = ImageOps.contain(source, (996, 760), method=Image.Resampling.LANCZOS)
+        panel = ImageOps.fit(source, (996, 760), method=Image.Resampling.LANCZOS)
+        panel = ImageEnhance.Brightness(panel.filter(ImageFilter.GaussianBlur(24))).enhance(0.78)
+        panel.paste(fitted, ((996 - fitted.width) // 2, (760 - fitted.height) // 2))
+        fitted, xy, radius = panel, (42, 405), 38
+    else:
+        fitted = ImageOps.contain(source, (896, 1020), method=Image.Resampling.LANCZOS)
+        panel = ImageOps.fit(source, (896, 1020), method=Image.Resampling.LANCZOS)
+        panel = ImageEnhance.Brightness(panel.filter(ImageFilter.GaussianBlur(24))).enhance(0.78)
+        panel.paste(fitted, ((896 - fitted.width) // 2, (1020 - fitted.height) // 2))
+        fitted, xy, radius = panel, (92, 190), 42
+    mask = Image.new("L", fitted.size, 0)
+    ImageDraw.Draw(mask).rounded_rectangle((0, 0, fitted.width, fitted.height), radius=radius, fill=255)
+    frame.paste(fitted, xy, mask)
+
+    shade = Image.new("RGBA", frame.size, (0, 0, 0, 0))
+    sd = ImageDraw.Draw(shade)
+    for y in range(470):
+        sd.line((0, y, H5_STAGE_WIDTH, y), fill=(0, 0, 0, max(0, int(132 * (1 - y / 470)))))
+    if landscape:
+        for y in range(1180, H5_STAGE_HEIGHT):
+            sd.line((0, y, H5_STAGE_WIDTH, y), fill=(0, 0, 0, int(150 * ((y - 1180) / 620))))
+    frame = Image.alpha_composite(frame.convert("RGBA"), shade)
+
+    # Fresh H5-lite art direction: quiet full-bleed image, floating glass crop,
+    # oversized editorial title, and a precise information rail. This branch is
+    # intentionally independent from the legacy dashboard poster treatment below.
+    draw = ImageDraw.Draw(frame)
+    accent_hex = _h5_photo_text(item.get("poster_accent")).lstrip("#")
+    try:
+        accent_rgb = tuple(int(accent_hex[i:i + 2], 16) for i in (0, 2, 4))
+    except Exception:
+        accent_rgb = (255, 196, 92)
+    accent_rgba = accent_rgb + (255,)
+    title = _h5_photo_text(item.get("poster_title")) or _h5_photo_text(item.get("title")) or "今日一帧"
+    english = _h5_photo_text(item.get("poster_english")) or "A MOMENT TO KEEP"
+    caption = _h5_photo_text(item.get("ai_caption")) or _h5_photo_text(item.get("description")) or "把此刻留在光里。"
+    date_text = _h5_photo_text(item.get("date_display"))
+    place = _h5_photo_text(item.get("place_display"))
+    num = f"{index + 1:02d}"
+    # darken the lower third without hiding the image's main subject
+    overlay = Image.new("RGBA", frame.size, (0, 0, 0, 0))
+    od = ImageDraw.Draw(overlay)
+    for y in range(900, H5_STAGE_HEIGHT):
+        a = int(205 * ((y - 900) / max(1, H5_STAGE_HEIGHT - 900)))
+        od.line((0, y, H5_STAGE_WIDTH, y), fill=(3, 7, 14, a))
+    frame = Image.alpha_composite(frame, overlay)
+    draw = ImageDraw.Draw(frame)
+    small = _h5_photo_font(24)
+    micro = _h5_photo_font(20)
+    title_font = _h5_photo_font(112 if len(title) <= 4 else 88 if len(title) <= 6 else 72, rounded_bold=True)
+    english_font = _h5_poster_english_font(30)
+    caption_font = _h5_photo_font(34)
+    # top-left identity and top-right date
+    draw.rounded_rectangle((58, 58, 292, 112), radius=27, fill=(8, 14, 26, 150), outline=(255, 255, 255, 62), width=2)
+    draw.ellipse((78, 76, 94, 92), fill=accent_rgba)
+    draw.text((112, 70), "REMOTE PANEL", font=micro, fill=(245, 248, 252, 235))
+    draw.text((1018, 70), num, font=_h5_photo_font(30), fill=accent_rgba, anchor="ra")
+    if date_text:
+        draw.text((1018, 108), date_text[:24], font=micro, fill=(235, 241, 249, 205), anchor="ra")
+    # Keep the outline on the actual photo panel, outside subject details.
+    crop_box = (xy[0], xy[1], xy[0] + fitted.width - 1, xy[1] + fitted.height - 1)
+    border = Image.new("RGBA", frame.size, (0, 0, 0, 0))
+    bd = ImageDraw.Draw(border)
+    bd.rounded_rectangle(crop_box, radius=radius, outline=(255, 255, 255, 92), width=3)
+    frame = Image.alpha_composite(frame, border)
+    # title block: one strong gesture, never a dense poster stack
+    draw = ImageDraw.Draw(frame)
+    draw.text((66, 1248), english.upper(), font=english_font, fill=accent_rgba)
+    draw.rounded_rectangle((66, 1306, 190, 1314), radius=4, fill=accent_rgba)
+    title_lines = _wrap_h5_title(draw, title, title_font, 780).splitlines()[:2]
+    ty = 1328
+    for line in title_lines:
+        draw.text((66, ty), line, font=title_font, fill=(255, 255, 255, 248))
+        ty += int(title_font.size * .86)
+    caption_lines = [p.strip() for p in re.split(r"[，,。]", caption) if p.strip()][:2]
+    if not caption_lines:
+        caption_lines = [caption[:28]]
+    cy = max(1530, ty + 18)
+    for line in caption_lines:
+        draw.text((66, cy), line, font=caption_font, fill=(235, 241, 249, 226))
+        cy += 48
+    draw.text((1018, 1698), "SWIPE / TAP TO EXPLORE", font=micro, fill=(235, 241, 249, 170), anchor="rt")
+    if place:
+        draw.text((1018, 1740), place[:28], font=small, fill=(255, 255, 255, 220), anchor="rt")
+    output = io.BytesIO()
+    frame.convert("RGB").save(output, format="JPEG", quality=86, optimize=True, progressive=True)
+    body = output.getvalue()
+    try:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        cache_path.write_bytes(body)
+    except OSError:
+        pass
+    return body
+
+    draw = ImageDraw.Draw(frame)
+    quote = _h5_photo_text(item.get("ai_caption")) or _h5_photo_text(item.get("title")) or _h5_photo_text(item.get("description"))
+    # Magazine-poster typography: editorial label, oversized Chinese title,
+    # colored rule, English deck, then a small scene-aware caption.
+    poster_title = _h5_photo_text(item.get("poster_title")) or quote
+    poster_english = _h5_photo_text(item.get("poster_english")) or "A MOMENT IN TIME"
+    layout_key = f"{payload.get('date') or ''}-{index:02d}"
+    layout_variant = sum((position + 1) * ord(ch) for position, ch in enumerate(layout_key)) % 6
+    try:
+        accent_hex = _h5_photo_text(item.get("poster_accent")).lstrip("#")
+        accent = tuple(int(accent_hex[i:i + 2], 16) for i in (0, 2, 4)) + (255,)
+    except Exception:
+        accent = (255, 214, 107, 255)
+    label_font = _h5_photo_font(34 if (not landscape and index == 2) else 24)
+    # Date + photo index selects a stable layout for the whole day.
+    top_title = poster_english if landscape and layout_variant % 2 else poster_title
+    top_subtitle = "" if landscape else poster_english
+    vertical_title = False
+    title_size = 147 if len(top_title) <= 4 else 129 if len(top_title) == 5 else 114
+    title_font = _h5_photo_font(title_size, rounded_bold=True)
+    english_font = _h5_photo_font(30)
+    caption_font = _h5_photo_font(46 if landscape else (46 if index == 2 else 33))
+    dfont, pfont, mfont = _h5_photo_font(41), _h5_photo_font(31), _h5_photo_font(25)
+    if landscape:
+        tx, ty, anchor = ((70, 70, "la") if layout_variant in {0, 2, 4} else (1000, 118, "ra"))
+    else:
+        # Portrait photos keep all editorial copy in a stable lower-third zone.
+        # This avoids randomized overlays crossing faces and gives busy scenes a
+        # predictable contrast surface.
+        tx, ty, anchor = (118, 1150, "la") if index == 2 else (118, 1245, "la")
+        title_size = (129 if len(top_title) <= 4 else 120 if len(top_title) == 5 else 109) if index == 2 else (92 if len(top_title) <= 4 else 86 if len(top_title) == 5 else 78)
+        title_font = _h5_photo_font(title_size, rounded_bold=True)
+    if landscape:
+        title_size = min(title_size, 84)
+        title_font = _h5_photo_font(title_size, rounded_bold=True)
+        if index in {1, 15}:
+            # Keep the subtitle clear of the landscape photo's rounded top edge.
+            tx, ty, anchor = (1000, 150, "ra")
+    if landscape and index == 13:
+        title_size = 84
+        title_font = _h5_photo_font(title_size, rounded_bold=True)
+    if landscape and index == 17:
+        # Keep the long game title clear of the oversized year/date block.
+        tx, ty, anchor = (1000, 300, "ra")
+        title_size = 72
+        title_font = _h5_photo_font(title_size, rounded_bold=True)
+    # Landscape dates occupy the opposite top corner. Keep headlines inside
+    # their own half so long English copy cannot merge into the large year.
+    max_title_width = 540 if landscape else 888
+    title_text = "\n".join(top_title) if vertical_title else _wrap_h5_title(draw, top_title, title_font, max_title_width)
+    while title_size > 72:
+        if vertical_title:
+            title_text = "\n".join(top_title)
+        else:
+            title_text = _wrap_h5_title(draw, top_title, title_font, max_title_width)
+        title_box_test = draw.multiline_textbbox((0, 0), title_text, font=title_font, spacing=-12)
+        if title_box_test[2] - title_box_test[0] <= max_title_width:
+            break
+        title_size -= 4
+        title_font = _h5_photo_font(title_size, rounded_bold=True)
+    align = "left" if anchor == "la" else "right"
+    if not landscape:
+        # Keep the photo-only H5 composition clean: title copy floats over the
+        # darkened frame without a separate black title card.
+        pass
+    accent_luminance = (accent[0] * 299 + accent[1] * 587 + accent[2] * 114) / 1000
+    readable_accent = accent if accent_luminance >= 145 else tuple(min(255, channel + 78) for channel in accent[:3]) + (255,)
+    label = f"MEMORY EDIT  /  {index + 1:02d}"
+    draw.text((tx + 1, ty + 2), label, font=label_font, fill=(0, 0, 0, 150), anchor=anchor)
+    draw.text((tx, ty), label, font=label_font, fill=readable_accent, anchor=anchor)
+    title_y = ty + 44
+    draw.multiline_text((tx + 2, title_y + 3), title_text, font=title_font, fill=(0, 0, 0, 145), anchor=anchor, spacing=-12, align=align)
+    title_color = accent if layout_variant in {1, 4} and accent_luminance >= 145 else (255, 255, 255, 255)
+    draw.multiline_text((tx, title_y), title_text, font=title_font, fill=title_color, anchor=anchor, spacing=-12, align=align)
+    title_box = draw.multiline_textbbox((tx, title_y), title_text, font=title_font, anchor=anchor, spacing=-12, align=align)
+    rule_y = title_box[3] + 18
+    if anchor == "la":
+        draw.rounded_rectangle((tx, rule_y, tx + 168, rule_y + 8), radius=4, fill=accent)
+    else:
+        draw.rounded_rectangle((tx - 168, rule_y, tx, rule_y + 8), radius=4, fill=accent)
+    english_y = rule_y + 26
+    subtitle_font = _h5_photo_font(36, rounded_bold=True) if top_subtitle == poster_title else english_font
+    subtitle_text = _wrap_h5_title(draw, top_subtitle, subtitle_font, 820)
+    subtitle_spacing = 5
+    draw.multiline_text((tx + 1, english_y + 2), subtitle_text, font=subtitle_font, fill=(0, 0, 0, 145), anchor=anchor, spacing=subtitle_spacing, align=align)
+    draw.multiline_text((tx, english_y), subtitle_text, font=subtitle_font, fill=readable_accent if title_color != accent else (255, 255, 255, 245), anchor=anchor, spacing=subtitle_spacing, align=align)
+    subtitle_box = draw.multiline_textbbox((tx, english_y), subtitle_text, font=subtitle_font, anchor=anchor, spacing=subtitle_spacing, align=align)
+    # The lower display title is painted after this block, so place landscape
+    # captions below its full two-line footprint and above the footer rail.
+    caption_y = 1495 if landscape else subtitle_box[3] + 20
+    if not landscape and layout_variant == 2:
+        caption_y = max(caption_y, 1370)
+    max_caption_width = 870 if landscape else 780
+    caption_parts = [part.strip() for part in re.split(r"[，,]", quote) if part.strip()]
+    if len(caption_parts) >= 2:
+        caption_lines = caption_parts[:2]
+    else:
+        caption_lines, line = [], ""
+        for ch in quote:
+            candidate = line + ch
+            bbox = draw.textbbox((0, 0), candidate, font=caption_font)
+            if line and bbox[2] - bbox[0] > max_caption_width:
+                caption_lines.append(line)
+                line = ch
+            else:
+                line = candidate
+        if line:
+            caption_lines.append(line)
+        caption_lines = caption_lines[:2]
+    # Draw each poetic clause independently so a wide frame cannot visually
+    # collapse the comma-separated pair back into one line.
+    caption_origin_x, caption_anchor = (72, "la") if landscape else (tx, anchor)
+    for line_index, caption_line in enumerate(caption_lines[:2]):
+        line_font = caption_font
+        if landscape:
+            while line_font.size > 38:
+                bbox = draw.textbbox((0, 0), caption_line, font=line_font)
+                if bbox[2] - bbox[0] <= 900:
+                    break
+                line_font = _h5_photo_font(line_font.size - 2)
+        line_y = caption_y + line_index * (line_font.size + (18 if landscape else 12))
+        draw.text((caption_origin_x + 2, line_y + 3), caption_line, font=line_font, fill=(0, 0, 0, 150), anchor=caption_anchor)
+        draw.text((caption_origin_x, line_y), caption_line, font=line_font, fill=(248, 250, 252, 245), anchor=caption_anchor)
+
+    if landscape:
+        # The lower display title must complement, not duplicate, the top:
+        # English on top -> large Chinese below; Chinese on top -> English below.
+        lower_copy = poster_title if top_title == poster_english else poster_english.upper()
+        lower_is_chinese = lower_copy == poster_title
+        lower_y = 1192
+        lower_colors = [readable_accent, (255, 106, 138, 255) if accent[0] > 180 and accent[1] > 150 else (255, 218, 107, 255)]
+        display_size = 108 if lower_is_chinese else 156 if len(lower_copy) <= 8 else 132 if len(lower_copy) <= 12 else 108
+        display_font = _h5_photo_font(display_size, rounded_bold=True) if lower_is_chinese else _h5_poster_english_font(display_size)
+        lower_text = _wrap_h5_title(draw, lower_copy, display_font, 930)
+        lower_lines = lower_text.splitlines()
+        for line_index, text in enumerate(lower_lines[:2]):
+            while display_size > 82:
+                bbox = draw.textbbox((0, 0), text, font=display_font)
+                if bbox[2] - bbox[0] <= 930:
+                    break
+                display_size -= 4
+                display_font = _h5_photo_font(display_size, rounded_bold=True) if lower_is_chinese else _h5_poster_english_font(display_size)
+            color = lower_colors[line_index % len(lower_colors)]
+            draw.text((72, lower_y), text, font=display_font, fill=color, anchor="la")
+            lower_y += int(display_size * 0.92)
+        # Repaint the caption after the lower title so multiline title glyphs
+        # cannot occlude scene-specific copy.
+        for line_index, caption_line in enumerate(caption_lines[:2]):
+            line_font = caption_font
+            while line_font.size > 38:
+                bbox = draw.textbbox((0, 0), caption_line, font=line_font)
+                if bbox[2] - bbox[0] <= 900:
+                    break
+                line_font = _h5_photo_font(line_font.size - 2)
+            line_y = caption_y + line_index * (line_font.size + 18)
+            draw.text((caption_origin_x + 2, line_y + 3), caption_line, font=line_font, fill=(0, 0, 0, 150), anchor=caption_anchor)
+            draw.text((caption_origin_x, line_y), caption_line, font=line_font, fill=(248, 250, 252, 245), anchor=caption_anchor)
+    def _h5_date_parts(value: str) -> tuple[str, str, str]:
+        """Return year, month/day, and small time copy for the photo date block."""
+        raw = re.sub(r"\s*星期[一二三四五六日天]\s*", " ", _h5_photo_text(value)).strip()
+        match = re.search(r"(\d{4})年\s*(\d{1,2})月\s*(\d{1,2})日(?:\s+(\d{1,2}:\d{2}))?", raw)
+        if not match:
+            match = re.search(r"(\d{4})[-/]\s*(\d{1,2})[-/]\s*(\d{1,2})(?:\s+(\d{1,2}:\d{2}))?", raw)
+        if not match:
+            time_match = re.search(r"\b(\d{1,2}:\d{2})\b", raw)
+            return (raw[:4] if raw[:4].isdigit() else "----", "-- / --", time_match.group(1) if time_match else "")
+        return (
+            match.group(1),
+            f"{int(match.group(2)):02d} / {int(match.group(3)):02d}",
+            match.group(4) or "",
+        )
+
+    raw_date_display = _h5_photo_text(item.get("date_display"))
+    if raw_date_display:
+        date_year, date_month_day, date_time = _h5_date_parts(raw_date_display)
+        date_style = sum(ord(ch) for ch in str(item.get("asset_id") or "")) % 3
+        portrait_year_size = 84 if index == 18 else 78 if index == 0 else 118
+        date_year_font = _h5_date_font(portrait_year_size if not landscape else 132, date_style)
+        date_day_font = _h5_date_font(34 if (not landscape and index == 0) else 42 if not landscape else 42, date_style)
+        date_time_font = _h5_date_font(24 if (not landscape and index == 0) else 26 if not landscape else 25, date_style)
+        date_color = readable_accent
+        date_shadow = (0, 0, 0, 210)
+        if landscape:
+            # Keep the date on the side opposite the headline in every layout variant.
+            if anchor == "ra":
+                date_x, date_y, date_anchor = (70, 92, "la")
+            else:
+                date_x, date_y, date_anchor = (958, 92, "ra")
+            date_label = "CAPTURED"
+        else:
+            # Portrait keeps the date in the open upper-right rail, away from the
+            # lower editorial title and the main subject area.
+            if index == 0:
+                date_x, date_y, date_anchor = (118, 74, "la")
+            elif index == 12:
+                # Keep the Christmas portrait's date clear of the subject's face.
+                date_x, date_y, date_anchor = (118, 94, "la")
+            else:
+                date_x, date_y, date_anchor = ((948, 94, "ra") if index in {2, 18} else (900, 94, "ra"))
+            date_label = "拍摄于"
+        draw.text((date_x + (2 if date_anchor == "la" else -2), date_y + 3), date_label, font=label_font, fill=date_shadow, anchor=date_anchor)
+        draw.text((date_x, date_y), date_label, font=label_font, fill=date_color, anchor=date_anchor)
+        year_y = date_y + 30
+        draw.text((date_x + (3 if date_anchor == "la" else -3), year_y + 4), date_year, font=date_year_font, fill=date_shadow, anchor=date_anchor)
+        draw.text((date_x, year_y), date_year, font=date_year_font, fill=(255, 255, 255, 245), anchor=date_anchor)
+        year_box = draw.textbbox((date_x, year_y), date_year, font=date_year_font, anchor=date_anchor)
+        day_y = year_box[3] + (34 if not landscape else 24)
+        draw.text((date_x + (2 if date_anchor == "la" else -2), day_y + 3), date_month_day, font=date_day_font, fill=date_shadow, anchor=date_anchor)
+        draw.text((date_x, day_y), date_month_day, font=date_day_font, fill=date_color, anchor=date_anchor)
+        day_box = draw.textbbox((date_x, day_y), date_month_day, font=date_day_font, anchor=date_anchor)
+        if date_time:
+            time_y = day_box[3] + (24 if not landscape else 18)
+            draw.text((date_x + (2 if date_anchor == "la" else -2), time_y + 3), date_time, font=date_time_font, fill=date_shadow, anchor=date_anchor)
+            draw.text((date_x, time_y), date_time, font=date_time_font, fill=(255, 255, 255, 245), anchor=date_anchor)
+
+    camera_make = _h5_photo_text(item.get("camera_make"))
+    camera_model = _h5_photo_text(item.get("camera_model"))
+    camera = camera_model if camera_make and camera_model.lower().startswith(camera_make.lower()) else " ".join(filter(None, [camera_make, camera_model]))
+    lines = [(_h5_photo_text(item.get("place_display")), pfont), (camera, mfont)]
+    mx, y, anchor = (980, 1690, "ra") if landscape else (980, 1600, "ra")
+    for text, font in lines:
+        if text:
+            draw.text((mx + 1, y + 2), text, font=font, fill=(0, 0, 0, 155), anchor=anchor)
+            draw.text((mx, y), text, font=font, fill="white", anchor=anchor)
+            y += font.size + 18
+    output = io.BytesIO()
+    frame.convert("RGB").save(output, format="JPEG", quality=84, optimize=True, progressive=True)
+    body = output.getvalue()
+    try:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        cache_path.write_bytes(body)
+    except OSError:
+        pass
+    return body
+
+
+def trigger_h5_daily_photo_refresh() -> bool:
+    today_manifest = H5_DAILY_PHOTO_DIR / datetime.now().date().isoformat() / "manifest.json"
+    manifest_ready = False
+    if today_manifest.exists():
+        try:
+            data = json.loads(today_manifest.read_text(encoding="utf-8"))
+            items = data.get("items") or []
+            manifest_ready = len(items) >= 20 and all(Path(str(item.get("image_path") or "")).exists() for item in items[:20])
+        except Exception:
+            manifest_ready = False
+    if manifest_ready or _PERSON_PHOTO_LOCK.locked():
+        return False
+
+    def worker():
+        if not _PERSON_PHOTO_LOCK.acquire(blocking=False):
+            return
+        try:
+            subprocess.run(
+                [sys.executable, str(H5_DAILY_PHOTO_EXPORT_SCRIPT), "--person", "方宇轩", "--count", "20"],
+                cwd=str(APP_ROOT), capture_output=True, text=True, timeout=1800, check=False,
+            )
+        finally:
+            _PERSON_PHOTO_LOCK.release()
+
+    threading.Thread(target=worker, name="h5-daily-photo-refresh", daemon=True).start()
+    return True
+
+
+def start_h5_midnight_photo_loop() -> None:
+    """Actively create the new daily set shortly after local midnight."""
+    def loop() -> None:
+        last_attempt_day = ""
+        while True:
+            now = datetime.now()
+            today = now.date().isoformat()
+            manifest = H5_DAILY_PHOTO_DIR / today / "manifest.json"
+            if not manifest.exists() and last_attempt_day != today:
+                last_attempt_day = today
+                trigger_h5_daily_photo_refresh()
+            tomorrow = datetime.combine(now.date(), datetime.min.time()).timestamp() + 86400
+            wait_seconds = max(5, min(60, tomorrow - time.time() + 2))
+            time.sleep(wait_seconds)
+
+    threading.Thread(target=loop, name="h5-midnight-photo-refresh", daemon=True).start()
+
+
+def render_h5_html(state: dict, requested_screen: str | None = None, lite: bool = False) -> bytes:
+    screens = state.get("screens") or []
+    active_screen = requested_screen or state.get("active_screen") or (screens[0]["id"] if screens else "work-cockpit")
+    state["active_screen"] = active_screen
+    if lite:
+        from ipad.h5_view import render_h5_lite_document
+        trigger_h5_daily_photo_refresh()
+        photo_payload = load_h5_daily_photos()
+        state = {
+            "active_screen": requested_screen or "photo-01",
+            "template": {"dwell_seconds": 20},
+            "photo_gallery": photo_payload,
+            "screens": [
+                {"id": f"photo-{index + 1:02d}", "title": "", "subtitle": "", "family": "photos"}
+                for index, _item in enumerate(photo_payload.get("items") or [])
+            ],
+        }
+        active_screen = state["active_screen"]
+        html_doc = render_h5_lite_document(state, active_screen, H5_STAGE_WIDTH, H5_STAGE_HEIGHT)
+    else:
+        from ipad.h5_view import render_h5_document
+        html_doc = render_h5_document(state, active_screen, H5_STAGE_WIDTH, H5_STAGE_HEIGHT)
+    return html_doc.encode("utf-8")
+
+
+class PreviewHandler(BaseHTTPRequestHandler):
+    server_version = "RemotePanelIPadH5/0.1"
+
+    def _send_json(self, code: int, payload: dict, send_body: bool = True) -> None:
+        self._send(code, "application/json; charset=utf-8", json.dumps(payload, ensure_ascii=False).encode("utf-8"), cache_seconds=0, send_body=send_body)
+
+    def _read_json_body(self) -> dict:
+        try:
+            length = int(self.headers.get("Content-Length", "0") or "0")
+        except Exception:
+            length = 0
+        raw = self.rfile.read(length) if length > 0 else b"{}"
+        try:
+            data = json.loads(raw.decode("utf-8") or "{}")
+        except Exception:
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def _send(self, code: int, content_type: str, body: bytes, cache_seconds: int = 0, refresh_target: str | None = None, refresh_seconds: int | None = None, send_body: bool = True) -> None:
+        self.send_response(code)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+        self.send_header("Pragma", "no-cache")
+        self.send_header("Expires", "0")
+        if refresh_target and refresh_seconds:
+            self.send_header("Refresh", f"{int(refresh_seconds)}; url={refresh_target}")
+        else:
+            self.send_header("Cache-Control", f"no-store, no-cache, must-revalidate, max-age={cache_seconds}")
+        self.end_headers()
+        if send_body:
+            self.wfile.write(body)
+
+    def do_HEAD(self):
+        self._handle_request(send_body=False)
+
+    def do_GET(self):
+        self._handle_request(send_body=True)
+
+    def do_POST(self):
+        parsed = urlparse(self.path)
+        if parsed.path == "/api/ipad/control/save":
+            data = self._read_json_body()
+            project = load_project(PROJECT_PATH)
+            templates_payload = data.get("templates") if isinstance(data, dict) else []
+            by_id = {str(item.get("id") or ""): item for item in templates_payload if isinstance(item, dict)}
+            for template in project.templates:
+                patch = by_id.get(template.id)
+                if not patch:
+                    continue
+                template.enabled = bool(patch.get("enabled", template.enabled))
+                template.dwell_seconds = max(5, int(patch.get("dwell_seconds", template.dwell_seconds) or template.dwell_seconds))
+                template.refresh_minutes = _refresh_minutes_from_controls(patch.get("refresh_value", template.refresh_minutes), patch.get("refresh_unit", "分钟"))
+            save_project(project, PROJECT_PATH)
+            self._send_json(200, ipad_control_payload())
+            return
+        if parsed.path == "/api/ipad/control/show":
+            data = self._read_json_body()
+            template_id = str(data.get("template_id") or "").strip()
+            try:
+                page_index = int(data.get("page_index", 0) or 0)
+            except Exception:
+                page_index = 0
+            save_state_patch(active_template_id=template_id, active_page_index=max(0, page_index), last_switch_at=datetime.now().isoformat())
+            self._send_json(200, ipad_control_payload())
+            return
+        if parsed.path == "/api/ipad/control/rotate":
+            data = self._read_json_body()
+            enabled = bool(data.get("enabled", True))
+            if enabled:
+                save_state_patch(last_switch_at=datetime.now().isoformat())
+            self._send_json(200, ipad_control_payload())
+            return
+        if parsed.path == "/api/ipad/control/refresh":
+            started = trigger_content_refresh("manual")
+            payload = ipad_control_payload()
+            payload["refresh_started"] = started
+            self._send_json(200, payload)
+            return
+        if parsed.path == "/api/h5/source-settings":
+            saved = save_source_settings(self._read_json_body())
+            started = trigger_content_refresh("manual")
+            self._send_json(200, {"ok": True, "settings": saved, "refresh_started": started})
+            return
+        if parsed.path == "/api/h5/control/show":
+            data = self._read_json_body()
+            screen = str(data.get("screen") or "work-cockpit").strip()
+            save_state_patch(active_h5_screen=screen)
+            self._send_json(200, {"ok": True, "active_h5_screen": screen})
+            return
+        self._send_json(404, {"error": "Not found"})
+
+    def _handle_request(self, send_body: bool):
+        parsed = urlparse(self.path)
+        qs = parse_qs(parsed.query)
+        template_id = (qs.get("template") or [None])[0]
+        requested_screen = (qs.get("screen") or [None])[0]
+        try:
+            page_index = int((qs.get("page") or [0])[0] or 0)
+        except (TypeError, ValueError):
+            page_index = 0
+        scale = int((qs.get("scale") or [1])[0] or 1)
+        rotate_raw = (qs.get("rotate") or ["1"])[0]
+        rotate = rotate_raw not in {"0", "false", "False", "off"}
+        ui_mode = (qs.get("ui") or ["simple"])[0]
+        ipad_mode = (qs.get("mode") or ["image"])[0]
+
+        if parsed.path == "/favicon.ico":
+            self._send(204, "image/x-icon", b"", cache_seconds=3600, send_body=send_body)
+            return
+
+        if parsed.path == "/ipad/control":
+            self._send(200, "text/html; charset=utf-8", render_ipad_control_html(), cache_seconds=0, send_body=send_body)
+            return
+
+        if parsed.path == "/api/ipad/control/state":
+            self._send_json(200, ipad_control_payload(), send_body=send_body)
+            return
+
+        if parsed.path == "/api/h5/source-settings":
+            self._send_json(200, load_source_settings(), send_body=send_body)
+            return
+
+        if parsed.path == "/api/h5/state":
+            payload = build_h5_state(template_id=template_id if template_id != "auto" else None, page_index=page_index, rotate=rotate)
+            if requested_screen:
+                payload["active_screen"] = requested_screen
+            self._send_json(200, payload, send_body=send_body)
+            return
+
+        if parsed.path == "/api/h5/photos":
+            self._send_json(200, load_h5_daily_photos(), send_body=send_body)
+            return
+
+        if parsed.path.startswith("/assets/h5-photo/"):
+            relative = Path(parsed.path.removeprefix("/assets/h5-photo/"))
+            asset_path = (H5_DAILY_PHOTO_DIR / relative).resolve()
+            try:
+                asset_path.relative_to(H5_DAILY_PHOTO_DIR.resolve())
+            except ValueError:
+                asset_path = Path("/__invalid__")
+            if asset_path.exists() and asset_path.is_file():
+                suffix = asset_path.suffix.lower()
+                content_type = "image/png" if suffix == ".png" else "image/jpeg"
+                self._send(200, content_type, asset_path.read_bytes(), cache_seconds=3600, send_body=send_body)
+                return
+        if parsed.path == "/h5-photo-frame.jpg":
+            try:
+                photo_index = max(0, int((qs.get("index") or [0])[0] or 0))
+            except (TypeError, ValueError):
+                photo_index = 0
+            body = render_h5_photo_frame(photo_index, weekly=self.server.server_port == 9121)
+            if body is not None:
+                # Frame contents change when the daily batch changes. The
+                # client also includes the batch version in the URL.
+                self._send(200, "image/jpeg", body, cache_seconds=0, send_body=send_body)
+                return
+        if parsed.path.startswith("/assets/ipad/poster/"):
+            asset_path = IPAD_POSTERS_PATH / Path(parsed.path).name
+            if asset_path.exists() and asset_path.is_file():
+                self._send(200, "image/jpeg", asset_path.read_bytes(), cache_seconds=0, send_body=send_body)
+                return
+        if parsed.path.startswith("/assets/ipad/steam-capsule/"):
+            asset_path = IPAD_STEAM_CAPSULES_PATH / Path(parsed.path).name
+            if asset_path.exists() and asset_path.is_file():
+                self._send(200, "image/jpeg", asset_path.read_bytes(), cache_seconds=0, send_body=send_body)
+                return
+        if parsed.path.startswith("/assets/ipad/steam-header/"):
+            asset_path = IPAD_STEAM_HEADERS_PATH / Path(parsed.path).name
+            if asset_path.exists() and asset_path.is_file():
+                self._send(200, "image/jpeg", asset_path.read_bytes(), cache_seconds=0, send_body=send_body)
+                return
+        if parsed.path.startswith("/assets/ipad/steam-screenshot/"):
+            asset_path = IPAD_STEAM_SCREENSHOTS_PATH / Path(parsed.path).name
+            if asset_path.exists() and asset_path.is_file():
+                self._send(200, "image/jpeg", asset_path.read_bytes(), cache_seconds=0, send_body=send_body)
+                return
+        if parsed.path.startswith("/assets/ipad/news-image/"):
+            asset_path = IPAD_NEWS_IMAGES_PATH / Path(parsed.path).name
+            if asset_path.exists() and asset_path.is_file():
+                self._send(200, "image/jpeg", asset_path.read_bytes(), cache_seconds=0, send_body=send_body)
+                return
+        if parsed.path.startswith("/assets/ipad/"):
+            asset_path = IPAD_ASSETS_PATH / Path(parsed.path).name
+            if asset_path.exists() and asset_path.is_file():
+                suffix = asset_path.suffix.lower()
+                content_type = "image/png" if suffix == ".png" else "image/jpeg" if suffix in {".jpg", ".jpeg"} else "application/octet-stream"
+                self._send(200, content_type, asset_path.read_bytes(), cache_seconds=0, send_body=send_body)
+                return
+
+        if parsed.path == "/panel.png":
+            body = render_current_png(template_id=template_id if template_id != "auto" else None, page_index=page_index, rotate=rotate)
+            self._send(200, "image/png", body, cache_seconds=0, send_body=send_body)
+            return
+
+        if parsed.path == "/ipad-panel.jpg":
+            body = render_ipad_dashboard_png(template_id=template_id if template_id != "auto" else None, page_index=page_index, rotate=rotate)
+            self._send(200, "image/jpeg", body, cache_seconds=0, send_body=send_body)
+            return
+
+        if parsed.path == "/panel.jpg":
+            body = render_current_jpeg(template_id=template_id if template_id != "auto" else None, page_index=page_index, scale=max(1, min(scale, 3)), rotate=rotate)
+            self._send(200, "image/jpeg", body, cache_seconds=0, send_body=send_body)
+            return
+
+        if parsed.path == "/api/status":
+            project, template, page, dwell, rotate_index, rotate_total = load_current_page(template_id=template_id if template_id != "auto" else None, page_index=page_index, rotate=rotate)
+            payload = {
+                "mode": "rotate" if rotate else "fixed",
+                "template_id": template.id,
+                "template_name": template.name,
+                "page_name": page.name,
+                "page_index": page_index,
+                "dwell_seconds": dwell,
+                "rotate_index": rotate_index,
+                "rotate_total": rotate_total,
+                "updated_at": datetime.now().isoformat(),
+                "image_png": f"/panel.png?template={template.id}&page={page_index}&rotate={'1' if rotate else '0'}",
+                "image_jpg": f"/panel.jpg?template={template.id}&page={page_index}&scale=2&rotate={'1' if rotate else '0'}",
+                "ipad_image_jpg": f"/ipad-panel.jpg?template={template.id}&page={page_index}&rotate={'1' if rotate else '0'}",
+                "ipad_url": f"/ipad?template={template.id}&page={page_index}&rotate={'1' if rotate else '0'}",
+                "h5_url": f"/h5?template={template.id}&page={page_index}&rotate={'1' if rotate else '0'}",
+            }
+            self._send_json(200, payload, send_body=send_body)
+            return
+
+        if parsed.path in {"/", "/h5", "/index.html"}:
+            payload = build_h5_state(template_id=template_id if template_id != "auto" else None, page_index=page_index, rotate=rotate)
+            if requested_screen:
+                payload["active_screen"] = requested_screen
+            self._send(200, "text/html; charset=utf-8", render_h5_html(payload, requested_screen=requested_screen), cache_seconds=0, send_body=send_body)
+            return
+
+        if parsed.path in {"/h5-lite", "/lite", "/index-lite.html"}:
+            payload = build_h5_state(template_id=template_id if template_id != "auto" else None, page_index=page_index, rotate=rotate)
+            if requested_screen:
+                payload["active_screen"] = requested_screen
+            self._send(200, "text/html; charset=utf-8", render_h5_html(payload, requested_screen=requested_screen, lite=True), cache_seconds=0, send_body=send_body)
+            return
+
+        if parsed.path in {"/ipad", "/ipad/landscape", "/iPad", "/iPad/landscape", "/ipad-simple", "/iPad-simple"}:
+            project, template, page, dwell, rotate_index, rotate_total = load_current_page(template_id=template_id if template_id != "auto" else None, page_index=page_index, rotate=rotate)
+            selected = html.escape(template.id)
+            refresh_seconds = 60
+            next_tick = int(time.time()) + refresh_seconds
+            ipad_refresh_target = f"/ipad?template={selected}&page={page_index}&rotate={'1' if rotate else '0'}&mode={ipad_mode}&tick={next_tick}"
+            if parsed.path in {"/ipad-simple", "/iPad-simple"}:
+                ipad_mode = "image"
+            if ipad_mode == "image":
+                image_base_url = f"/ipad-panel.jpg?template={selected}&page={page_index}&rotate={'1' if rotate else '0'}"
+                image_url = f"{image_base_url}&t={int(time.time())}"
+                body = f'''<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=1024, initial-scale=1.0">
+<title>{html.escape(template.name)}</title>
+<style>
+html, body {{ margin:0; padding:0; width:100%; height:100%; overflow:hidden; background:#111; }}
+.stage {{ width:100%; height:100%; display:flex; align-items:center; justify-content:center; background:#111; }}
+#panel {{ display:block; width:1024px; height:700px; }}
+</style>
+</head>
+<body>
+<div class="stage"><img id="panel" src="{image_url}" alt="panel" width="1024" height="700"></div>
+<script>
+(function () {{
+  var panel = document.getElementById('panel');
+  var baseUrl = {json.dumps(image_base_url)};
+  var refreshMs = {refresh_seconds * 1000};
+  var retryMs = 5000;
+  var timer = null;
+  var loading = false;
+
+  function schedule(delay) {{
+    if (timer) window.clearTimeout(timer);
+    timer = window.setTimeout(preloadNext, delay);
+  }}
+
+  function preloadNext() {{
+    if (loading) return;
+    loading = true;
+    var next = new Image();
+    var nextUrl = baseUrl + '&t=' + Date.now();
+    var settled = false;
+
+    function release() {{
+      next.onload = null;
+      next.onerror = null;
+      loading = false;
+    }}
+
+    function showWhenReady() {{
+      if (settled) return;
+      settled = true;
+      panel.src = nextUrl;
+      release();
+      schedule(refreshMs);
+    }}
+
+    next.onload = function () {{
+      if (typeof next.decode === 'function') {{
+        next.decode().then(showWhenReady, showWhenReady);
+      }} else {{
+        showWhenReady();
+      }}
+    }};
+    next.onerror = function () {{
+      if (settled) return;
+      settled = true;
+      release();
+      schedule(retryMs);
+    }};
+    next.src = nextUrl;
+  }}
+
+  window.__ipadPreloadNext = preloadNext;
+  schedule(refreshMs);
+}})();
+</script>
+</body>
+</html>'''.encode("utf-8")
+            else:
+                body = f'''<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=1024, initial-scale=1.0"><meta http-equiv="refresh" content="{refresh_seconds};url={ipad_refresh_target}"><title>{html.escape(template.name)}</title></head>
+<body style="margin:0;background:#111;"><img src="/ipad-panel.jpg?template={selected}&page={page_index}&rotate={'1' if rotate else '0'}&t={int(time.time())}" style="display:block;width:1024px;height:700px;margin:0 auto;" alt="panel"></body></html>'''.encode("utf-8")
+            self._send(200, "text/html; charset=utf-8", body, cache_seconds=0, send_body=send_body)
+            return
+
+        if parsed.path in {"/legacy", "/preview"}:
+            templates = list_templates()
+            project, template, page, dwell, rotate_index, rotate_total = load_current_page(template_id=template_id if template_id != "auto" else None, page_index=page_index, rotate=rotate)
+            selected = html.escape(template.id)
+            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            refresh_seconds = 60
+            image_query = f"template={selected}&page={page_index}&scale=2&rotate={'1' if rotate else '0'}&t={int(time.time())}"
+            next_tick = int(time.time()) + refresh_seconds
+            refresh_target = f"/legacy?template={selected}&page={page_index}&rotate={'1' if rotate else '0'}&ui={ui_mode}&tick={next_tick}"
+            if ui_mode != "full":
+                body = f'''<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<meta http-equiv="refresh" content="{refresh_seconds};url={refresh_target}">
+<title>{html.escape(template.name)}</title>
+<style>
+html, body {{ margin:0; padding:0; background:#111; }}
+.wrap {{ width:100%; text-align:center; }}
+img {{ width:100%; height:auto; display:block; margin:0 auto; background:#fff; }}
+.bar {{ font-family:Helvetica,Arial,sans-serif; font-size:12px; color:#ddd; background:#111; padding:6px 8px; text-align:center; }}
+a {{ color:#ddd; text-decoration:none; }}
+</style>
+</head>
+<body>
+<div class="wrap"><img src="/panel.jpg?{image_query}" alt="panel preview"></div>
+<div class="bar">{html.escape(template.name)} · {rotate_index + 1}/{rotate_total} · {dwell}s · <a href="/h5?template={selected}&rotate={'1' if rotate else '0'}">h5</a> · <a href="/ipad?rotate={'1' if rotate else '0'}">ipad</a></div>
+</body>
+</html>'''.encode("utf-8")
+                self._send(200, "text/html; charset=utf-8", body, cache_seconds=0, refresh_target=refresh_target, refresh_seconds=refresh_seconds, send_body=send_body)
+                return
+            rows = []
+            for item in templates:
+                tid = html.escape(item["id"])
+                name = html.escape(item["name"])
+                dwell_text = html.escape(item["dwell_seconds"])
+                rows.append(f'<li><a href="/legacy?template={tid}&rotate=0&ui=full">{name}</a> <span>({tid} / {dwell_text}s)</span></li>')
+            current_mode = "轮播" if rotate else "单页"
+            body = f'''<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="refresh" content="{refresh_seconds};url={refresh_target}">
+<title>Remote Panel Legacy Web</title>
+<style>
+body {{ margin:0; padding:12px; font-family:Helvetica,Arial,sans-serif; background:#f5f5f5; color:#111; }}
+h1 {{ font-size:20px; margin:0 0 8px 0; }}
+p, li, a, span, div {{ font-size:14px; line-height:1.4; }}
+.panel {{ background:#fff; border:1px solid #000; padding:8px; text-align:center; }}
+.panel img {{ width:100%; max-width:1200px; height:auto; image-rendering:pixelated; }}
+.meta {{ margin:8px 0 12px 0; }}
+ul {{ padding-left:20px; }}
+.actions a {{ display:inline-block; margin-right:10px; margin-bottom:6px; }}
+</style>
+</head>
+<body>
+<h1>Remote Panel</h1>
+<div class="meta">模式: {current_mode} | 当前模板: {html.escape(template.name)} ({selected}) | 页面: {html.escape(page.name)} | 停留: {dwell}s | 序号: {rotate_index + 1}/{rotate_total} | 更新时间: {html.escape(now)}</div>
+<div class="actions">
+<a href="/legacy?rotate=1&ui=simple">极简轮播</a>
+<a href="/legacy?rotate=1&ui=full">完整轮播</a>
+<a href="/ipad?rotate=1">iPad 横版</a>
+<a href="/h5?rotate=1">H5</a>
+<a href="/panel.jpg?template={selected}&page={page_index}&scale=2&rotate={'1' if rotate else '0'}">JPG</a>
+<a href="/api/status?template={selected}&page={page_index}&rotate={'1' if rotate else '0'}">JSON</a>
+</div>
+<div class="panel"><img src="/panel.jpg?{image_query}" alt="panel preview"></div>
+<h1>模板</h1>
+<ul>{''.join(rows)}</ul>
+</body>
+</html>'''.encode("utf-8")
+            self._send(200, "text/html; charset=utf-8", body, cache_seconds=0, refresh_target=refresh_target, refresh_seconds=refresh_seconds, send_body=send_body)
+            return
+
+        self._send(404, "text/plain; charset=utf-8", b"Not found", cache_seconds=0, send_body=send_body)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="iPad + H5 preview server for RemotePanelEInkStudio")
+    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument("--port", type=int, default=9120)
+    args = parser.parse_args()
+    start_content_refresh_loop()
+    start_h5_midnight_photo_loop()
+    server = ThreadingHTTPServer((args.host, args.port), PreviewHandler)
+    print(f"Serving iPad/H5 preview on http://{args.host}:{args.port}")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

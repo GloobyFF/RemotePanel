@@ -1,0 +1,69 @@
+{
+  "schemaVersion": 1,
+  "queriedAt": "2026-08-10T18:14:08.647Z",
+  "source": "https://penguinapi.vip",
+  "timezoneOffsetMinutes": 480,
+  "account": {
+    "username": "glooby",
+    "group": "cc5",
+    "balanceQuota": 54941315,
+    "balanceUsd": 109.88263,
+    "balanceCny": 802.14,
+    "totalUsedUsd": 8741.11124,
+    "requestCount": 126437
+  },
+  "usage": {
+    "todayUsd": 0,
+    "last24HoursUsd": 0,
+    "monthUsd": 48.39542,
+    "rpm": 0,
+    "tpm": 0,
+    "estimatedDaysRemaining": null
+  },
+  "settings": {
+    "quotaPerUnit": 500000,
+    "usdExchangeRate": 7.3,
+    "quotaDisplayType": "USD"
+  },
+  "history": {
+    "days": [
+      {
+        "date": "2026-08-05",
+        "usageUsd": 0,
+        "requests": 0
+      },
+      {
+        "date": "2026-08-06",
+        "usageUsd": 0,
+        "requests": 0
+      },
+      {
+        "date": "2026-08-07",
+        "usageUsd": 0,
+        "requests": 0
+      },
+      {
+        "date": "2026-08-08",
+        "usageUsd": 0,
+        "requests": 0
+      },
+      {
+        "date": "2026-08-09",
+        "usageUsd": 0,
+        "requests": 0
+      },
+      {
+        "date": "2026-08-10",
+        "usageUsd": 0,
+        "requests": 0
+      },
+      {
+        "date": "2026-08-11",
+        "usageUsd": 0,
+        "requests": 0
+      }
+    ],
+    "models": []
+  },
+  "_fetched_at": 1786385647.9482
+}

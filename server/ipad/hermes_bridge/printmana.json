@@ -1,0 +1,306 @@
+{
+  "endpoint": "http://192.168.28.126:8088/api/printers",
+  "printers": [
+    {
+      "online": true,
+      "id": "DFE202C0-A014-4506-9457-7E8085FC8C5C",
+      "remainingMinutes": 1086,
+      "statusText": "打印中",
+      "model": "H2D",
+      "progress": 10,
+      "status": "RUNNING",
+      "fileName": "M5 Module 4F.stl",
+      "name": "高级玩具H2D"
+    }
+  ],
+  "primary": {
+    "nozzleDiameter": 0.4,
+    "ams": [
+      {
+        "index": 0,
+        "slots": [
+          {
+            "slot": 0,
+            "colorHex": "7C4B00FF",
+            "remainPercent": 0,
+            "isEmpty": false,
+            "type": "PLA",
+            "isRainbow": false,
+            "bound": {
+              "type": "PLA",
+              "totalGram": 1000,
+              "colors": [
+                "5C3317FF"
+              ],
+              "remainingGram": -7.300000000000026,
+              "remainingPercent": -0.7300000000000025,
+              "brand": "余兄弟",
+              "colorHex": "5C3317FF",
+              "id": "FF558F2B-E193-4148-AD47-8D53089DB117",
+              "name": "余兄弟 PLA 深棕",
+              "isRainbow": false
+            },
+            "colors": [
+              "7C4B00FF"
+            ]
+          },
+          {
+            "slot": 1,
+            "colorHex": "161616FF",
+            "remainPercent": 0,
+            "isEmpty": false,
+            "type": "PETG",
+            "isRainbow": false,
+            "bound": {
+              "type": "PETG",
+              "totalGram": 200,
+              "colors": [
+                "1A1A1AFF"
+              ],
+              "remainingGram": 123.29999999999998,
+              "remainingPercent": 61.64999999999999,
+              "brand": "派特尔",
+              "colorHex": "1A1A1AFF",
+              "id": "5E97388F-DB9D-4A02-BEC3-C3A70AEEA880",
+              "name": "派特尔 PETG 黑色",
+              "isRainbow": false
+            },
+            "colors": [
+              "161616FF"
+            ]
+          },
+          {
+            "slot": 2,
+            "colorHex": "898989FF",
+            "remainPercent": 0,
+            "isEmpty": false,
+            "type": "PLA",
+            "isRainbow": false,
+            "bound": {
+              "type": "PLA",
+              "totalGram": 1000,
+              "colors": [
+                "545454FF"
+              ],
+              "remainingGram": 608.6,
+              "remainingPercent": 60.86,
+              "brand": "Sunlu (三绿)",
+              "colorHex": "545454FF",
+              "id": "796C0225-8B10-4E56-ADB2-2466A40147A3",
+              "name": "Sunlu (三绿) PLA 深灰",
+              "isRainbow": false
+            },
+            "colors": [
+              "898989FF"
+            ]
+          },
+          {
+            "slot": 3,
+            "colorHex": "F98C36FF",
+            "remainPercent": 0,
+            "isEmpty": false,
+            "type": "PLA",
+            "isRainbow": false,
+            "bound": {
+              "type": "PLA",
+              "totalGram": 1000,
+              "colors": [
+                "D95900FF"
+              ],
+              "remainingGram": 147.4,
+              "remainingPercent": 14.74,
+              "brand": "余兄弟",
+              "colorHex": "D95900FF",
+              "id": "F9DE71A9-CD51-4235-AC6C-1DE96FE2C0F5",
+              "name": "余兄弟 PLA 深橙",
+              "isRainbow": false
+            },
+            "colors": [
+              "F98C36FF"
+            ]
+          }
+        ],
+        "type": "AMS2 Pro"
+      },
+      {
+        "index": 1,
+        "slots": [
+          {
+            "slot": 0,
+            "colorHex": "FFFFFFFF",
+            "remainPercent": 0,
+            "isEmpty": true,
+            "type": "",
+            "isRainbow": false,
+            "bound": {
+              "type": "PETG",
+              "totalGram": 1000,
+              "colors": [
+                "FFFFFFFF"
+              ],
+              "remainingGram": -9.499999999999943,
+              "remainingPercent": -0.9499999999999943,
+              "brand": "谷造三维",
+              "colorHex": "FFFFFFFF",
+              "id": "3E9F891A-4BC6-4D87-AF56-BBC854DCAE2A",
+              "name": "谷造三维 PETG 白色",
+              "isRainbow": false
+            },
+            "colors": [
+              "FFFFFFFF"
+            ]
+          },
+          {
+            "slot": 1,
+            "colorHex": "FFB366FF",
+            "remainPercent": 0,
+            "isEmpty": false,
+            "type": "PLA",
+            "isRainbow": true,
+            "bound": {
+              "type": "PLA",
+              "totalGram": 1000,
+              "colors": [
+                "FFB366FF",
+                "FFF0B3FF",
+                "8FED8FFF",
+                "87CFEBFF"
+              ],
+              "remainingGram": 389.79999999999995,
+              "remainingPercent": 38.98,
+              "brand": "超维彩线",
+              "colorHex": "FFB366FF",
+              "id": "9617535D-CE75-4867-BB1F-19494FD17B46",
+              "name": "超维彩线 PLA 哑光 彩虹",
+              "isRainbow": true
+            },
+            "colors": [
+              "FFB366FF",
+              "FFF0B3FF",
+              "8FED8FFF",
+              "87CFEBFF"
+            ]
+          },
+          {
+            "slot": 2,
+            "colorHex": "D3C5A3FF",
+            "remainPercent": 0,
+            "isEmpty": false,
+            "type": "PLA",
+            "isRainbow": false,
+            "bound": {
+              "type": "PLA",
+              "totalGram": 1000,
+              "colors": [
+                "F5CCB0FF"
+              ],
+              "remainingGram": 370,
+              "remainingPercent": 37,
+              "brand": "余兄弟",
+              "colorHex": "F5CCB0FF",
+              "id": "D17A7FA2-97FF-485B-B610-6BB7BB10706A",
+              "name": "余兄弟 PLA 肤色",
+              "isRainbow": false
+            },
+            "colors": [
+              "D3C5A3FF"
+            ]
+          },
+          {
+            "slot": 3,
+            "colorHex": "001454FF",
+            "remainPercent": 0,
+            "isEmpty": false,
+            "type": "PLA",
+            "isRainbow": true,
+            "bound": {
+              "type": "PLA",
+              "totalGram": 1000,
+              "colors": [
+                "001454FF",
+                "005924FF"
+              ],
+              "remainingGram": 423.5,
+              "remainingPercent": 42.35,
+              "brand": "超维彩线",
+              "colorHex": "001454FF",
+              "id": "79F6703D-A218-486D-9750-224677764124",
+              "name": "超维彩线 PLA 哑光 彩虹",
+              "isRainbow": true
+            },
+            "colors": [
+              "001454FF",
+              "005924FF"
+            ]
+          }
+        ],
+        "type": "AMS2 Pro"
+      },
+      {
+        "index": 2,
+        "slots": [
+          {
+            "slot": 0,
+            "colorHex": "7C4B00FF",
+            "remainPercent": 0,
+            "isEmpty": false,
+            "type": "PETG",
+            "isRainbow": false,
+            "bound": {
+              "type": "PETG",
+              "totalGram": 1000,
+              "colors": [
+                "B87333FF"
+              ],
+              "remainingGram": 1000,
+              "remainingPercent": 100,
+              "brand": "遇果",
+              "colorHex": "B87333FF",
+              "id": "045DF446-A330-4AFB-ABB2-42DB4D311D76",
+              "name": "遇果 PETG 铜色",
+              "isRainbow": false
+            },
+            "colors": [
+              "7C4B00FF"
+            ]
+          }
+        ],
+        "type": "AMS HT"
+      }
+    ],
+    "id": "DFE202C0-A014-4506-9457-7E8085FC8C5C",
+    "status": "RUNNING",
+    "statusText": "打印中",
+    "temps": {
+      "chamber": 41,
+      "nozzles": [
+        {
+          "temp": 49,
+          "id": 0,
+          "active": true,
+          "name": "右喷嘴"
+        },
+        {
+          "temp": 52,
+          "id": 1,
+          "active": false,
+          "name": "左喷嘴"
+        }
+      ],
+      "nozzle": 250,
+      "bed": 70
+    },
+    "online": true,
+    "printWeightGram": 0,
+    "model": "H2D",
+    "name": "高级玩具H2D",
+    "totalLayers": 1150,
+    "activeTray": "2-0",
+    "layer": 8,
+    "fileName": "M5 Module 4F.stl",
+    "lastUpdated": "2026-10-30T06:53:28Z",
+    "remainingMinutes": 1086,
+    "progress": 10
+  },
+  "updated_at": "2026-10-30T14:53:30.239104"
+}

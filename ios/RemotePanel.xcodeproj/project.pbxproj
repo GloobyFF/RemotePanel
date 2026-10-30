@@ -1,0 +1,402 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 51;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		B140BF0000000000000000000 /* Images.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = B140000000000000000000000 /* Images.xcassets */; };
+		B101BF0000000000000000000 /* main.m in Sources */ = {isa = PBXBuildFile; fileRef = B101000000000000000000000 /* main.m */; };
+		B102BF0000000000000000000 /* AppDelegate.m in Sources */ = {isa = PBXBuildFile; fileRef = B102000000000000000000000 /* AppDelegate.m */; };
+		B103BF0000000000000000000 /* RPTheme.m in Sources */ = {isa = PBXBuildFile; fileRef = B103000000000000000000000 /* RPTheme.m */; };
+		B104BF0000000000000000000 /* RPAPIClient.m in Sources */ = {isa = PBXBuildFile; fileRef = B104000000000000000000000 /* RPAPIClient.m */; };
+		B105BF0000000000000000000 /* RPPhotoSource.m in Sources */ = {isa = PBXBuildFile; fileRef = B105000000000000000000000 /* RPPhotoSource.m */; };
+		B106BF0000000000000000000 /* RPKioskRootVC.m in Sources */ = {isa = PBXBuildFile; fileRef = B106000000000000000000000 /* RPKioskRootVC.m */; };
+		B107BF0000000000000000000 /* RPPages.m in Sources */ = {isa = PBXBuildFile; fileRef = B107000000000000000000000 /* RPPages.m */; };
+		B108BF0000000000000000000 /* RPNet.m in Sources */ = {isa = PBXBuildFile; fileRef = B108000000000000000000000 /* RPNet.m */; };
+		B109BF0000000000000000000 /* RPLocalFeed.m in Sources */ = {isa = PBXBuildFile; fileRef = B109000000000000000000000 /* RPLocalFeed.m */; };
+		B121BF0000000000000000000 /* LaunchScreen.storyboard in Resources */ = {isa = PBXBuildFile; fileRef = B121000000000000000000000 /* LaunchScreen.storyboard */; };
+		B130BF0000000000000000000 /* fusion-pixel-12px-proportional-zh_hans.ttf in Resources */ = {isa = PBXBuildFile; fileRef = B130000000000000000000000 /* fusion-pixel-12px-proportional-zh_hans.ttf */; };
+		B131BF0000000000000000000 /* fusion-pixel-12px-proportional-latin.ttf in Resources */ = {isa = PBXBuildFile; fileRef = B131000000000000000000000 /* fusion-pixel-12px-proportional-latin.ttf */; };
+		B132BF0000000000000000000 /* fusion-pixel-12px-monospaced-zh_hans.ttf in Resources */ = {isa = PBXBuildFile; fileRef = B132000000000000000000000 /* fusion-pixel-12px-monospaced-zh_hans.ttf */; };
+		B133BF0000000000000000000 /* ark-pixel-16px-proportional-zh_cn.ttf in Resources */ = {isa = PBXBuildFile; fileRef = B133000000000000000000000 /* ark-pixel-16px-proportional-zh_cn.ttf */; };
+		B134BF0000000000000000000 /* ark-pixel-12px-proportional-zh_cn.ttf in Resources */ = {isa = PBXBuildFile; fileRef = B134000000000000000000000 /* ark-pixel-12px-proportional-zh_cn.ttf */; };
+		B135BF0000000000000000000 /* zpix.ttf in Resources */ = {isa = PBXBuildFile; fileRef = B135000000000000000000000 /* zpix.ttf */; };
+		B136BF0000000000000000000 /* weathericons-regular-webfont.ttf in Resources */ = {isa = PBXBuildFile; fileRef = B136000000000000000000000 /* weathericons-regular-webfont.ttf */; };
+		F01BF0000000000000000000 /* UIKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = F01000000000000000000000 /* UIKit.framework */; };
+		F02BF0000000000000000000 /* Foundation.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = F02000000000000000000000 /* Foundation.framework */; };
+		F03BF0000000000000000000 /* CoreGraphics.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = F03000000000000000000000 /* CoreGraphics.framework */; };
+		F04BF0000000000000000000 /* QuartzCore.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = F04000000000000000000000 /* QuartzCore.framework */; };
+		F05BF0000000000000000000 /* Photos.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = F05000000000000000000000 /* Photos.framework */; };
+		F06BF0000000000000000000 /* WebKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = F06000000000000000000000 /* WebKit.framework */; };
+		F07BF0000000000000000000 /* CoreText.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = F07000000000000000000000 /* CoreText.framework */; };
+		F08BF0000000000000000000 /* Security.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = F08000000000000000000000 /* Security.framework */; };
+		F09BF0000000000000000000 /* AudioToolbox.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = F09000000000000000000000 /* AudioToolbox.framework */; };
+		F10BF0000000000000000000 /* EventKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = F10000000000000000000000 /* EventKit.framework */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXFileReference section */
+		B140000000000000000000000 /* Images.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Images.xcassets; sourceTree = "<group>"; };
+		B101000000000000000000000 /* main.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = main.m; sourceTree = "<group>"; };
+		B102000000000000000000000 /* AppDelegate.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = AppDelegate.m; sourceTree = "<group>"; };
+		B103000000000000000000000 /* RPTheme.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = RPTheme.m; sourceTree = "<group>"; };
+		B104000000000000000000000 /* RPAPIClient.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = RPAPIClient.m; sourceTree = "<group>"; };
+		B105000000000000000000000 /* RPPhotoSource.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = RPPhotoSource.m; sourceTree = "<group>"; };
+		B106000000000000000000000 /* RPKioskRootVC.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = RPKioskRootVC.m; sourceTree = "<group>"; };
+		B107000000000000000000000 /* RPPages.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = RPPages.m; sourceTree = "<group>"; };
+		B108000000000000000000000 /* RPNet.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = RPNet.m; sourceTree = "<group>"; };
+		B109000000000000000000000 /* RPLocalFeed.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = RPLocalFeed.m; sourceTree = "<group>"; };
+		B118000000000000000000000 /* RPNet.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = RPNet.h; sourceTree = "<group>"; };
+		B119000000000000000000000 /* RPLocalFeed.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = RPLocalFeed.h; sourceTree = "<group>"; };
+		B112000000000000000000000 /* AppDelegate.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = AppDelegate.h; sourceTree = "<group>"; };
+		B113000000000000000000000 /* RPTheme.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = RPTheme.h; sourceTree = "<group>"; };
+		B114000000000000000000000 /* RPAPIClient.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = RPAPIClient.h; sourceTree = "<group>"; };
+		B115000000000000000000000 /* RPPhotoSource.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = RPPhotoSource.h; sourceTree = "<group>"; };
+		B116000000000000000000000 /* RPKioskRootVC.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = RPKioskRootVC.h; sourceTree = "<group>"; };
+		B117000000000000000000000 /* RPPages.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = RPPages.h; sourceTree = "<group>"; };
+		B120000000000000000000000 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		B121000000000000000000000 /* LaunchScreen.storyboard */ = {isa = PBXFileReference; lastKnownFileType = file.storyboard; path = LaunchScreen.storyboard; sourceTree = "<group>"; };
+		B130000000000000000000000 /* fusion-pixel-12px-proportional-zh_hans.ttf */ = {isa = PBXFileReference; lastKnownFileType = file; name = fusion-pixel-12px-proportional-zh_hans.ttf; path = fonts/fusion-pixel-12px-proportional-zh_hans.ttf; sourceTree = "<group>"; };
+		B131000000000000000000000 /* fusion-pixel-12px-proportional-latin.ttf */ = {isa = PBXFileReference; lastKnownFileType = file; name = fusion-pixel-12px-proportional-latin.ttf; path = fonts/fusion-pixel-12px-proportional-latin.ttf; sourceTree = "<group>"; };
+		B132000000000000000000000 /* fusion-pixel-12px-monospaced-zh_hans.ttf */ = {isa = PBXFileReference; lastKnownFileType = file; name = fusion-pixel-12px-monospaced-zh_hans.ttf; path = fonts/fusion-pixel-12px-monospaced-zh_hans.ttf; sourceTree = "<group>"; };
+		B133000000000000000000000 /* ark-pixel-16px-proportional-zh_cn.ttf */ = {isa = PBXFileReference; lastKnownFileType = file; name = ark-pixel-16px-proportional-zh_cn.ttf; path = fonts/ark-pixel-16px-proportional-zh_cn.ttf; sourceTree = "<group>"; };
+		B134000000000000000000000 /* ark-pixel-12px-proportional-zh_cn.ttf */ = {isa = PBXFileReference; lastKnownFileType = file; name = ark-pixel-12px-proportional-zh_cn.ttf; path = fonts/ark-pixel-12px-proportional-zh_cn.ttf; sourceTree = "<group>"; };
+		B135000000000000000000000 /* zpix.ttf */ = {isa = PBXFileReference; lastKnownFileType = file; name = zpix.ttf; path = fonts/zpix.ttf; sourceTree = "<group>"; };
+		B136000000000000000000000 /* weathericons-regular-webfont.ttf */ = {isa = PBXFileReference; lastKnownFileType = file; name = weathericons-regular-webfont.ttf; path = fonts/weathericons-regular-webfont.ttf; sourceTree = "<group>"; };
+		F01000000000000000000000 /* UIKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = UIKit.framework; path = System/Library/Frameworks/UIKit.framework; sourceTree = SDKROOT; };
+		F02000000000000000000000 /* Foundation.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Foundation.framework; path = System/Library/Frameworks/Foundation.framework; sourceTree = SDKROOT; };
+		F03000000000000000000000 /* CoreGraphics.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = CoreGraphics.framework; path = System/Library/Frameworks/CoreGraphics.framework; sourceTree = SDKROOT; };
+		F04000000000000000000000 /* QuartzCore.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = QuartzCore.framework; path = System/Library/Frameworks/QuartzCore.framework; sourceTree = SDKROOT; };
+		F05000000000000000000000 /* Photos.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Photos.framework; path = System/Library/Frameworks/Photos.framework; sourceTree = SDKROOT; };
+		F06000000000000000000000 /* WebKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = WebKit.framework; path = System/Library/Frameworks/WebKit.framework; sourceTree = SDKROOT; };
+		F07000000000000000000000 /* CoreText.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = CoreText.framework; path = System/Library/Frameworks/CoreText.framework; sourceTree = SDKROOT; };
+		F08000000000000000000000 /* Security.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Security.framework; path = System/Library/Frameworks/Security.framework; sourceTree = SDKROOT; };
+		F09000000000000000000000 /* AudioToolbox.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = AudioToolbox.framework; path = System/Library/Frameworks/AudioToolbox.framework; sourceTree = SDKROOT; };
+		F10000000000000000000000 /* EventKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = EventKit.framework; path = System/Library/Frameworks/EventKit.framework; sourceTree = SDKROOT; };
+		B150000000000000000000000 /* RemotePanel.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = RemotePanel.app; sourceTree = BUILT_PRODUCTS_DIR; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		B10000000000000000000004 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				F01BF0000000000000000000 /* UIKit.framework in Frameworks */,
+				F02BF0000000000000000000 /* Foundation.framework in Frameworks */,
+				F03BF0000000000000000000 /* CoreGraphics.framework in Frameworks */,
+				F04BF0000000000000000000 /* QuartzCore.framework in Frameworks */,
+				F05BF0000000000000000000 /* Photos.framework in Frameworks */,
+				F06BF0000000000000000000 /* WebKit.framework in Frameworks */,
+				F07BF0000000000000000000 /* CoreText.framework in Frameworks */,
+				F08BF0000000000000000000 /* Security.framework in Frameworks */,
+				F09BF0000000000000000000 /* AudioToolbox.framework in Frameworks */,
+				F10BF0000000000000000000 /* EventKit.framework in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		B10000000000000000000010 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				B150000000000000000000000 /* RemotePanel.app */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		B10000000000000000000013 /* Frameworks */ = {
+			isa = PBXGroup;
+			children = (
+				F01000000000000000000000 /* UIKit.framework */,
+				F02000000000000000000000 /* Foundation.framework */,
+				F03000000000000000000000 /* CoreGraphics.framework */,
+				F04000000000000000000000 /* QuartzCore.framework */,
+				F05000000000000000000000 /* Photos.framework */,
+				F06000000000000000000000 /* WebKit.framework */,
+				F07000000000000000000000 /* CoreText.framework */,
+				F08000000000000000000000 /* Security.framework */,
+				F09000000000000000000000 /* AudioToolbox.framework */,
+				F10000000000000000000000 /* EventKit.framework */,
+			);
+			name = Frameworks;
+			sourceTree = "<group>";
+		};
+		B139000000000000000000000 /* fonts */ = {
+			isa = PBXGroup;
+			children = (
+				B130000000000000000000000 /* fusion-pixel-12px-proportional-zh_hans.ttf */,
+				B131000000000000000000000 /* fusion-pixel-12px-proportional-latin.ttf */,
+				B132000000000000000000000 /* fusion-pixel-12px-monospaced-zh_hans.ttf */,
+				B133000000000000000000000 /* ark-pixel-16px-proportional-zh_cn.ttf */,
+				B134000000000000000000000 /* ark-pixel-12px-proportional-zh_cn.ttf */,
+				B135000000000000000000000 /* zpix.ttf */,
+				B136000000000000000000000 /* weathericons-regular-webfont.ttf */,
+			);
+			name = fonts;
+			sourceTree = "<group>";
+		};
+		B10000000000000000000012 /* RemotePanel */ = {
+			isa = PBXGroup;
+			children = (
+				B101000000000000000000000 /* main.m */,
+				B102000000000000000000000 /* AppDelegate.m */,
+				B103000000000000000000000 /* RPTheme.m */,
+				B104000000000000000000000 /* RPAPIClient.m */,
+				B105000000000000000000000 /* RPPhotoSource.m */,
+				B106000000000000000000000 /* RPKioskRootVC.m */,
+				B107000000000000000000000 /* RPPages.m */,
+				B108000000000000000000000 /* RPNet.m */,
+				B109000000000000000000000 /* RPLocalFeed.m */,
+				B112000000000000000000000 /* AppDelegate.h */,
+				B113000000000000000000000 /* RPTheme.h */,
+				B114000000000000000000000 /* RPAPIClient.h */,
+				B115000000000000000000000 /* RPPhotoSource.h */,
+				B116000000000000000000000 /* RPKioskRootVC.h */,
+				B117000000000000000000000 /* RPPages.h */,
+				B118000000000000000000000 /* RPNet.h */,
+				B119000000000000000000000 /* RPLocalFeed.h */,
+				B120000000000000000000000 /* Info.plist */,
+				B121000000000000000000000 /* LaunchScreen.storyboard */,
+				B140000000000000000000000 /* Images.xcassets */,
+				B139000000000000000000000 /* fonts */,
+			);
+			path = RemotePanel;
+			sourceTree = "<group>";
+		};
+		B10000000000000000000011 /* Root */ = {
+			isa = PBXGroup;
+			children = (
+				B10000000000000000000012 /* RemotePanel */,
+				B10000000000000000000013 /* Frameworks */,
+				B10000000000000000000010 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		B10000000000000000000002 /* RemotePanel */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = B10000000000000000000025 /* Build configuration list for PBXNativeTarget "RemotePanel" */;
+			buildPhases = (
+				B10000000000000000000003 /* Sources */,
+				B10000000000000000000004 /* Frameworks */,
+				B10000000000000000000005 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = RemotePanel;
+			productName = RemotePanel;
+			productReference = B150000000000000000000000 /* RemotePanel.app */;
+			productType = "com.apple.product-type.application";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		B10000000000000000000001 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				LastUpgradeCheck = 1010;
+				TargetAttributes = {
+					B10000000000000000000002 = {
+						CreatedOnToolsVersion = 10.1;
+						DevelopmentTeam = FLFYQXCCZM;
+						ProvisioningStyle = Manual;
+					};
+				};
+			};
+			buildConfigurationList = B10000000000000000000024 /* Build configuration list for PBXProject "RemotePanel" */;
+			compatibilityVersion = "Xcode 9.3";
+			developmentRegion = zh_Hans;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				en,
+				Base,
+				"zh-Hans",
+			);
+			mainGroup = B10000000000000000000011 /* Root */;
+			productRefGroup = B10000000000000000000010 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				B10000000000000000000002 /* RemotePanel */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		B10000000000000000000005 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				B121BF0000000000000000000 /* LaunchScreen.storyboard in Resources */,
+				B140BF0000000000000000000 /* Images.xcassets in Resources */,
+				B130BF0000000000000000000 /* fusion-pixel-12px-proportional-zh_hans.ttf in Resources */,
+				B131BF0000000000000000000 /* fusion-pixel-12px-proportional-latin.ttf in Resources */,
+				B132BF0000000000000000000 /* fusion-pixel-12px-monospaced-zh_hans.ttf in Resources */,
+				B133BF0000000000000000000 /* ark-pixel-16px-proportional-zh_cn.ttf in Resources */,
+				B134BF0000000000000000000 /* ark-pixel-12px-proportional-zh_cn.ttf in Resources */,
+				B135BF0000000000000000000 /* zpix.ttf in Resources */,
+				B136BF0000000000000000000 /* weathericons-regular-webfont.ttf in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		B10000000000000000000003 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				B101BF0000000000000000000 /* main.m in Sources */,
+				B102BF0000000000000000000 /* AppDelegate.m in Sources */,
+				B103BF0000000000000000000 /* RPTheme.m in Sources */,
+				B104BF0000000000000000000 /* RPAPIClient.m in Sources */,
+				B105BF0000000000000000000 /* RPPhotoSource.m in Sources */,
+				B106BF0000000000000000000 /* RPKioskRootVC.m in Sources */,
+				B107BF0000000000000000000 /* RPPages.m in Sources */,
+				B108BF0000000000000000000 /* RPNet.m in Sources */,
+				B109BF0000000000000000000 /* RPLocalFeed.m in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin XCBuildConfiguration section */
+		B10000000000000000000020 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN_UNUSED_VARIABLE = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"DEBUG=1",
+					"$(inherited)",
+				);
+				IPHONEOS_DEPLOYMENT_TARGET = 9.3;
+				ONLY_ACTIVE_ARCH = NO;
+				SDKROOT = iphoneos;
+			};
+			name = Debug;
+		};
+		B10000000000000000000021 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN_UNUSED_VARIABLE = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_NO_COMMON_BLOCKS = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 9.3;
+				SDKROOT = iphoneos;
+				VALIDATE_PRODUCT = YES;
+			};
+			name = Release;
+		};
+		B10000000000000000000022 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ARCHS = armv7;
+				"ARCHS[sdk=iphoneos*]" = armv7;
+				CODE_SIGN_IDENTITY = "iPhone Developer";
+				CODE_SIGN_STYLE = Manual;
+				DEVELOPMENT_TEAM = FLFYQXCCZM;
+				ENABLE_BITCODE = NO;
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				INFOPLIST_FILE = RemotePanel/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 9.3;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				ONLY_ACTIVE_ARCH = NO;
+				PRODUCT_BUNDLE_IDENTIFIER = com.glooby.RemotePanel;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				PROVISIONING_PROFILE = "82daac59-68ad-46f5-bacd-b8033bc9dc0b";
+				PROVISIONING_PROFILE_SPECIFIER = "RemotePanel Dev";
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = 2;
+			};
+			name = Debug;
+		};
+		B10000000000000000000023 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ARCHS = armv7;
+				"ARCHS[sdk=iphoneos*]" = armv7;
+				CODE_SIGN_IDENTITY = "iPhone Developer";
+				CODE_SIGN_STYLE = Manual;
+				DEVELOPMENT_TEAM = FLFYQXCCZM;
+				ENABLE_BITCODE = NO;
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				INFOPLIST_FILE = RemotePanel/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 9.3;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.glooby.RemotePanel;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				PROVISIONING_PROFILE = "82daac59-68ad-46f5-bacd-b8033bc9dc0b";
+				PROVISIONING_PROFILE_SPECIFIER = "RemotePanel Dev";
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = 2;
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		B10000000000000000000024 /* Build configuration list for PBXProject "RemotePanel" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				B10000000000000000000020 /* Debug */,
+				B10000000000000000000021 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		B10000000000000000000025 /* Build configuration list for PBXNativeTarget "RemotePanel" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				B10000000000000000000022 /* Debug */,
+				B10000000000000000000023 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = B10000000000000000000001 /* Project object */;
+}

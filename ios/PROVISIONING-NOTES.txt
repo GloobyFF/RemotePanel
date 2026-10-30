@@ -1,0 +1,9 @@
+Bundle ID: com.glooby.RemotePanel
+Team ID: FLFYQXCCZM
+Signing identity (on build Mac .179): iPhone Developer: ZhiLing Fang (GE75FA37EU)
+Provisioning profile name: RemotePanel Dev
+Profile UUID (as used by build_install.sh): 82daac59-68ad-46f5-bacd-b8033bc9dc0b
+Device UDID: 1b9b4d6959e9d533837d946d94105049dfd794a8 (Easton iPad 3 / iOS 9.3.5)
+Build host: 192.168.28.179 — user fangzhiling — High Sierra + Xcode 10.1
+Credentials / keychain unlock: ask operator (not stored in this package).
+ios-deploy binary path is machine-local under DerivedData; rebuild ios-deploy if missing.

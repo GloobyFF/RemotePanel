@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>RemotePanel 设置</title>
+<style>
+body{font-family:-apple-system,"Segoe UI",sans-serif;background:#eef3fb;color:#14213d;margin:0}
+main{max-width:880px;margin:0 auto;padding:24px 16px 48px}
+h1{font-size:22px;margin:0 0 6px}
+h2{font-size:16px;margin:0 0 8px}
+p{color:#445;font-size:14px}
+.card{background:#fff;border-radius:12px;padding:16px;margin:12px 0;box-shadow:0 1px 4px rgba(20,40,80,.08)}
+label{display:block;font-size:13px;color:#445;margin:10px 0 4px}
+input[type=text],input[type=number],select{width:100%;box-sizing:border-box;padding:8px 10px;border:1px solid #c5d0e0;border-radius:8px;font-size:14px;background:#fff}
+.row{display:flex;gap:16px;align-items:center;flex-wrap:wrap}
+.page{border-top:1px solid #e6edf5;padding-top:12px;margin-top:12px}
+.check{display:flex;align-items:center;gap:8px;font-size:14px}
+.check input{width:auto}
+button{background:#1a6fe8;color:#fff;border:0;border-radius:8px;padding:12px 20px;font-size:16px;cursor:pointer}
+#msg{min-height:22px;margin:8px 0;font-size:14px}
+.narrow{width:120px}
+</style>
+</head>
+<body>
+<main>
+<h1>RemotePanel 设置</h1>
+<p>这里改的就是 iPad 上的设置。保存后，iPad 会按新内容重新拉取。</p>
+<div id="msg"></div>
+<div id="app">正在读取…</div>
+<button id="save" type="button">保存到 iPad</button>
+</main>
+<script>
+var state;
+function esc(s){return String(s==null?"":s).replace(/[&<>"]/g,function(c){return {"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;"}[c]})}
+function opt(choices,titles,cur){
+  var h="", n=Number(cur);
+  for(var i=0;i<choices.length;i++){
+    h+="<option value=\""+choices[i]+"\""+(Number(choices[i])===n?" selected":"")+">"+esc(titles[i])+"</option>";
+  }
+  return h;
+}
+function render(){
+  var ch=state.refresh_choices, ti=state.refresh_titles, h="";
+  h+="<div class=\"card\"><h2>连接</h2><label>HTTP / SOCKS 代理</label><input id=\"proxy\" type=\"text\" value=\""+esc(state.proxy)+"\">";
+  h+="<label>全局停留秒（0 表示用每一页自己的秒数）</label><input id=\"dwell\" class=\"narrow\" type=\"number\" value=\""+esc(state.dwell_override)+"\"></div>";
+  h+="<div class=\"card\"><h2>消息</h2><label>走马灯地址（JSON、纯文本或 RSS，留空则不显示）</label><input id=\"ticker\" type=\"text\" value=\""+esc(state.ticker_url)+"\">";
+  h+="<label class=\"check\"><input id=\"tickerProxy\" type=\"checkbox\""+(state.ticker_proxy?" checked":"")+"> 使用代理</label>";
+  h+="<label>多久拉一次</label><select id=\"tickerRefresh\">"+opt(ch,ti,state.ticker_refresh)+"</select></div>";
+  h+="<div class=\"card\"><h2>VPS 流量</h2><label>接口地址</label><input id=\"vps\" type=\"text\" value=\""+esc(state.vps_url)+"\">";
+  h+="<label>Token</label><input id=\"vpsToken\" type=\"text\" value=\""+esc(state.vps_token)+"\">";
+  h+="<label class=\"check\"><input id=\"vpsProxy\" type=\"checkbox\""+(state.vps_proxy?" checked":"")+"> 使用代理</label>";
+  h+="<label>流量更新</label><select id=\"vpsRefresh\">"+opt(ch,ti,state.vps_refresh)+"</select></div>";
+  h+="<div class=\"card\"><h2>相册</h2><label>本地相册 A / B 使用的相册</label><select id=\"album\"><option value=\"\">默认（收藏夹或图库）</option>";
+  (state.albums||[]).forEach(function(a){
+    h+="<option value=\""+esc(a.id)+"\""+(a.id===state.album_id?" selected":"")+">"+esc(a.title)+"</option>";
+  });
+  if(!(state.albums||[]).length) h+="</select><p>还没有读到相册列表。iPad 需要先允许访问照片。</p></div>";
+  else h+="</select></div>";
+  h+="<div class=\"card\"><h2>页面</h2>";
+  (state.pages||[]).forEach(function(pg,i){
+    h+="<div class=\"page\" data-i=\""+i+"\"><div class=\"row\"><strong>"+esc(pg.title)+"</strong>";
+    h+="<label class=\"check\"><input type=\"checkbox\" class=\"en\""+(pg.enabled?" checked":"")+"> 显示</label>";
+    h+="<label class=\"check\">停留 <input class=\"dw narrow\" type=\"number\" value=\""+esc(pg.dwell)+"\"> 秒</label></div>";
+    if(pg.has_source){
+      h+="<label>"+esc(pg.hint||"接口")+"</label><input class=\"url\" type=\"text\" value=\""+esc(pg.url)+"\">";
+      h+="<label class=\"check\"><input type=\"checkbox\" class=\"px\""+(pg.use_proxy?" checked":"")+"> 使用代理</label>";
+      if(pg.refresh_shared) h+="<p>数据更新与「Steam 新游」共用。</p>";
+      else h+="<label>数据更新</label><select class=\"rf\">"+opt(ch,ti,pg.refresh)+"</select>";
+    }
+    h+="</div>";
+  });
+  h+="</div>";
+  document.getElementById("app").innerHTML=h;
+}
+function collect(){
+  var body=JSON.parse(JSON.stringify(state));
+  body.proxy=document.getElementById("proxy").value;
+  body.dwell_override=Number(document.getElementById("dwell").value)||0;
+  body.ticker_url=document.getElementById("ticker").value;
+  body.ticker_proxy=document.getElementById("tickerProxy").checked;
+  body.ticker_refresh=Number(document.getElementById("tickerRefresh").value);
+  body.vps_url=document.getElementById("vps").value;
+  body.vps_token=document.getElementById("vpsToken").value;
+  body.vps_proxy=document.getElementById("vpsProxy").checked;
+  body.vps_refresh=Number(document.getElementById("vpsRefresh").value);
+  body.album_id=document.getElementById("album").value;
+  var nodes=document.querySelectorAll(".page");
+  for(var i=0;i<nodes.length;i++){
+    var n=nodes[i], pg=body.pages[i];
+    pg.enabled=n.querySelector(".en").checked;
+    pg.dwell=Number(n.querySelector(".dw").value)||pg.dwell;
+    var u=n.querySelector(".url"); if(u) pg.url=u.value;
+    var px=n.querySelector(".px"); if(px) pg.use_proxy=px.checked;
+    var rf=n.querySelector(".rf"); if(rf) pg.refresh=Number(rf.value);
+  }
+  return body;
+}
+document.getElementById("save").onclick=function(){
+  var msg=document.getElementById("msg");
+  msg.textContent="正在保存…";
+  fetch("/setup",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(collect())})
+    .then(function(r){return r.text().then(function(t){if(!r.ok) throw new Error(t); return t})})
+    .then(function(){msg.textContent="已保存。iPad 会按新设置重新拉取。"})
+    .catch(function(){msg.textContent="保存失败，请确认 iPad 上的 App 还开着。"});
+};
+fetch("/setup.json").then(function(r){return r.json()}).then(function(j){state=j;render()}).catch(function(){
+  document.getElementById("app").textContent="读不到 iPad 上的设置。";
+});
+</script>
+</body>
+</html>

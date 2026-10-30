@@ -1,0 +1,8 @@
+shots/
+*.zip
+server/ipad/hermes_bridge/content_cache.json
+DerivedData/
+build/
+*.xcuserstate
+xcuserdata/
+.DS_Store
