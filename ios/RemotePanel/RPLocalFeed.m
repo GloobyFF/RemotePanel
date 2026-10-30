@@ -439,8 +439,8 @@ static NSArray *RPParseMovies(NSData *data, NSInteger limit) {
     return items;
 }
 
-static NSStringEncoding RPICSEncodingNamed(NSString *name) {
-    NSString *n = [[name ?: @""] lowercaseString];
+static NSStringEncoding RPICSEncodingNamed(NSString *charset) {
+    NSString *n = [(charset ?: @"") lowercaseString];
     if ([n rangeOfString:@"gb18030"].location != NSNotFound || [n rangeOfString:@"gbk"].location != NSNotFound ||
         [n rangeOfString:@"gb2312"].location != NSNotFound || [n rangeOfString:@"cp936"].location != NSNotFound) {
         return CFStringConvertEncodingToNSStringEncoding(kCFStringEncodingGB_18030_2000);
