@@ -28,4 +28,16 @@ object Theme {
     fun card(): Int = hex(week[dayIndex()][1])
     fun border(): Int = hex(week[dayIndex()][2])
     fun accent(): Int = hex(week[dayIndex()][3])
+
+    private val tints = intArrayOf(
+        0x0E7C86, 0x1D4EC4, 0x6A3CC8, 0xE06A12, 0xC43B78, 0x1E8A4A
+    )
+
+    fun cardTint(index: Int): Int {
+        val n = Math.floorMod(index, tints.size)
+        return hex(tints[n])
+    }
+
+    fun up(): Int = Color.rgb(0x52, 0x1C, 0x21)
+    fun down(): Int = Color.rgb(0x14, 0x72, 0x3C)
 }

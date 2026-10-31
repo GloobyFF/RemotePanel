@@ -18,9 +18,6 @@ import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
-import androidx.core.view.WindowCompat
-import androidx.core.view.WindowInsetsCompat
-import androidx.core.view.WindowInsetsControllerCompat
 import androidx.lifecycle.lifecycleScope
 import com.glooby.remotepanel.R
 import com.glooby.remotepanel.data.FeedRepository
@@ -28,6 +25,7 @@ import com.glooby.remotepanel.data.PageCatalog
 import com.glooby.remotepanel.data.PageDef
 import com.glooby.remotepanel.data.Prefs
 import com.glooby.remotepanel.data.Theme
+import com.glooby.remotepanel.pages.BoardPage
 import com.glooby.remotepanel.pages.DefaultPageFactory
 import com.glooby.remotepanel.pages.PanelPage
 import kotlinx.coroutines.launch
@@ -60,10 +58,14 @@ class KioskActivity : AppCompatActivity() {
     private var dwellTotalMs = 60_000L
     private var dwellLeftMs = 60_000L
     private var transitioning = false
+    private var rosterKey = ""
+    private var askedCalendar = false
+    private var askedVideo = false
+    private var videoHold = false
 
     private val clockTick = object : Runnable {
         override fun run() {
-            clockLabel.text = SimpleDateFormat("HH:mm", Locale.getDefault()).format(Date())
+            clockLabel.text = "${Theme.dayName()} " + SimpleDateFormat("HH:mm", Locale.getDefault()).format(Date())
             applyThemeColors()
             handler.postDelayed(this, 1000L)
         }
@@ -71,7 +73,9 @@ class KioskActivity : AppCompatActivity() {
 
     private val dwellTick = object : Runnable {
         override fun run() {
-            if (!transitioning) {
+            if (videoHold) {
+                indexLabel.text = "${index + 1}/${roster.size} · 播放"
+            } else if (!transitioning) {
                 dwellLeftMs -= 250L
                 updateProgress()
                 indexLabel.text = "${index + 1}/${roster.size} · ${((dwellLeftMs + 999) / 1000)}s"
@@ -96,23 +100,24 @@ class KioskActivity : AppCompatActivity() {
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         setContentView(R.layout.activity_kiosk)
         bindViews()
-        hideSystemBars()
+        applyImmersive()
         pageHostTop = (pageHost.layoutParams as ViewGroup.MarginLayoutParams).topMargin
         pageHostBottom = (pageHost.layoutParams as ViewGroup.MarginLayoutParams).bottomMargin
 
         findViewById<ImageButton>(R.id.settingsBtn).setOnClickListener { openSettings() }
-        edgeLeft.setOnClickListener { turnBy(-1) }
-        edgeRight.setOnClickListener { turnBy(1) }
-        val longOpen = View.OnLongClickListener {
+        findViewById<ImageButton>(R.id.prevBtn).setOnClickListener { turnBy(-1) }
+        findViewById<ImageButton>(R.id.nextBtn).setOnClickListener { turnBy(1) }
+        chromePeek.setOnLongClickListener {
             openSettings()
             true
         }
-        edgeLeft.setOnLongClickListener(longOpen)
-        edgeRight.setOnLongClickListener(longOpen)
-        chromePeek.setOnLongClickListener(longOpen)
+        root.setOnLongClickListener {
+            openSettings()
+            true
+        }
 
-        ensurePhotoPermission()
         rebuildRoster()
+        rosterKey = roster.joinToString(",") { it.id }
         showPage(0, resetDwell = true)
         refreshFeed()
         handler.post(clockTick)
@@ -121,12 +126,20 @@ class KioskActivity : AppCompatActivity() {
 
     override fun onResume() {
         super.onResume()
-        hideSystemBars()
-        // Settings may have changed.
+        applyImmersive()
         val cur = roster.getOrNull(index)?.id
         rebuildRoster()
-        val newIdx = roster.indexOfFirst { it.id == cur }.let { if (it >= 0) it else 0 }
-        showPage(newIdx, resetDwell = true)
+        val key = roster.joinToString(",") { it.id }
+        if (key != rosterKey || currentPage == null) {
+            rosterKey = key
+            val newIdx = roster.indexOfFirst { it.id == cur }.let { if (it >= 0) it else 0 }
+            showPage(newIdx, resetDwell = true)
+        }
+    }
+
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (hasFocus) applyImmersive()
     }
 
     override fun onDestroy() {
@@ -156,20 +169,48 @@ class KioskActivity : AppCompatActivity() {
         chromePeek = findViewById(R.id.chromePeek)
     }
 
-    private fun hideSystemBars() {
-        WindowCompat.setDecorFitsSystemWindows(window, false)
-        WindowInsetsControllerCompat(window, root).let { c ->
-            c.hide(WindowInsetsCompat.Type.systemBars())
-            c.systemBarsBehavior =
-                WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+    @Suppress("DEPRECATION")
+    private fun applyImmersive() {
+        val decor = window?.decorView ?: return
+        decor.systemUiVisibility = (
+            View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
+                or View.SYSTEM_UI_FLAG_FULLSCREEN
+                or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+                or View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+                or View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
+                or View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
+            )
+    }
+
+    fun askCalendar() {
+        if (askedCalendar) return
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.READ_CALENDAR) ==
+            PackageManager.PERMISSION_GRANTED
+        ) return
+        askedCalendar = true
+        ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.READ_CALENDAR), 1002)
+    }
+
+    fun askVideo() {
+        if (askedVideo) return
+        val perm = if (Build.VERSION.SDK_INT >= 33) {
+            Manifest.permission.READ_MEDIA_VIDEO
+        } else {
+            Manifest.permission.READ_EXTERNAL_STORAGE
         }
+        if (ContextCompat.checkSelfPermission(this, perm) == PackageManager.PERMISSION_GRANTED) return
+        askedVideo = true
+        ActivityCompat.requestPermissions(this, arrayOf(perm), 1003)
+    }
+
+    fun turnFromPage() {
+        if (!isFinishing) turnBy(1)
     }
 
     private fun applyThemeColors() {
         root.setBackgroundColor(Theme.bg())
-        if (!chromeHidden) {
-            // chrome stays translucent over themed bg
-        }
+        progressTrack.setBackgroundColor(0x38FFFFFF)
+        progressFill.setBackgroundColor(Theme.accent())
     }
 
     private fun rebuildRoster() {
@@ -186,7 +227,7 @@ class KioskActivity : AppCompatActivity() {
                     statusPill.setBackgroundColor(
                         ContextCompat.getColor(this@KioskActivity, R.color.rp_ok)
                     )
-                    currentPage?.bind(it)
+                    runCatching { currentPage?.bind(it) }
                 }
                 .onFailure {
                     statusPill.text = getString(R.string.stale)
@@ -197,6 +238,10 @@ class KioskActivity : AppCompatActivity() {
         }
     }
 
+    fun holdForVideo(hold: Boolean) {
+        videoHold = hold
+    }
+
     private fun showPage(idx: Int, resetDwell: Boolean) {
         if (roster.isEmpty()) return
         var i = idx
@@ -205,10 +250,12 @@ class KioskActivity : AppCompatActivity() {
         index = i
         val def = roster[i]
 
+        videoHold = false
         currentPage?.onDisappear()
         pageHost.removeAllViews()
 
-        val page = DefaultPageFactory.create(this, def.id, def.title)
+        val page = runCatching { DefaultPageFactory.create(this, def.id, def.title) }
+            .getOrElse { BoardPage(this, "hello") }
         currentPage = page
         pageHost.addView(
             page.root,
@@ -219,12 +266,11 @@ class KioskActivity : AppCompatActivity() {
         )
         titleLabel.text = def.title
         setChromeHidden(PageCatalog.isWebId(def.id) || def.kind == PageDef.Kind.WEB)
-        page.bind(FeedRepository.lastState)
+        runCatching { page.bind(FeedRepository.lastState) }
         page.onAppear()
         layoutEdgeCatchers()
 
         if (resetDwell) restartDwell()
-        transitioning = false
     }
 
     private fun restartDwell() {
@@ -239,17 +285,46 @@ class KioskActivity : AppCompatActivity() {
 
     private fun updateProgress() {
         val p = if (dwellTotalMs <= 0) 0f else 1f - (dwellLeftMs.toFloat() / dwellTotalMs.toFloat())
-        val w = (progressTrack.width * p.coerceIn(0f, 1f)).toInt()
+        val full = progressTrack.width.takeIf { it > 0 } ?: root.width
+        val w = (full * p.coerceIn(0f, 1f)).toInt()
         val lp = progressFill.layoutParams
         lp.width = w
         progressFill.layoutParams = lp
+        progressFill.setBackgroundColor(Theme.accent())
+        progressTrack.setBackgroundColor(0x38FFFFFF.toInt())
     }
 
     private fun turnBy(delta: Int) {
         if (transitioning || roster.isEmpty()) return
         transitioning = true
         handler.removeCallbacks(dwellTick)
-        showPage(index + delta, resetDwell = true)
+        val travel = pageHost.width.coerceAtLeast(root.width).coerceAtLeast(1).toFloat()
+        val forward = delta >= 0
+        val style = Math.floorMod(index + if (forward) 1 else 0, 3)
+        pageHost.animate().cancel()
+        pageHost.animate()
+            .translationX(if (style == 1) 0f else (if (forward) -travel else travel) * 0.22f)
+            .translationY(if (style == 1) (if (forward) -48f else 48f) else 0f)
+            .alpha(0f)
+            .setDuration(240)
+            .withEndAction {
+                showPage(index + delta, resetDwell = true)
+                pageHost.translationX = if (style == 1) 0f else (if (forward) travel else -travel) * 0.18f
+                pageHost.translationY = if (style == 1) (if (forward) 56f else -56f) else 0f
+                pageHost.alpha = 0f
+                pageHost.scaleX = if (style == 2) 0.94f else 1f
+                pageHost.scaleY = if (style == 2) 0.94f else 1f
+                pageHost.animate()
+                    .translationX(0f)
+                    .translationY(0f)
+                    .alpha(1f)
+                    .scaleX(1f)
+                    .scaleY(1f)
+                    .setDuration(340)
+                    .withEndAction { transitioning = false }
+                    .start()
+            }
+            .start()
     }
 
     private fun setChromeHidden(hidden: Boolean) {
@@ -303,7 +378,7 @@ class KioskActivity : AppCompatActivity() {
         startActivity(Intent(this, SettingsActivity::class.java))
     }
 
-    private fun ensurePhotoPermission() {
+    fun askPhotos() {
         val need = if (Build.VERSION.SDK_INT >= 33) {
             Manifest.permission.READ_MEDIA_IMAGES
         } else {
@@ -322,6 +397,10 @@ class KioskActivity : AppCompatActivity() {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
         if (requestCode == 1001 && grantResults.firstOrNull() != PackageManager.PERMISSION_GRANTED) {
             Toast.makeText(this, "未授予相册权限，本地相册页将为空", Toast.LENGTH_LONG).show()
+        }
+        if (grantResults.firstOrNull() == PackageManager.PERMISSION_GRANTED) {
+            runCatching { currentPage?.bind(FeedRepository.lastState) }
+            currentPage?.onAppear()
         }
     }
 }

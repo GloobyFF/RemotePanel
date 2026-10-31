@@ -5,6 +5,8 @@
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
     <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
+    <uses-permission android:name="android.permission.READ_MEDIA_VIDEO" />
+    <uses-permission android:name="android.permission.READ_CALENDAR" />
 
     <application
         android:name=".RemotePanelApp"
@@ -21,7 +23,7 @@
             android:configChanges="orientation|screenSize|screenLayout|keyboardHidden"
             android:exported="true"
             android:launchMode="singleTask"
-            android:screenOrientation="sensor"
+            android:screenOrientation="portrait"
             android:theme="@style/Theme.RemotePanel.Kiosk">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />

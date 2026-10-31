@@ -157,12 +157,70 @@ NSArray *RPLocalPageCatalog(void) {
         @{@"id": @"person-photo-local-2", @"title": @"本地相册 B", @"dwell": @60},
         @{@"id": @"gamer520-switch-latest", @"title": @"Switch 上新", @"dwell": @60, @"hint": @"Switch 游戏页面"},
         @{@"id": @"ps5-games-latest", @"title": @"PS5 上新", @"dwell": @60, @"hint": @"PS5 游戏页面"},
+        @{@"id": @"local-video", @"title": @"视频", @"dwell": @12, @"hint": @"无片可播时的停留。播放中会播完再翻页。", @"default_off": @YES},
     ];
+}
+
+BOOL RPLocalPageDefaultOn(NSString *pid) {
+    for (NSDictionary *meta in RPLocalPageCatalog()) {
+        if ([meta[@"id"] isEqualToString:pid]) return ![meta[@"default_off"] boolValue];
+    }
+    return YES;
+}
+
+static NSString * const RPVideoSourceKey = @"RemotePanel.video.source";
+static NSString * const RPVideoAlbumKey = @"RemotePanel.video.albumId";
+static NSString * const RPVideoHTTPKey = @"RemotePanel.video.http";
+static NSString * const RPVideoMaxKey = @"RemotePanel.video.maxMinutes";
+
+NSString *RPVideoDirectory(void) {
+    NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
+    NSString *dir = [docs stringByAppendingPathComponent:@"Videos"];
+    [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+    return dir ?: @"";
+}
+
+static NSString *RPVideoSafeName(NSString *raw) {
+    NSString *base = [[raw ?: @"" lastPathComponent] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (base.length < 5 || base.length > 120) return @"";
+    if ([base rangeOfString:@"/"].location != NSNotFound || [base rangeOfString:@".."].location != NSNotFound) return @"";
+    NSString *ext = base.pathExtension.lowercaseString;
+    if (![@[@"mp4", @"mov", @"m4v"] containsObject:ext]) return @"";
+    return base;
+}
+
+NSArray *RPVideoLocalFiles(void) {
+    NSString *dir = RPVideoDirectory();
+    NSArray *names = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:dir error:nil] ?: @[];
+    NSMutableArray *files = [NSMutableArray array];
+    for (NSString *name in names) {
+        if ([name hasSuffix:@".part"]) continue;
+        if (RPVideoSafeName(name).length == 0) continue;
+        [files addObject:[dir stringByAppendingPathComponent:name]];
+    }
+    [files sortUsingSelector:@selector(compare:)];
+    return files;
 }
 
 static NSString *RPString(id value) {
     if (![value isKindOfClass:[NSString class]]) return @"";
     return [(NSString *)value stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+}
+
+NSDictionary *RPVideoSettings(void) {
+    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+    NSString *src = RPString([ud stringForKey:RPVideoSourceKey]);
+    if (![@[@"album", @"files", @"http"] containsObject:src]) src = @"album";
+    NSInteger mins = [ud integerForKey:RPVideoMaxKey];
+    if (mins < 0) mins = 0;
+    if (mins > 180) mins = 180;
+    return @{
+        @"source": src,
+        @"album": RPString([ud stringForKey:RPVideoAlbumKey]),
+        @"http": RPString([ud stringForKey:RPVideoHTTPKey]),
+        @"max": @(mins),
+        @"photo_album": RPString([ud stringForKey:@"RemotePanel.albumLocalId"]),
+    };
 }
 
 NSUInteger RPWebPagesMaxCount(void) { return 8; }
@@ -709,6 +767,11 @@ static NSArray *RPParseBilibili(NSData *data, NSInteger limit) {
         if (RPString(owner[@"name"]).length) [bits addObject:RPString(owner[@"name"])];
         if (RPString(row[@"tname"]).length) [bits addObject:RPString(row[@"tname"])];
         if (views.length) [bits addObject:[NSString stringWithFormat:@"播放 %@", views]];
+        NSString *desc = RPString(row[@"desc"]);
+        if (desc.length > 80) desc = [[desc substringToIndex:80] stringByAppendingString:@"…"];
+        if (desc.length) [bits addObject:desc];
+        NSInteger dur = [row[@"duration"] integerValue];
+        if (dur > 0) [bits addObject:[NSString stringWithFormat:@"时长 %ld:%02ld", (long)(dur / 60), (long)(dur % 60)]];
         NSString *link = RPString(row[@"short_link_v2"]);
         if (link.length == 0 && RPString(row[@"bvid"]).length) {
             link = [NSString stringWithFormat:@"https://www.bilibili.com/video/%@", RPString(row[@"bvid"])];
@@ -1019,6 +1082,24 @@ static NSString *RPSetupHTML(void) {
         "  }\n"
         "  return h;\n"
         "}\n"
+        "function uploadVideo(){\n"
+        "  var input=document.getElementById(\"vfile\"), msg=document.getElementById(\"vmsg\");\n"
+        "  if(!input||!input.files||!input.files[0]){ if(msg) msg.textContent=\"先选择一个 mp4、mov 或 m4v。\"; return; }\n"
+        "  var file=input.files[0], name=file.name||\"clip.mp4\", chunk=100000, seq=0;\n"
+        "  if(!file.size){ if(msg) msg.textContent=\"文件是空的。\"; return; }\n"
+        "  if(file.size>200*1024*1024){ if(msg) msg.textContent=\"单个文件请小于 200MB。\"; return; }\n"
+        "  if(msg) msg.textContent=\"正在上传…\";\n"
+        "  function step(){\n"
+        "    var end=Math.min(file.size,(seq+1)*chunk), last=end>=file.size?1:0, blob=file.slice(seq*chunk,end);\n"
+        "    fetch(\"/video-chunk?name=\"+encodeURIComponent(name)+\"&seq=\"+seq+\"&last=\"+last,{method:\"POST\",body:blob})\n"
+        "      .then(function(r){return r.text().then(function(t){if(!r.ok) throw new Error(t||\"失败\");});})\n"
+        "      .then(function(){\n"
+        "        if(last){ if(msg) msg.textContent=\"已上传。来源选「上传到这台 iPad」，并勾选视频页的显示。\"; return; }\n"
+        "        seq++; if(msg) msg.textContent=\"正在上传… \"+Math.round(end*100/file.size)+\"%\"; step();\n"
+        "      }).catch(function(e){ if(msg) msg.textContent=\"上传失败：\"+(e&&e.message?e.message:\"\"); });\n"
+        "  }\n"
+        "  step();\n"
+        "}\n"
         "function render(){\n"
         "  var ch=state.refresh_choices, ti=state.refresh_titles, h=\"\";\n"
         "  h+=\"<div class=\\\"card\\\"><h2>连接</h2><label>HTTP / SOCKS 代理</label><input id=\\\"proxy\\\" type=\\\"text\\\" value=\\\"\"+esc(state.proxy)+\"\\\">\";\n"
@@ -1036,11 +1117,33 @@ static NSString *RPSetupHTML(void) {
         "  });\n"
         "  if(!(state.albums||[]).length) h+=\"</select><p>还没有读到相册列表。iPad 需要先允许访问照片。</p></div>\";\n"
         "  else h+=\"</select></div>\";\n"
+        "  h+=\"<div class=\\\"card\\\"><h2>视频</h2>\";\n"
+        "  h+=\"<p>和自定义网页一样，默认不加入轮播。到下面的页面列表里勾选「视频」的「显示」才会出现。每次随机播一条，播完再翻页，这一页没有飞入动画。只支持 H.264 的 mp4、mov、m4v，建议 1080p 以内。</p>\";\n"
+        "  h+=\"<label>来源</label><select id=\\\"vsource\\\">\";\n"
+        "  h+=\"<option value=\\\"album\\\"\"+(state.video_source===\\\"album\\\"?\" selected\":\"\")+\">相册里的视频</option>\";\n"
+        "  h+=\"<option value=\\\"files\\\"\"+(state.video_source===\\\"files\\\"?\" selected\":\"\")+\">上传到这台 iPad</option>\";\n"
+        "  h+=\"<option value=\\\"http\\\"\"+(state.video_source===\\\"http\\\"?\" selected\":\"\")+\">网络目录（http）</option></select>\";\n"
+        "  h+=\"<label>相册（留空则用上面选的相册；那个相册没有视频时，再用全部视频）</label><select id=\\\"valbum\\\"><option value=\\\"\\\">跟随上面的相册</option>\";\n"
+        "  (state.albums||[]).forEach(function(a){\n"
+        "    h+=\"<option value=\\\"\"+esc(a.id)+\"\\\"\"+(a.id===state.video_album?\" selected\":\"\")+\">\"+esc(a.title)+\"</option>\";\n"
+        "  });\n"
+        "  h+=\"</select>\";\n"
+        "  h+=\"<label>网络目录</label><input id=\\\"vhttp\\\" type=\\\"text\\\" value=\\\"\"+esc(state.video_http)+\"\\\" placeholder=\\\"http://192.168.28.30/videos/\\\">\";\n"
+        "  h+=\"<p>填 iPad 能直接打开的 http 地址。不能填 \\\\\\\\电脑\\\\共享。页面里要有 mp4 / mov / m4v 的链接，或者这个地址本身就是一个视频文件。</p>\";\n"
+        "  h+=\"<label>最长播放（分钟，0 表示播完再翻页）</label><input id=\\\"vmax\\\" class=\\\"narrow\\\" type=\\\"number\\\" value=\\\"\"+esc(state.video_max)+\"\\\">\";\n"
+        "  h+=\"<label>已经上传的视频</label>\";\n"
+        "  if(!(state.video_files||[]).length) h+=\"<p>还没有上传。</p>\";\n"
+        "  else (state.video_files||[]).forEach(function(f){\n"
+        "    h+=\"<label class=\\\"check\\\"><input type=\\\"checkbox\\\" class=\\\"vdel\\\" data-name=\\\"\"+esc(f.name)+\"\\\"> 删除 \"+esc(f.name)+\" （\"+esc(f.mb)+\" MB）</label>\";\n"
+        "  });\n"
+        "  h+=\"<label>从这台电脑上传</label><input id=\\\"vfile\\\" type=\\\"file\\\" accept=\\\".mp4,.mov,.m4v,video/mp4,video/quicktime\\\">\";\n"
+        "  h+=\"<p><button id=\\\"vupload\\\" type=\\\"button\\\">上传到 iPad</button></p><p id=\\\"vmsg\\\"></p></div>\";\n"
         "  h+=\"<div class=\\\"card\\\"><h2>页面</h2>\";\n"
         "  (state.pages||[]).forEach(function(pg,i){\n"
         "    h+=\"<div class=\\\"page\\\" data-i=\\\"\"+i+\"\\\"><div class=\\\"row\\\"><strong>\"+esc(pg.title)+\"</strong>\";\n"
         "    h+=\"<label class=\\\"check\\\"><input type=\\\"checkbox\\\" class=\\\"en\\\"\"+(pg.enabled?\" checked\":\"\")+\"> 显示</label>\";\n"
         "    h+=\"<label class=\\\"check\\\">停留 <input class=\\\"dw narrow\\\" type=\\\"number\\\" value=\\\"\"+esc(pg.dwell)+\"\\\"> 秒</label></div>\";\n"
+        "    if(pg.id===\"local-video\") h+=\"<p>这里的秒数只在没有片子可播时使用。正在播放时会播完，或到达上面的最长播放，再翻页。</p>\";\n"
         "    if(pg.has_source){\n"
         "      h+=\"<label>\"+esc(pg.hint||\"接口\")+\"</label><input class=\\\"url\\\" type=\\\"text\\\" value=\\\"\"+esc(pg.url)+\"\\\">\";\n"
         "      if(pg.api_key!=null){\n"
@@ -1056,6 +1159,8 @@ static NSString *RPSetupHTML(void) {
         "  });\n"
         "  h+=\"</div>\";\n"
         "  document.getElementById(\"app\").innerHTML=h;\n"
+        "  var up=document.getElementById(\"vupload\");\n"
+        "  if(up) up.onclick=uploadVideo;\n"
         "}\n"
         "function collect(){\n"
         "  var body=JSON.parse(JSON.stringify(state));\n"
@@ -1069,6 +1174,13 @@ static NSString *RPSetupHTML(void) {
         "  body.vps_proxy=document.getElementById(\"vpsProxy\").checked;\n"
         "  body.vps_refresh=Number(document.getElementById(\"vpsRefresh\").value);\n"
         "  body.album_id=document.getElementById(\"album\").value;\n"
+        "  body.video_source=document.getElementById(\"vsource\").value;\n"
+        "  body.video_album=document.getElementById(\"valbum\").value;\n"
+        "  body.video_http=document.getElementById(\"vhttp\").value;\n"
+        "  body.video_max=Number(document.getElementById(\"vmax\").value)||0;\n"
+        "  body.video_remove=[];\n"
+        "  var dels=document.querySelectorAll(\".vdel\");\n"
+        "  for(var di=0;di<dels.length;di++) if(dels[di].checked) body.video_remove.push(dels[di].getAttribute(\"data-name\"));\n"
         "  var nodes=document.querySelectorAll(\".page\");\n"
         "  for(var i=0;i<nodes.length;i++){\n"
         "    var n=nodes[i], pg=body.pages[i];\n"
@@ -1154,7 +1266,7 @@ static NSString * const RPDwellOverrideDefaultsKey = @"RemotePanel.dwellOverride
 - (BOOL)pageEnabled:(NSString *)pid {
     NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
     NSString *key = [RPPageEnabledPrefix stringByAppendingString:pid];
-    if ([ud objectForKey:key] == nil) return YES;
+    if ([ud objectForKey:key] == nil) return RPLocalPageDefaultOn(pid);
     return [ud boolForKey:key];
 }
 
@@ -1220,6 +1332,12 @@ static NSString * const RPDwellOverrideDefaultsKey = @"RemotePanel.dwellOverride
             id first = [(NSArray *)payload firstObject];
             if (![first isKindOfClass:[NSDictionary class]] || ![(NSDictionary *)first objectForKey:@"image_url"] || (([key isEqualToString:@"x"] || [key isEqualToString:@"xhs"]) && ![first[@"rich"] boolValue])) return NO;
             if ([key isEqualToString:@"xhs"] && [first[@"cover"] integerValue] < 3) return NO;
+            if ([key isEqualToString:@"x"] && ![first[@"blurb"] isKindOfClass:[NSString class]]) return NO;
+        }
+        if ([key isEqualToString:@"bili"] && [payload isKindOfClass:[NSArray class]] && [(NSArray *)payload count]) {
+            id first = [(NSArray *)payload firstObject];
+            NSString *sum = [first isKindOfClass:[NSDictionary class]] ? first[@"summary"] : nil;
+            if (![sum isKindOfClass:[NSString class]] || [sum rangeOfString:@"时长"].location == NSNotFound) return NO;
         }
         if ([payload isKindOfClass:[NSArray class]]) {
             for (id row in (NSArray *)payload) {
@@ -1313,7 +1431,7 @@ static NSString * const RPDwellOverrideDefaultsKey = @"RemotePanel.dwellOverride
         NSString *pid = meta[@"id"] ?: @"";
         BOOL hasSource = sourceDefaults[pid] != nil;
         NSString *enabledKey = [RPPageEnabledPrefix stringByAppendingString:pid];
-        BOOL enabled = [ud objectForKey:enabledKey] == nil ? YES : [ud boolForKey:enabledKey];
+        BOOL enabled = [ud objectForKey:enabledKey] == nil ? RPLocalPageDefaultOn(pid) : [ud boolForKey:enabledKey];
         NSInteger dwell = [ud integerForKey:[RPDwellPrefix stringByAppendingString:pid]];
         if (dwell <= 0) dwell = [meta[@"dwell"] integerValue];
         NSString *proxyKey = [RPSourceProxyPrefix stringByAppendingString:pid];
@@ -1371,6 +1489,22 @@ static NSString * const RPDwellOverrideDefaultsKey = @"RemotePanel.dwellOverride
         @"vps_refresh": choices[RPLocalRefreshChoiceIndex(RPLocalTTL(@"vps"))],
         @"album_id": RPString([ud stringForKey:RPAlbumDefaultsKey]),
         @"albums": albums,
+        @"video_source": ({
+            NSString *src = RPString([ud stringForKey:RPVideoSourceKey]);
+            src.length ? src : @"album";
+        }),
+        @"video_album": RPString([ud stringForKey:RPVideoAlbumKey]),
+        @"video_http": RPString([ud stringForKey:RPVideoHTTPKey]),
+        @"video_max": @([ud integerForKey:RPVideoMaxKey]),
+        @"video_files": ({
+            NSMutableArray *rows = [NSMutableArray array];
+            for (NSString *path in RPVideoLocalFiles()) {
+                NSDictionary *attr = [[NSFileManager defaultManager] attributesOfItemAtPath:path error:nil];
+                double mb = [attr[NSFileSize] doubleValue] / (1024.0 * 1024.0);
+                [rows addObject:@{ @"name": path.lastPathComponent ?: @"", @"mb": [NSString stringWithFormat:@"%.1f", mb] }];
+            }
+            rows;
+        }),
         @"refresh_choices": choices,
         @"refresh_titles": RPLocalRefreshChoiceTitles(),
         @"pages": pages,
@@ -1402,6 +1536,31 @@ static NSString * const RPDwellOverrideDefaultsKey = @"RemotePanel.dwellOverride
     if ([doc[@"vps_proxy"] respondsToSelector:@selector(boolValue)]) [ud setBool:[doc[@"vps_proxy"] boolValue] forKey:RPVpsProxyKey];
     if ([doc[@"vps_refresh"] respondsToSelector:@selector(doubleValue)] && [doc[@"vps_refresh"] doubleValue] >= 60) {
         [ud setDouble:[doc[@"vps_refresh"] doubleValue] forKey:[RPRefreshPrefix stringByAppendingString:@"vps"]];
+    }
+    if ([doc[@"video_source"] isKindOfClass:[NSString class]]) {
+        NSString *src = RPString(doc[@"video_source"]);
+        if (![@[@"album", @"files", @"http"] containsObject:src]) src = @"album";
+        [ud setObject:src forKey:RPVideoSourceKey];
+    }
+    if ([doc objectForKey:@"video_album"]) {
+        NSString *aid = RPString(doc[@"video_album"]);
+        if (aid.length) [ud setObject:aid forKey:RPVideoAlbumKey];
+        else [ud removeObjectForKey:RPVideoAlbumKey];
+    }
+    if ([doc[@"video_http"] isKindOfClass:[NSString class]]) [ud setObject:RPString(doc[@"video_http"]) forKey:RPVideoHTTPKey];
+    if ([doc[@"video_max"] respondsToSelector:@selector(integerValue)]) {
+        NSInteger mins = [doc[@"video_max"] integerValue];
+        if (mins < 0) mins = 0;
+        if (mins > 180) mins = 180;
+        [ud setInteger:mins forKey:RPVideoMaxKey];
+    }
+    if ([doc[@"video_remove"] isKindOfClass:[NSArray class]]) {
+        NSString *dir = RPVideoDirectory();
+        for (id raw in doc[@"video_remove"]) {
+            NSString *name = RPVideoSafeName([raw isKindOfClass:[NSString class]] ? raw : @"");
+            if (name.length == 0) continue;
+            [[NSFileManager defaultManager] removeItemAtPath:[dir stringByAppendingPathComponent:name] error:nil];
+        }
     }
     if ([doc objectForKey:@"album_id"]) {
         NSString *aid = RPString(doc[@"album_id"]);
@@ -1537,6 +1696,80 @@ static NSString * const RPDwellOverrideDefaultsKey = @"RemotePanel.dwellOverride
     return found;
 }
 
+- (NSString *)query:(NSString *)first key:(NSString *)key {
+    NSRange q = [first rangeOfString:@"?"];
+    if (q.location == NSNotFound) return @"";
+    NSString *rest = [first substringFromIndex:q.location + 1];
+    NSRange sp = [rest rangeOfString:@" "];
+    if (sp.location != NSNotFound) rest = [rest substringToIndex:sp.location];
+    for (NSString *pair in [rest componentsSeparatedByString:@"&"]) {
+        NSRange eq = [pair rangeOfString:@"="];
+        if (eq.location == NSNotFound) continue;
+        NSString *k = [pair substringToIndex:eq.location];
+        if (![k isEqualToString:key]) continue;
+        NSString *v = [pair substringFromIndex:eq.location + 1];
+        v = [v stringByRemovingPercentEncoding] ?: v;
+        return [v stringByReplacingOccurrencesOfString:@"+" withString:@" "];
+    }
+    return @"";
+}
+
+- (BOOL)writeVideoChunk:(NSData *)body name:(NSString *)name seq:(NSInteger)seq last:(BOOL)last error:(NSString **)error {
+    if (name.length == 0) {
+        if (error) *error = @"文件名需要以 mp4、mov 或 m4v 结尾";
+        return NO;
+    }
+    if (seq < 0 || seq > 4000) {
+        if (error) *error = @"分片序号不对";
+        return NO;
+    }
+    NSString *dir = RPVideoDirectory();
+    NSString *part = [dir stringByAppendingPathComponent:[name stringByAppendingString:@".part"]];
+    NSString *dest = [dir stringByAppendingPathComponent:name];
+    NSFileManager *fm = [NSFileManager defaultManager];
+    if (seq == 0) {
+        [fm removeItemAtPath:part error:nil];
+        if (RPVideoLocalFiles().count >= 30 && ![fm fileExistsAtPath:dest]) {
+            if (error) *error = @"最多保存 30 个视频";
+            return NO;
+        }
+        [fm createFileAtPath:part contents:nil attributes:nil];
+    }
+    if (![fm fileExistsAtPath:part]) {
+        if (error) *error = @"上传中断了，请重试";
+        return NO;
+    }
+    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:part];
+    if (!fh) {
+        if (error) *error = @"写不进去";
+        return NO;
+    }
+    @try {
+        [fh seekToEndOfFile];
+        if (body.length) [fh writeData:body];
+    } @catch (NSException *ex) {
+        [fh closeFile];
+        [fm removeItemAtPath:part error:nil];
+        if (error) *error = @"写入失败";
+        return NO;
+    }
+    [fh closeFile];
+    NSDictionary *attr = [fm attributesOfItemAtPath:part error:nil];
+    if ([attr[NSFileSize] unsignedLongLongValue] > 200ull * 1024ull * 1024ull) {
+        [fm removeItemAtPath:part error:nil];
+        if (error) *error = @"单个文件请小于 200MB";
+        return NO;
+    }
+    if (!last) return YES;
+    [fm removeItemAtPath:dest error:nil];
+    if (![fm moveItemAtPath:part toPath:dest error:nil]) {
+        if (error) *error = @"保存失败";
+        return NO;
+    }
+    [self appendLog:@"视频" status:@"ok" detail:[NSString stringWithFormat:@"已上传 %@", name]];
+    return YES;
+}
+
 - (void)runStatusServer {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) return;
@@ -1579,6 +1812,17 @@ static NSString * const RPDwellOverrideDefaultsKey = @"RemotePanel.dwellOverride
         if ([first hasPrefix:@"GET /setup"]) {
             NSData *bytes = [RPSetupHTML() dataUsingEncoding:NSUTF8StringEncoding] ?: [NSData data];
             [self replyClient:client code:200 type:@"text/html; charset=utf-8" data:bytes];
+            close(client);
+            continue;
+        }
+        if ([first hasPrefix:@"POST /video-chunk"]) {
+            NSString *name = RPVideoSafeName([self query:first key:@"name"]);
+            NSInteger seq = [[self query:first key:@"seq"] integerValue];
+            BOOL last = [[self query:first key:@"last"] integerValue] != 0;
+            NSString *why = nil;
+            BOOL ok = name.length && [self writeVideoChunk:reqBody name:name seq:seq last:last error:&why];
+            NSString *text = ok ? @"ok" : (why.length ? why : @"上传失败");
+            [self replyClient:client code:(ok ? 200 : 400) type:@"text/plain; charset=utf-8" data:[text dataUsingEncoding:NSUTF8StringEncoding]];
             close(client);
             continue;
         }
@@ -1859,6 +2103,10 @@ static NSString * const RPDwellOverrideDefaultsKey = @"RemotePanel.dwellOverride
     NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
     NSString *key = RPString([ud stringForKey:RPHelloKeyKey]);
     if (key.length == 0) key = RPLocalDefaultHelloKey();
+    if (key.length == 0) {
+        self.fetchError = @"没有填写接口密钥";
+        return nil;
+    }
     NSString *model = RPString([ud stringForKey:RPHelloModelKey]);
     if (model.length == 0) model = RPLocalDefaultHelloModel();
     NSDictionary *payload = @{
@@ -1946,7 +2194,7 @@ static NSString * const RPDwellOverrideDefaultsKey = @"RemotePanel.dwellOverride
             NSString *title = RPString(item[@"title"]);
             if (title.length) [titles addObject:title];
         }
-        NSString *prompt = [NSString stringWithFormat:@"把下面每条 X 热门话题翻译成一句简短中文，口语、准确。保持 %lu 行，一行一条，不要编号，不要空行，不要解释。已经是中文就原样输出。\n%@", (unsigned long)titles.count, [titles componentsJoinedByString:@"\n"]];
+        NSString *prompt = [NSString stringWithFormat:@"把下面每条 X 热门话题写成一行，格式严格为：中文话题｜一句话说明。说明不超过22个字，告诉家里人这条在聊什么。保持 %lu 行，一行一条，不要编号，不要空行。已经是中文的话题名保持原样，后面仍要有说明。\n%@", (unsigned long)titles.count, [titles componentsJoinedByString:@"\n"]];
         NSString *savedError = self.fetchError;
         NSString *translated = [self completeChat:prompt limit:1200];
         self.fetchError = savedError;
@@ -1969,7 +2217,27 @@ static NSString * const RPDwellOverrideDefaultsKey = @"RemotePanel.dwellOverride
             if (![item isKindOfClass:[NSDictionary class]]) continue;
             NSMutableDictionary *row = [item mutableCopy];
             row[@"place"] = place;
-            if (i < (NSInteger)lines.count) row[@"zh"] = lines[i];
+            if (i < (NSInteger)lines.count) {
+                NSString *line = lines[i];
+                NSString *zh = line;
+                NSString *blurb = @"";
+                NSRange bar = [line rangeOfString:@"｜"];
+                if (bar.location == NSNotFound) bar = [line rangeOfString:@"|"];
+                if (bar.location != NSNotFound && bar.location > 0 && bar.location + 1 < line.length) {
+                    zh = [[line substringToIndex:bar.location] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+                    NSUInteger cut = bar.location + 1;
+                    if (bar.length > 1) cut = bar.location + bar.length;
+                    blurb = [[line substringFromIndex:cut] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+                }
+                row[@"zh"] = zh;
+                if (blurb.length == 0) blurb = RPString(row[@"summary"]);
+                if (blurb.length == 0) blurb = @"热门话题";
+                row[@"blurb"] = blurb;
+            }
+            if (![row[@"blurb"] isKindOfClass:[NSString class]] || [row[@"blurb"] length] == 0) {
+                NSString *fallback = RPString(row[@"summary"]);
+                row[@"blurb"] = fallback.length ? fallback : @"热门话题";
+            }
             NSMutableString *summary = [NSMutableString stringWithFormat:@"%@ 第 %@ 名", place, row[@"rank"] ?: @""];
             NSString *score = RPString(row[@"score"]);
             if (score.length) [summary appendFormat:@" · %@", score];

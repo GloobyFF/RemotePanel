@@ -59,6 +59,27 @@
     return opts;
 }
 
+- (NSArray<PHAsset *> *)videoAssetsInAlbumId:(NSString *)albumId limit:(NSUInteger)limit {
+    PHFetchOptions *opts = [[PHFetchOptions alloc] init];
+    opts.sortDescriptors = @[[NSSortDescriptor sortDescriptorWithKey:@"creationDate" ascending:NO]];
+    opts.predicate = [NSPredicate predicateWithFormat:@"mediaType == %d", PHAssetMediaTypeVideo];
+    PHFetchResult *assets = nil;
+    if (albumId.length) {
+        PHFetchResult *cols = [PHAssetCollection fetchAssetCollectionsWithLocalIdentifiers:@[albumId] options:nil];
+        PHAssetCollection *col = cols.firstObject;
+        if (!col) return @[];
+        assets = [PHAsset fetchAssetsInAssetCollection:col options:opts];
+    } else {
+        assets = [PHAsset fetchAssetsWithOptions:opts];
+    }
+    NSMutableArray *arr = [NSMutableArray array];
+    [assets enumerateObjectsUsingBlock:^(PHAsset *obj, NSUInteger idx, BOOL *stop) {
+        [arr addObject:obj];
+        if (limit > 0 && arr.count >= limit) *stop = YES;
+    }];
+    return arr;
+}
+
 - (NSArray<PHAsset *> *)assetsFromCollection:(PHAssetCollection *)col limit:(NSUInteger)limit {
     if (!col) return @[];
     PHFetchResult *assets = [PHAsset fetchAssetsInAssetCollection:col options:[self imageFetchOptions]];

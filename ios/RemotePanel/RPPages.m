@@ -8,7 +8,12 @@
 #import <EventKit/EventKit.h>
 #import <objc/runtime.h>
 #import <CommonCrypto/CommonDigest.h>
+#import <ImageIO/ImageIO.h>
+#import <QuartzCore/QuartzCore.h>
+#import <AVFoundation/AVFoundation.h>
 #import <ctype.h>
+
+static NSString *RPShortNumber(id value);
 
 @interface RPBasePageVC (Fingerprint)
 - (BOOL)shouldSkipRebuildForKey:(NSString *)key bounds:(CGRect)b;
@@ -31,7 +36,7 @@ static char kRPImageURLKey;
 static char kRPDismissDimKey;
 static char kRPReminderID;
 /** Soft cap for decoded bitmaps on iPad 3 (1024×768 @2x still huge if kept full-res). */
-static const CGFloat kRPImageMaxSide = 720.0;
+static const CGFloat kRPImageMaxSide = 480.0;
 static const NSTimeInterval kRPIntroImageWait = 1.35;
 
 static NSCache *RPImageCache(void) {
@@ -39,9 +44,9 @@ static NSCache *RPImageCache(void) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         c = [[NSCache alloc] init];
-        c.countLimit = 28;
-        // ~18 MB of decoded RGBA budget for the kiosk.
-        c.totalCostLimit = 18 * 1024 * 1024;
+        c.countLimit = 16;
+        // iPad 3 dies if several full-size posters decode at once.
+        c.totalCostLimit = 12 * 1024 * 1024;
     });
     return c;
 }
@@ -50,18 +55,22 @@ void RPPurgeImageCache(void) {
     [RPImageCache() removeAllObjects];
 }
 
-static UIImage *RPDownscaleImage(UIImage *img, CGFloat maxSide) {
-    if (!img) return nil;
-    CGSize s = img.size;
-    CGFloat longest = MAX(s.width, s.height);
-    if (longest <= 1.0 || longest <= maxSide) return img;
-    CGFloat scale = maxSide / longest;
-    CGSize ns = CGSizeMake(MAX(1.0, round(s.width * scale)), MAX(1.0, round(s.height * scale)));
-    UIGraphicsBeginImageContextWithOptions(ns, YES, 1.0);
-    [img drawInRect:CGRectMake(0, 0, ns.width, ns.height)];
-    UIImage *out = UIGraphicsGetImageFromCurrentImageContext();
-    UIGraphicsEndImageContext();
-    return out ?: img;
+/** Decode a small thumbnail. imageWithData: first would allocate the full bitmap and can jetsam this iPad. */
+static UIImage *RPImageFromData(NSData *data, CGFloat maxSide) {
+    if (data.length == 0) return nil;
+    CGImageSourceRef src = CGImageSourceCreateWithData((__bridge CFDataRef)data, NULL);
+    if (!src) return nil;
+    NSDictionary *opt = @{
+        (id)kCGImageSourceCreateThumbnailFromImageAlways: @YES,
+        (id)kCGImageSourceThumbnailMaxPixelSize: @(MAX(64.0, maxSide)),
+        (id)kCGImageSourceCreateThumbnailWithTransform: @YES,
+    };
+    CGImageRef cg = CGImageSourceCreateThumbnailAtIndex(src, 0, (__bridge CFDictionaryRef)opt);
+    CFRelease(src);
+    if (!cg) return nil;
+    UIImage *img = [UIImage imageWithCGImage:cg];
+    CGImageRelease(cg);
+    return img;
 }
 
 static NSUInteger RPImageCost(UIImage *img) {
@@ -130,6 +139,7 @@ void RPPrefetchImagesForPage(NSString *pageId, NSDictionary *state, NSString *ba
         }
     }
     if (keys.count == 0) return;
+    if (keys.count > 4) [keys removeObjectsInRange:NSMakeRange(4, keys.count - 4)];
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_LOW, 0), ^{
         for (NSString *key in keys) {
             if ([RPImageCache() objectForKey:key]) continue;
@@ -140,7 +150,7 @@ void RPPrefetchImagesForPage(NSString *pageId, NSDictionary *state, NSString *ba
                 if (proxy.length == 0) proxy = RPLocalDefaultProxy();
             }
             NSData *data = [RPNet syncGET:key proxy:proxy headers:nil timeout:16 error:&error];
-            UIImage *img = data ? RPDownscaleImage([UIImage imageWithData:data], kRPImageMaxSide) : nil;
+            UIImage *img = RPImageFromData(data, kRPImageMaxSide);
             if (img) RPCacheImage(key, img);
         }
     });
@@ -167,6 +177,7 @@ static NSString *RPHashObject(id obj) {
     BOOL _waitingIntro;
     NSInteger _pendingImageLoads;
     NSInteger _introWaitToken;
+    NSInteger _cardSerial;
 }
 - (void)viewDidLoad {
     [super viewDidLoad];
@@ -177,8 +188,12 @@ static NSString *RPHashObject(id obj) {
 }
 - (void)pageWillAppear {
     _waitingIntro = YES;
+    _introPlayed = NO;
     _introWaitToken += 1;
     NSInteger token = _introWaitToken;
+    // Park before the run loop paints. Image pages used to sit at rest for the
+    // load wait, then jump off-canvas and fly back in.
+    [self parkMotionOffscreen];
     [self tryPlayIntro];
     // Don't stall the fly-in forever on a slow LAN — start with whatever is ready.
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kRPIntroImageWait * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
@@ -195,13 +210,25 @@ static NSString *RPHashObject(id obj) {
 }
 - (void)applyState:(NSDictionary *)state baseURL:(NSString *)baseURL { (void)state; (void)baseURL; }
 - (void)clearContent {
-    _introPlayed = NO;
+    // A refresh on the page that's already flying (or finished) must not
+    // rewind the intro; the next appear creates a new controller.
+    if (_waitingIntro) _introPlayed = NO;
     _pendingImageLoads = 0;
+    _cardSerial = 0;
     for (UIView *v in self.contentView.subviews) [v removeFromSuperview];
+}
+- (void)rpReplayIntro {
+    _introPlayed = NO;
+    _waitingIntro = YES;
+    self.contentView.alpha = 1;
+    [self.view layoutIfNeeded];
+    [self parkMotionOffscreen];
+    [self tryPlayIntro];
 }
 - (void)tryPlayIntro {
     if (!_waitingIntro || _introPlayed) return;
     if (_pendingImageLoads > 0) return;
+    if (self.contentView.bounds.size.width < 2) return;
     _waitingIntro = NO;
     [self playPageIntro];
 }
@@ -244,10 +271,37 @@ static NSString *RPHashObject(id obj) {
     }
     return all;
 }
+- (BOOL)rpIntroFromOutside {
+    NSString *pid = self.pageId ?: @"";
+    if ([pid hasPrefix:@"person-photo"]) return YES;
+    static NSArray *imagePages;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        imagePages = @[@"github-news", @"xiaohongshu-hot", @"bilibili-hot", @"daily-news",
+                       @"movie-now-showing", @"steam-new-releases", @"steam-new-releases-2",
+                       @"gamer520-pc-latest", @"gamer520-switch-latest", @"ps5-games-latest"];
+    });
+    return [imagePages containsObject:pid];
+}
+- (BOOL)rpIntroHasPlayed { return _introPlayed; }
+- (void)parkMotionOffscreen {
+    if (_introPlayed) return;
+    if (self.contentView.bounds.size.width < 2) return;
+    NSArray *views = [self rpMotionViews];
+    NSInteger kind = [self rpMotionKind];
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    [views enumerateObjectsUsingBlock:^(UIView *v, NSUInteger i, BOOL *stop) {
+        v.transform = [self rpMotionShift:kind index:(NSInteger)i outro:NO];
+        v.alpha = 1;
+    }];
+    [CATransaction commit];
+}
 - (CGAffineTransform)rpMotionShift:(NSInteger)kind index:(NSInteger)i outro:(BOOL)outro {
     CGFloat w = MAX(self.contentView.bounds.size.width, 480);
     CGFloat h = MAX(self.contentView.bounds.size.height, 320);
-    NSInteger style = kind % 8;
+    // Covers and posters fly in from off-canvas. Scale/spin styles read as a flash.
+    NSInteger style = [self rpIntroFromOutside] ? 5 : (kind % 8);
     BOOL leave = outro;
     switch (style) {
         case 0: return CGAffineTransformMakeTranslation(leave ? w : -w, 0);
@@ -268,8 +322,11 @@ static NSString *RPHashObject(id obj) {
     _introPlayed = YES;
     NSInteger kind = [self rpMotionKind];
     [views enumerateObjectsUsingBlock:^(UIView *v, NSUInteger i, BOOL *stop) {
-        v.transform = [self rpMotionShift:kind index:(NSInteger)i outro:NO];
-        v.alpha = (kind % 8 == 4 || kind % 8 == 6) ? 0 : 1;
+        CGAffineTransform start = [self rpMotionShift:kind index:(NSInteger)i outro:NO];
+        [UIView performWithoutAnimation:^{
+            v.transform = start;
+            v.alpha = 1;
+        }];
         [UIView animateWithDuration:2.3 delay:MIN(0.55, i * 0.07) options:UIViewAnimationOptionCurveEaseOut animations:^{
             v.transform = CGAffineTransformIdentity;
             v.alpha = 1;
@@ -323,12 +380,19 @@ static NSString *RPHashObject(id obj) {
     l.numberOfLines = 0;
     return l;
 }
+- (NSInteger)rpPageColorBias {
+    NSUInteger page = 0;
+    NSString *pid = self.pageId ?: @"";
+    for (NSUInteger i = 0; i < pid.length; i++) page = page * 33 + [pid characterAtIndex:i];
+    return (NSInteger)(page % 6);
+}
 - (UIView *)makeCard {
-    return [self makeCardTinted:0 accent:nil];
+    _cardSerial += 1;
+    return [self makeCardTinted:_cardSerial accent:nil];
 }
 - (UIView *)makeCardTinted:(NSInteger)idx accent:(UIColor *)accent {
     UIView *c = [[UIView alloc] init];
-    c.backgroundColor = [RPTheme cardTint:idx];
+    c.backgroundColor = [RPTheme cardTint:idx + [self rpPageColorBias]];
     UIColor *border = accent ?: [RPTheme cardBorder];
     c.layer.borderColor = border.CGColor;
     c.layer.borderWidth = 1.5;
@@ -525,7 +589,7 @@ static NSString *RPHashObject(id obj) {
             if (proxy.length == 0) proxy = RPLocalDefaultProxy();
         }
         NSData *data = [RPNet syncGET:key proxy:proxy headers:nil timeout:18 error:&error];
-        UIImage *img = data ? RPDownscaleImage([UIImage imageWithData:data], kRPImageMaxSide) : nil;
+        UIImage *img = RPImageFromData(data, kRPImageMaxSide);
         if (img) RPCacheImage(key, img);
         dispatch_async(dispatch_get_main_queue(), ^{
             UIImageView *strongIV = weakIV;
@@ -566,34 +630,64 @@ static NSString *RPHashObject(id obj) {
     BOOL waiting = text.length == 0;
     if (period.length == 0) period = @"你好";
     if (waiting) text = @"正在准备一句问候";
-    NSString *fp = [NSString stringWithFormat:@"hello3|%@|%@", period, text];
+    NSDictionary *weather = [state[@"weather"] isKindOfClass:[NSDictionary class]] ? state[@"weather"] : @{};
+    NSString *fp = [NSString stringWithFormat:@"hello4|%@|%@|%@", period, text, weather[@"temperature"] ?: @""];
     if ([self shouldSkipRebuildForKey:fp bounds:b]) return;
     [self clearContent];
     BOOL landscape = [self isLandscape];
     CGFloat m = [self mInset];
     UIColor *tone = [RPTheme accent];
-    if ([period isEqualToString:@"中午好"]) tone = [RPTheme tintOrange];
-    else if ([period isEqualToString:@"晚上好"]) tone = [RPTheme tintPurple];
 
-    UILabel *big = [self makeLabel:[RPTheme title:landscape ? 72 : 60] color:tone];
+    CGFloat panelW = landscape ? floor(b.size.width * 0.34) : (b.size.width - 2 * m);
+    CGFloat panelH = landscape ? (b.size.height - 2 * m) : 220;
+    CGFloat panelX = landscape ? (b.size.width - m - panelW) : m;
+    CGFloat panelY = landscape ? m : (b.size.height - m - panelH);
+    UIView *panel = [self makeCard];
+    panel.frame = CGRectMake(panelX, panelY, panelW, panelH);
+    NSString *iconText = [NSString stringWithFormat:@"%@", weather[@"icon"] ?: @""];
+    if ([iconText isEqualToString:@"(null)"] || iconText.length == 0) iconText = @"\uf00d";
+    UILabel *icon = [self makeLabel:[RPTheme weatherIcon:landscape ? 120 : 88] color:tone];
+    icon.text = iconText;
+    icon.textAlignment = NSTextAlignmentCenter;
+    icon.frame = CGRectMake(12, 18, panelW - 24, landscape ? 140 : 96);
+    UILabel *temp = [self makeLabel:[RPTheme hero:landscape ? 64 : 48] color:[RPTheme text]];
+    NSString *tempText = RPShortNumber(weather[@"temperature"]);
+    if ([tempText isEqualToString:@"-"]) tempText = @"";
+    temp.text = (tempText.length && ![tempText isEqualToString:@"(null)"]) ? [NSString stringWithFormat:@"%@°", tempText] : @"";
+    temp.textAlignment = NSTextAlignmentCenter;
+    temp.frame = CGRectMake(12, CGRectGetMaxY(icon.frame) + 4, panelW - 24, 70);
+    UILabel *desc = [self makeLabel:[RPTheme title:28] color:[RPTheme text]];
+    NSString *descText = [NSString stringWithFormat:@"%@", weather[@"description"] ?: @""];
+    NSString *city = [NSString stringWithFormat:@"%@", weather[@"city"] ?: @""];
+    if ([descText isEqualToString:@"(null)"]) descText = @"";
+    if ([city isEqualToString:@"(null)"]) city = @"";
+    desc.text = city.length ? [NSString stringWithFormat:@"%@  %@", city, descText] : descText;
+    desc.textAlignment = NSTextAlignmentCenter;
+    desc.frame = CGRectMake(12, panelH - 52, panelW - 24, 36);
+    [panel addSubview:icon];
+    [panel addSubview:temp];
+    [panel addSubview:desc];
+    [self.contentView addSubview:panel];
+
+    CGFloat textW = landscape ? (panelX - m - 16) : (b.size.width - 2 * m);
+    CGFloat textTop = landscape ? 28 : 12;
+    UILabel *big = [self makeLabel:[RPTheme title:landscape ? 72 : 56] color:tone];
     big.text = period;
     big.textAlignment = NSTextAlignmentCenter;
     big.adjustsFontSizeToFitWidth = YES;
     big.minimumScaleFactor = 0.6;
-    CGFloat bigH = landscape ? 110 : 100;
-    big.frame = CGRectMake(m, landscape ? 36 : 48, b.size.width - 2 * m, bigH);
+    big.frame = CGRectMake(m, textTop, textW, landscape ? 100 : 80);
     [self.contentView addSubview:big];
 
-    UILabel *line = [self makeLabel:[RPTheme title:36] color:waiting ? [RPTheme textDim] : [RPTheme text]];
+    UILabel *line = [self makeLabel:[RPTheme title:landscape ? 32 : 28] color:waiting ? [RPTheme textDim] : [RPTheme text]];
     line.text = text;
     line.textAlignment = NSTextAlignmentCenter;
-    line.numberOfLines = 4;
+    line.numberOfLines = 5;
     line.adjustsFontSizeToFitWidth = YES;
     line.minimumScaleFactor = 0.45;
-    CGFloat lineY = CGRectGetMaxY(big.frame) + (landscape ? 18 : 28);
-    CGFloat lineH = b.size.height - lineY - (landscape ? 64 : 80);
-    if (lineH < 80) lineH = 80;
-    line.frame = CGRectMake(m + 24, lineY, b.size.width - 2 * m - 48, lineH);
+    CGFloat lineY = CGRectGetMaxY(big.frame) + 12;
+    CGFloat lineBottom = landscape ? (b.size.height - 56) : panelY - 8;
+    line.frame = CGRectMake(m + 8, lineY, textW - 16, MAX(80, lineBottom - lineY));
     [self.contentView addSubview:line];
 
     NSDateFormatter *fmt = [[NSDateFormatter alloc] init];
@@ -601,11 +695,27 @@ static NSString *RPHashObject(id obj) {
     fmt.dateFormat = @"M月d日 EEEE";
     UILabel *when = [self makeLabel:[RPTheme body:22] color:[RPTheme textDim]];
     when.text = [fmt stringFromDate:[NSDate date]];
-    when.textAlignment = NSTextAlignmentCenter;
-    when.frame = CGRectMake(m, b.size.height - (landscape ? 48 : 56), b.size.width - 2 * m, 28);
+    when.textAlignment = landscape ? NSTextAlignmentLeft : NSTextAlignmentCenter;
+    when.frame = CGRectMake(m, b.size.height - 40, textW, 28);
     [self.contentView addSubview:when];
 }
 @end
+
+static NSString *RPShortNumber(id value) {
+    if (!value || value == [NSNull null]) return @"-";
+    if ([value isKindOfClass:[NSString class]]) {
+        NSString *s = [(NSString *)value stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        if (s.length == 0 || [s isEqualToString:@"(null)"]) return @"-";
+        NSScanner *scanner = [NSScanner scannerWithString:s];
+        double v = 0;
+        if (![scanner scanDouble:&v] || !scanner.isAtEnd) return s;
+        value = @(v);
+    }
+    if (![value respondsToSelector:@selector(doubleValue)]) return @"-";
+    double v = [value doubleValue];
+    if (fabs(v - round(v)) < 0.05) return [NSString stringWithFormat:@"%.0f", round(v)];
+    return [NSString stringWithFormat:@"%.1f", v];
+}
 
 #pragma mark - Weather
 
@@ -615,7 +725,7 @@ static NSString *RPHashObject(id obj) {
     CGRect b = self.contentView.bounds;
     NSDictionary *w = state[@"weather"] ?: @{};
     NSDictionary *vps = state[@"vps"] ?: @{};
-    NSString *fp = [NSString stringWithFormat:@"weather2-%d|%@|%@", self.weekly?1:0, RPHashObject(w), RPHashObject(vps)];
+    NSString *fp = [NSString stringWithFormat:@"weather4-%d|%@|%@", self.weekly?1:0, RPHashObject(w), RPHashObject(vps)];
     if ([self shouldSkipRebuildForKey:fp bounds:b]) return;
     [self clearContent];
     BOOL landscape = [self isLandscape];
@@ -630,12 +740,13 @@ static NSString *RPHashObject(id obj) {
 
     CGFloat y = 100;
     if (!self.weekly) {
-        CGFloat heroW = landscape ? b.size.width*0.38 : b.size.width-2*m;
-        CGFloat heroH = landscape ? 220 : 210;
-        UIView *hero = [self makeCardTinted:0 accent:[RPTheme accent]];
+        CGFloat heroW = landscape ? b.size.width*0.34 : b.size.width-2*m;
+        CGFloat vpsBand = vps.count ? 168 : 16;
+        CGFloat heroH = landscape ? MAX(280, MIN(400, b.size.height - y - vpsBand)) : 210;
+        UIView *hero = [self makeCard];
         hero.frame = CGRectMake(m, y, heroW, heroH);
         UILabel *temp = [self makeLabel:[RPTheme hero:96] color:[RPTheme accent]];
-        temp.text = [NSString stringWithFormat:@"%@°", w[@"temperature"] ?: @"--"];
+        temp.text = [NSString stringWithFormat:@"%@°", RPShortNumber(w[@"temperature"])];
         temp.frame = CGRectMake(22, 28, heroW*0.55, 100);
         UILabel *icon = [self makeLabel:[RPTheme weatherIcon:72] color:[RPTheme text]];
         icon.text = [NSString stringWithFormat:@"%@", w[@"icon"] ?: @""];
@@ -645,7 +756,7 @@ static NSString *RPHashObject(id obj) {
         desc.text = [NSString stringWithFormat:@"%@", w[@"description"]?:@""];
         desc.frame = CGRectMake(22, 130, heroW-40, 40);
         UILabel *meta = [self makeLabel:[RPTheme body:24] color:[RPTheme textDim]];
-        meta.text = [NSString stringWithFormat:@"风 %@ · %@°~%@°", w[@"wind_speed"]?:@"-", w[@"temp_min"]?:@"-", w[@"temp_max"]?:@"-"];
+        meta.text = [NSString stringWithFormat:@"风 %@ · %@°~%@°", RPShortNumber(w[@"wind_speed"]), RPShortNumber(w[@"temp_min"]), RPShortNumber(w[@"temp_max"])];
         meta.frame = CGRectMake(22, 172, heroW-40, 30);
         [hero addSubview:temp]; [hero addSubview:icon]; [hero addSubview:desc]; [hero addSubview:meta];
         [self.contentView addSubview:hero];
@@ -665,24 +776,24 @@ static NSString *RPHashObject(id obj) {
                 for (NSUInteger i=0; i<show; i++) {
                     NSDictionary *d = weekly[i];
                     NSInteger row=i/cols, col=i%cols;
-                    UIView *card = [self makeCardTinted:(NSInteger)i+1 accent:[RPTheme tintBlue]];
+                    UIView *card = [self makeCard];
                     card.frame = CGRectMake(x0 + col*(cw+gap), y + row*(ch+gap), cw, ch);
                     UILabel *day = [self makeLabel:[RPTheme title:20] color:[RPTheme accent]];
                     day.text = [NSString stringWithFormat:@"%@", d[@"weekday"]?:@""];
                     day.textAlignment = NSTextAlignmentCenter;
-                    day.frame = CGRectMake(6, 8, cw-12, 24);
-                    UILabel *ds = [self makeLabel:[RPTheme body:16] color:[RPTheme text]];
-                    ds.text = [NSString stringWithFormat:@"%@", d[@"description"]?:@""];
-                    ds.textAlignment = NSTextAlignmentCenter;
-                    ds.numberOfLines = 1;
-                    ds.frame = CGRectMake(6, 32, cw-12, 22);
+                    day.frame = CGRectMake(6, 6, cw-12, 22);
+                    CGFloat iconH = MAX(52, ch - 72);
+                    UILabel *ic = [self makeLabel:[RPTheme weatherIcon:MIN(96, iconH)] color:[RPTheme text]];
+                    ic.text = [NSString stringWithFormat:@"%@", d[@"icon"]?:@""];
+                    ic.textAlignment = NSTextAlignmentCenter;
+                    ic.frame = CGRectMake(4, 26, cw-8, iconH);
                     UILabel *tr = [self makeLabel:[RPTheme mono:18] color:[RPTheme text]];
-                    tr.text = [NSString stringWithFormat:@"%@° / %@°", d[@"temp_max"]?:@"-", d[@"temp_min"]?:@"-"];
+                    tr.text = [NSString stringWithFormat:@"%@° / %@°", RPShortNumber(d[@"temp_max"]), RPShortNumber(d[@"temp_min"])];
                     tr.textAlignment = NSTextAlignmentCenter;
                     tr.adjustsFontSizeToFitWidth = YES;
                     tr.minimumScaleFactor = 0.7;
-                    tr.frame = CGRectMake(6, ch-30, cw-12, 22);
-                    [card addSubview:day]; [card addSubview:ds]; [card addSubview:tr];
+                    tr.frame = CGRectMake(6, ch-28, cw-12, 22);
+                    [card addSubview:day]; [card addSubview:ic]; [card addSubview:tr];
                     [self.contentView addSubview:card];
                 }
             }
@@ -700,18 +811,18 @@ static NSString *RPHashObject(id obj) {
             for (NSUInteger i=0; i<show; i++) {
                 NSDictionary *d = weekly[i];
                 NSInteger row=i/cols, col=i%cols;
-                UIView *card = [self makeCardTinted:(NSInteger)i+1 accent:[UIColor colorWithRed:0.22 green:0.55 blue:0.95 alpha:1]];
+                UIView *card = [self makeCard];
                 card.frame = CGRectMake(m + col*(cw+gap), y + row*(ch+gap), cw, ch);
                 UILabel *day = [self makeLabel:[RPTheme title:26] color:[RPTheme accent]];
                 day.text = [NSString stringWithFormat:@"%@", d[@"weekday"]?:@""];
                 day.textAlignment = NSTextAlignmentCenter;
-                day.frame = CGRectMake(6, 10, cw-12, 28);
-                UILabel *ic = [self makeLabel:[RPTheme weatherIcon:40] color:[RPTheme text]];
+                day.frame = CGRectMake(6, 8, cw-12, 28);
+                UILabel *ic = [self makeLabel:[RPTheme weatherIcon:56] color:[RPTheme text]];
                 ic.text = [NSString stringWithFormat:@"%@", d[@"icon"]?:@""];
                 ic.textAlignment = NSTextAlignmentCenter;
-                ic.frame = CGRectMake(6, 42, cw-12, 42);
+                ic.frame = CGRectMake(6, 38, cw-12, 58);
                 UILabel *tr = [self makeLabel:[RPTheme mono:22] color:[RPTheme text]];
-                tr.text = [NSString stringWithFormat:@"%@°/%@°", d[@"temp_max"]?:@"-", d[@"temp_min"]?:@"-"];
+                tr.text = [NSString stringWithFormat:@"%@°/%@°", RPShortNumber(d[@"temp_max"]), RPShortNumber(d[@"temp_min"])];
                 tr.textAlignment = NSTextAlignmentCenter;
                 tr.frame = CGRectMake(4, ch-36, cw-8, 28);
                 [card addSubview:day]; [card addSubview:ic]; [card addSubview:tr];
@@ -730,19 +841,20 @@ static NSString *RPHashObject(id obj) {
         for (NSUInteger i=0; i<weekly.count; i++) {
             NSDictionary *d = weekly[i];
             NSInteger row = i / cols, col = i % cols;
-            UIView *card = [self makeCardTinted:(NSInteger)i accent:[RPTheme accent]];
+            UIView *card = [self makeCard];
             card.frame = CGRectMake(m + col*(cw+gap), y + row*(ch+gap), cw, ch);
             UILabel *day = [self makeLabel:[RPTheme title:28] color:[RPTheme accent]];
             day.text = [NSString stringWithFormat:@"%@", d[@"weekday"] ?: @""];
             day.frame = CGRectMake(14, 12, cw-28, 32);
-            UILabel *icon = [self makeLabel:[RPTheme weatherIcon:44] color:[RPTheme text]];
+            UILabel *icon = [self makeLabel:[RPTheme weatherIcon:72] color:[RPTheme text]];
             icon.text = [NSString stringWithFormat:@"%@", d[@"icon"] ?: @""];
-            icon.frame = CGRectMake(14, 48, cw-28, 46);
+            icon.textAlignment = NSTextAlignmentCenter;
+            icon.frame = CGRectMake(8, 44, cw-16, 64);
             UILabel *desc = [self makeLabel:[RPTheme body:24] color:[RPTheme text]];
             desc.text = [NSString stringWithFormat:@"%@", d[@"description"]?:@""];
             desc.frame = CGRectMake(14, 96, cw-28, 28);
             UILabel *tr = [self makeLabel:[RPTheme mono:24] color:[RPTheme textDim]];
-            tr.text = [NSString stringWithFormat:@"%@° ~ %@°", d[@"temp_min"]?:@"-", d[@"temp_max"]?:@"-"];
+            tr.text = [NSString stringWithFormat:@"%@° ~ %@°", RPShortNumber(d[@"temp_min"]), RPShortNumber(d[@"temp_max"])];
             tr.frame = CGRectMake(14, ch-36, cw-28, 28);
             [card addSubview:day]; [card addSubview:icon]; [card addSubview:desc]; [card addSubview:tr];
             [self.contentView addSubview:card];
@@ -758,16 +870,16 @@ static NSString *RPHashObject(id obj) {
         CGFloat gap = 12;
         NSInteger cols = landscape ? 4 : 2;
         CGFloat cw = (b.size.width - 2*m - gap*(cols-1)) / cols;
-        CGFloat ch = MIN(120, b.size.height - y - m);
+        CGFloat ch = MIN(150, MAX(96, b.size.height - y - m));
         NSArray *cards = @[
-            @[@"流量使用", [NSString stringWithFormat:@"%.0f%%", [vps[@"percent"] floatValue]], [NSString stringWithFormat:@"%@", vps[@"used"]?:@""], [RPTheme accent]],
-            @[@"剩余", [NSString stringWithFormat:@"%@", vps[@"remain"]?:@"-"], [NSString stringWithFormat:@"%@", vps[@"cycle"]?:@""], [RPTheme ok]],
-            @[@"状态", [NSString stringWithFormat:@"%@", vps[@"status"]?:@"-"], @"Traffic", [RPTheme tintBlue]],
-            @[@"周期", @"本月", [NSString stringWithFormat:@"%@", vps[@"cycle"]?:@""], [RPTheme tintPurple]],
+            @[@"流量使用", [NSString stringWithFormat:@"%.0f%%", [vps[@"percent"] floatValue]], [NSString stringWithFormat:@"%@", vps[@"used"]?:@""]],
+            @[@"剩余", [NSString stringWithFormat:@"%@", vps[@"remain"]?:@"-"], [NSString stringWithFormat:@"%@", vps[@"cycle"]?:@""]],
+            @[@"状态", [NSString stringWithFormat:@"%@", vps[@"status"]?:@"-"], @"流量"],
+            @[@"周期", @"本月", [NSString stringWithFormat:@"%@", vps[@"cycle"]?:@""]],
         ];
         for (NSUInteger i=0; i<MIN((NSUInteger)cols, cards.count); i++) {
             NSArray *c = cards[i];
-            UIView *card = [self makeCardTinted:(NSInteger)i accent:c[3]];
+            UIView *card = [self makeCard];
             card.frame = CGRectMake(m + i*(cw+gap), y, cw, ch);
             UILabel *k=[self makeLabel:[RPTheme small:20] color:[RPTheme textDim]];
             k.text=c[0]; k.frame=CGRectMake(14,12,cw-28,24);
@@ -1010,7 +1122,7 @@ static NSString *RPHashObject(id obj) {
             items = built;
         }
     }
-    NSString *fp = [NSString stringWithFormat:@"news2-%d-%@|%@|%@", self.github?1:0, kind, RPHashObject(items), baseURL?:@""];
+    NSString *fp = [NSString stringWithFormat:@"news3-%d-%@|%@|%@", self.github?1:0, kind, RPHashObject(items), baseURL?:@""];
     if ([self shouldSkipRebuildForKey:fp bounds:b]) return;
     [self clearContent];
     CGFloat m = [self mInset];
@@ -1052,18 +1164,18 @@ static NSString *RPHashObject(id obj) {
         [scroll addSubview:empty];
     }
     CGFloat avail = MAX(80, b.size.height - top - 8);
-    NSInteger slots = MIN(5, MAX(1, maxN == 0 ? 1 : maxN));
+    NSInteger slots = self.github ? MIN(4, MAX(1, maxN == 0 ? 1 : maxN)) : MIN(5, MAX(1, maxN == 0 ? 1 : maxN));
     CGFloat cardH = floor((avail - gap * MAX(slots - 1, 0)) / slots);
-    if (cardH < 118 && slots > 4) {
+    if (!self.github && cardH < 118 && slots > 4) {
         slots = 4;
         cardH = floor((avail - gap * MAX(slots - 1, 0)) / slots);
     }
-    if (cardH > 132) cardH = 132;
+    if (cardH > (self.github ? 188 : 132)) cardH = self.github ? 188 : 132;
     if (cardH < 96) cardH = 96;
     maxN = MIN(maxN, slots);
     for (NSInteger i=0; i<maxN; i++) {
         NSDictionary *it = items[i];
-        UIView *card = [self makeCardTinted:i accent:self.github ? [RPTheme tintPurple] : [RPTheme tintOrange]];
+        UIView *card = [self makeCard];
         card.frame = CGRectMake(m, y, b.size.width-2*m, cardH);
         card.userInteractionEnabled = YES;
         card.tag = 7000 + i;
@@ -1075,9 +1187,46 @@ static NSString *RPHashObject(id obj) {
         if (self.github) {
             t = [NSString stringWithFormat:@"%@", it[@"full_name"] ?: it[@"name"] ?: @""];
             s = [NSString stringWithFormat:@"%@", it[@"description"] ?: @""];
+            if ([s isEqualToString:@"(null)"]) s = @"";
             metaLine = [NSString stringWithFormat:@"★ %@  ·  %@  ·  forks %@", it[@"stars"]?:@"0", it[@"language"]?:@"--", it[@"forks"]?:@"0"];
             NSString *img = [NSString stringWithFormat:@"%@", it[@"image_url"] ?: @""];
-            if (img.length) imgURL = [self absURL:img base:baseURL];
+            if (img.length && ![img isEqualToString:@"(null)"]) imgURL = [self absURL:img base:baseURL];
+            CGFloat leftW = floor(card.bounds.size.width * 0.40);
+            CGFloat thumb = 56;
+            if (imgURL) {
+                UIImageView *iv = [[UIImageView alloc] initWithFrame:CGRectMake(14, 14, thumb, thumb)];
+                iv.contentMode = UIViewContentModeScaleAspectFill;
+                iv.clipsToBounds = YES;
+                iv.layer.cornerRadius = thumb / 2.0;
+                iv.backgroundColor = [[UIColor whiteColor] colorWithAlphaComponent:0.12];
+                [card addSubview:iv];
+                [self loadImageURL:imgURL into:iv];
+            }
+            UILabel *idx = [self makeLabel:[RPTheme mono:22] color:[RPTheme accent]];
+            idx.text = [NSString stringWithFormat:@"%02ld", (long)(i+1)];
+            idx.frame = CGRectMake(imgURL ? 78 : 16, 12, 52, 26);
+            [card addSubview:idx];
+            UILabel *tl = [self makeLabel:[RPTheme title:24] color:[RPTheme text]];
+            tl.text = t;
+            tl.numberOfLines = 2;
+            tl.frame = CGRectMake(14, imgURL ? 76 : 44, leftW - 20, 52);
+            [card addSubview:tl];
+            UILabel *ml = [self makeLabel:[RPTheme body:16] color:[RPTheme textDim]];
+            ml.text = metaLine;
+            ml.numberOfLines = 2;
+            ml.frame = CGRectMake(14, cardH - 42, leftW - 20, 32);
+            [card addSubview:ml];
+            UILabel *sl = [self makeLabel:[RPTheme readable:20] color:[RPTheme text]];
+            sl.text = s.length ? s : @"这个项目没有简介。";
+            sl.numberOfLines = 5;
+            sl.frame = CGRectMake(leftW + 8, 14, card.bounds.size.width - leftW - 22, cardH - 28);
+            [card addSubview:sl];
+            UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(rpNewsTap:)];
+            [card addGestureRecognizer:tap];
+            objc_setAssociatedObject(card, &kRPImageURLKey, @{ @"item": it ?: @{}, @"base": baseURL ?: @"", @"github": @YES }, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            [scroll addSubview:card];
+            y += cardH + gap;
+            continue;
         } else {
             t = [NSString stringWithFormat:@"%@", it[@"title"] ?: it[@"name"] ?: @""];
             s = [NSString stringWithFormat:@"%@", it[@"summary"] ?: @""];
@@ -1147,7 +1296,7 @@ static NSString *RPHashObject(id obj) {
     sub.frame = CGRectMake(m, 4, b.size.width - 2 * m, 28);
     [self.contentView addSubview:sub];
     top = 38;
-    NSInteger n = MIN(12, (NSInteger)items.count);
+    NSInteger n = MIN(6, (NSInteger)items.count);
     if (n == 0) {
         UILabel *empty = [self makeLabel:[RPTheme body:22] color:[UIColor whiteColor]];
         empty.text = @"正在读取美国区 X 热门，并译成中文。这个榜没有中国区，全球榜目前多是日文和泰文。";
@@ -1162,37 +1311,49 @@ static NSString *RPHashObject(id obj) {
     CGFloat gap = 8;
     CGFloat cardW = floor((b.size.width - 2 * m - gap * (cols - 1)) / cols);
     CGFloat cardH = floor((b.size.height - top - 8 - gap * (rows - 1)) / rows);
-    if (cardH > 108) cardH = 108;
-    if (cardH < 76) cardH = 76;
+    if (cardH > 210) cardH = 210;
+    if (cardH < 120) cardH = 120;
     for (NSInteger i = 0; i < n; i++) {
         NSDictionary *it = items[i];
         NSInteger col = i % cols;
         NSInteger row = i / cols;
-        UIView *card = [self makeCardTinted:i accent:[RPTheme accent]];
+        UIView *card = [self makeCard];
         card.frame = CGRectMake(m + col * (cardW + gap), top + row * (cardH + gap), cardW, cardH);
         card.tag = 7000 + i;
         card.userInteractionEnabled = YES;
-        UILabel *rank = [self makeLabel:[RPTheme title:28] color:[RPTheme accent]];
+        UILabel *rank = [self makeLabel:[RPTheme title:26] color:[RPTheme accent]];
         rank.text = [NSString stringWithFormat:@"%@", it[@"rank"] ?: @(i + 1)];
-        rank.frame = CGRectMake(10, 8, 42, 32);
+        rank.frame = CGRectMake(12, 10, 48, 30);
         [card addSubview:rank];
         NSString *zh = [NSString stringWithFormat:@"%@", it[@"zh"] ?: @""];
         if ([zh isEqualToString:@"(null)"]) zh = @"";
         NSString *title = [NSString stringWithFormat:@"%@", it[@"title"] ?: @""];
         if ([title isEqualToString:@"(null)"]) title = @"";
-        UILabel *tl = [self makeLabel:[RPTheme title:22] color:[UIColor whiteColor]];
-        tl.text = zh.length ? zh : title;
-        tl.numberOfLines = 2;
-        tl.frame = CGRectMake(54, 6, cardW - 66, cardH > 90 ? 48 : 40);
-        [card addSubview:tl];
-        UILabel *sl = [self makeLabel:[RPTheme body:14] color:[RPTheme textDim]];
+        NSString *blurb = [NSString stringWithFormat:@"%@", it[@"blurb"] ?: @""];
+        if ([blurb isEqualToString:@"(null)"]) blurb = @"";
         NSString *score = [NSString stringWithFormat:@"%@", it[@"score"] ?: @""];
         if ([score isEqualToString:@"(null)"]) score = @"";
-        NSString *origin = zh.length ? title : @"";
-        sl.text = score.length ? [NSString stringWithFormat:@"%@%@", origin.length ? [origin stringByAppendingString:@" · "] : @"", score] : origin;
-        sl.numberOfLines = 1;
-        sl.lineBreakMode = NSLineBreakByTruncatingTail;
-        sl.frame = CGRectMake(54, cardH - 24, cardW - 66, 18);
+        UILabel *tl = [self makeLabel:[RPTheme readable:26] color:[RPTheme text]];
+        tl.text = zh.length ? zh : title;
+        tl.numberOfLines = 2;
+        tl.frame = CGRectMake(64, 10, cardW - 78, 64);
+        [card addSubview:tl];
+        UILabel *origin = [self makeLabel:[RPTheme readable:18] color:[RPTheme textDim]];
+        origin.text = (zh.length && title.length && ![zh isEqualToString:title]) ? title : @"";
+        origin.numberOfLines = 2;
+        origin.frame = CGRectMake(16, 78, cardW - 32, 44);
+        [card addSubview:origin];
+        UILabel *sl = [self makeLabel:[RPTheme readable:20] color:[RPTheme text]];
+        NSMutableString *detail = [NSMutableString string];
+        if (blurb.length) [detail appendString:blurb];
+        if (score.length) {
+            if (detail.length) [detail appendString:@"  ·  "];
+            [detail appendString:score];
+        }
+        if (detail.length == 0) detail = [NSMutableString stringWithFormat:@"%@", it[@"summary"] ?: @""];
+        sl.text = detail;
+        sl.numberOfLines = 3;
+        sl.frame = CGRectMake(16, cardH - 78, cardW - 32, 64);
         [card addSubview:sl];
         UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(rpNewsTap:)];
         [card addGestureRecognizer:tap];
@@ -1221,41 +1382,47 @@ static NSString *RPHashObject(id obj) {
         NSDictionary *it = items[i];
         NSInteger col = i % cols;
         NSInteger row = i / cols;
-        UIView *card = [self makeCardTinted:i accent:[UIColor whiteColor]];
+        UIView *card = [self makeCard];
         card.frame = CGRectMake(m + col * (cardW + gap), top + row * (cardH + gap), cardW, cardH);
         card.tag = 7000 + i;
         card.userInteractionEnabled = YES;
-        BOOL wide = cardW > cardH * 1.15;
-        CGRect imgFrame = wide ? CGRectMake(0, 0, floor(cardW * 0.46), cardH) : CGRectMake(0, 0, cardW, floor(cardH * 0.62));
+        CGFloat imgSide = floor(MIN(cardH - 20, cardW * 0.36));
+        if (imgSide < 72) imgSide = 72;
+        CGRect imgFrame = CGRectMake(10, floor((cardH - imgSide) / 2.0), imgSide, imgSide);
         UIImageView *iv = [[UIImageView alloc] initWithFrame:imgFrame];
-        iv.contentMode = UIViewContentModeScaleAspectFill;
+        iv.contentMode = UIViewContentModeScaleAspectFit;
         iv.clipsToBounds = YES;
-        iv.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.2];
+        iv.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.15];
+        iv.layer.cornerRadius = 8;
         [card addSubview:iv];
         NSString *img = [NSString stringWithFormat:@"%@", it[@"image_url"] ?: @""];
         if (img.length && ![img isEqualToString:@"(null)"]) {
             [self loadImageURL:[self absURL:img base:baseURL] into:iv];
         } else {
-            UILabel *mark = [self makeLabel:[RPTheme hero:36] color:[UIColor whiteColor]];
+            UILabel *mark = [self makeLabel:[RPTheme readable:28] color:[RPTheme textDim]];
             NSString *title = [NSString stringWithFormat:@"%@", it[@"title"] ?: @""];
-            mark.text = title.length >= 2 ? [title substringToIndex:2] : title;
+            mark.text = title.length >= 2 ? [title substringToIndex:2] : @"图";
             mark.textAlignment = NSTextAlignmentCenter;
             mark.frame = iv.bounds;
             mark.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
             [iv addSubview:mark];
         }
-        CGFloat textX = wide ? CGRectGetMaxX(imgFrame) + 12 : 14;
-        CGFloat textY = wide ? 16 : CGRectGetMaxY(imgFrame) + 8;
+        CGFloat textX = CGRectGetMaxX(imgFrame) + 12;
         CGFloat textW = cardW - textX - 14;
-        UILabel *tl = [self makeLabel:[RPTheme title:24] color:[UIColor whiteColor]];
-        tl.text = [NSString stringWithFormat:@"%@", it[@"title"] ?: @""];
-        tl.numberOfLines = 2;
-        tl.frame = CGRectMake(textX, textY, textW, wide ? 64 : 52);
+        NSString *titleText = [NSString stringWithFormat:@"%@", it[@"title"] ?: @""];
+        if ([titleText isEqualToString:@"(null)"]) titleText = @"";
+        NSString *sumText = [NSString stringWithFormat:@"%@", it[@"summary"] ?: @""];
+        if ([sumText isEqualToString:@"(null)"]) sumText = @"";
+        if (sumText.length == 0) sumText = @"热门内容";
+        UILabel *tl = [self makeLabel:[RPTheme readable:22] color:[RPTheme text]];
+        tl.text = titleText;
+        tl.numberOfLines = 3;
+        tl.frame = CGRectMake(textX, 12, textW, floor(cardH * 0.48));
         [card addSubview:tl];
-        UILabel *sl = [self makeLabel:[RPTheme body:18] color:[UIColor whiteColor]];
-        sl.text = [NSString stringWithFormat:@"%@", it[@"summary"] ?: @""];
-        sl.numberOfLines = 2;
-        sl.frame = CGRectMake(textX, CGRectGetMaxY(tl.frame) + 4, textW, 44);
+        UILabel *sl = [self makeLabel:[RPTheme readable:18] color:[RPTheme textDim]];
+        sl.text = sumText;
+        sl.numberOfLines = 4;
+        sl.frame = CGRectMake(textX, CGRectGetMaxY(tl.frame) + 4, textW, cardH - CGRectGetMaxY(tl.frame) - 16);
         [card addSubview:sl];
         UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(rpNewsTap:)];
         [card addGestureRecognizer:tap];
@@ -1300,11 +1467,11 @@ static NSString *RPHashObject(id obj) {
     BOOL landscape = [self isLandscape];
     CGFloat m = [self mInset];
 
-    NSDictionary *p = print[@"primary"] ?: @{};
-    NSArray *printers = print[@"printers"] ?: @[];
-    if (p.count == 0 && printers.count) p = printers[0];
-    NSDictionary *temps = p[@"temps"] ?: @{};
-    NSArray *ams = p[@"ams"] ?: @[];
+    NSDictionary *p = [print[@"primary"] isKindOfClass:[NSDictionary class]] ? print[@"primary"] : @{};
+    NSArray *printers = [print[@"printers"] isKindOfClass:[NSArray class]] ? print[@"printers"] : @[];
+    if (p.count == 0 && printers.count && [printers[0] isKindOfClass:[NSDictionary class]]) p = printers[0];
+    NSDictionary *temps = [p[@"temps"] isKindOfClass:[NSDictionary class]] ? p[@"temps"] : @{};
+    NSArray *ams = [p[@"ams"] isKindOfClass:[NSArray class]] ? p[@"ams"] : @[];
     BOOL online = [p[@"online"] boolValue];
     double prog = [p[@"progress"] doubleValue];
     NSString *name = [NSString stringWithFormat:@"%@", p[@"name"] ?: @"打印机"];
@@ -1356,33 +1523,8 @@ static NSString *RPHashObject(id obj) {
         [statusCard addSubview:meta]; [statusCard addSubview:fl];
         [self.contentView addSubview:statusCard];
 
-        // Temps on right of status
-        NSMutableArray *tempItems = [NSMutableArray array];
-        [tempItems addObject:@[@"热床", [NSString stringWithFormat:@"%@°", temps[@"bed"]?:@"-"]]];
-        [tempItems addObject:@[@"腔体", [NSString stringWithFormat:@"%@°", temps[@"chamber"]?:@"-"]]];
-        [tempItems addObject:@[@"喷嘴", [NSString stringWithFormat:@"%@°", temps[@"nozzle"]?:@"-"]]];
-        NSArray *nozzles = temps[@"nozzles"] ?: @[];
-        for (NSDictionary *n in nozzles) {
-            NSString *mark = [n[@"active"] boolValue] ? @"●" : @"○";
-            [tempItems addObject:@[[NSString stringWithFormat:@"%@%@", mark, n[@"name"]?:@"喷嘴"],
-                                   [NSString stringWithFormat:@"%@°", n[@"temp"]?:@"-"]]];
-        }
-        NSInteger tcols = MIN(3, (NSInteger)tempItems.count);
-        CGFloat tgap = 8;
-        CGFloat tcw = (rightW - tgap*(tcols-1)) / MAX(1,tcols);
-        CGFloat tch = (statusH - tgap) / 2.0;
-        for (NSUInteger i=0; i<tempItems.count; i++) {
-            NSInteger row = i / tcols, col = i % tcols;
-            if (row > 1) break;
-            UIView *card = [self makeCard];
-            card.frame = CGRectMake(rightX + col*(tcw+tgap), top + row*(tch+tgap), tcw, tch);
-            UILabel *k = [self makeLabel:[RPTheme small:14] color:[RPTheme textDim]];
-            k.text = tempItems[i][0]; k.frame = CGRectMake(10, 8, tcw-20, 20);
-            UILabel *v = [self makeLabel:[RPTheme hero:36] color:[RPTheme accent]];
-            v.text = tempItems[i][1]; v.frame = CGRectMake(10, 32, tcw-20, 48);
-            [card addSubview:k]; [card addSubview:v];
-            [self.contentView addSubview:card];
-        }
+        NSArray *tempItems = [self tempItemsFrom:temps];
+        [self layoutTempCards:tempItems inRect:CGRectMake(rightX, top, rightW, statusH)];
 
         CGFloat amsTop = top + statusH + gap;
         [self layoutAMS:ams inRect:CGRectMake(m, amsTop, b.size.width-2*m, bottomY-amsTop) landscape:YES];
@@ -1413,40 +1555,74 @@ static NSString *RPHashObject(id obj) {
         [statusCard addSubview:track]; [statusCard addSubview:fl];
         [self.contentView addSubview:statusCard];
 
-        NSMutableArray *tempItems = [NSMutableArray array];
-        [tempItems addObject:@[@"热床", [NSString stringWithFormat:@"%@°", temps[@"bed"]?:@"-"]]];
-        [tempItems addObject:@[@"腔体", [NSString stringWithFormat:@"%@°", temps[@"chamber"]?:@"-"]]];
-        [tempItems addObject:@[@"喷嘴", [NSString stringWithFormat:@"%@°", temps[@"nozzle"]?:@"-"]]];
-        NSArray *nozzles = temps[@"nozzles"] ?: @[];
-        for (NSDictionary *n in nozzles) {
-            NSString *mark = [n[@"active"] boolValue] ? @"●" : @"○";
-            [tempItems addObject:@[[NSString stringWithFormat:@"%@%@", mark, n[@"name"]?:@""],
-                                   [NSString stringWithFormat:@"%@°", n[@"temp"]?:@"-"]]];
-        }
-        CGFloat ty = top + statusH + gap;
-        NSInteger tcols = MIN(3, (NSInteger)tempItems.count);
-        if (tempItems.count >= 5) tcols = 3;
-        CGFloat tgap = 8;
-        CGFloat tcw = (b.size.width - 2*m - tgap*(tcols-1)) / MAX(1,tcols);
-        CGFloat tch = 88;
+        NSArray *tempItems = [self tempItemsFrom:temps];
         NSInteger shown = MIN(6, (NSInteger)tempItems.count);
+        NSInteger tcols = shown <= 3 ? MAX(1, shown) : 3;
         NSInteger trows = (shown + tcols - 1) / tcols;
-        for (NSUInteger i=0; i<(NSUInteger)shown; i++) {
-            NSInteger row = i / tcols, col = i % tcols;
-            UIView *card = [self makeCard];
-            card.frame = CGRectMake(m + col*(tcw+tgap), ty + row*(tch+tgap), tcw, tch);
-            UILabel *k = [self makeLabel:[RPTheme small:14] color:[RPTheme textDim]];
-            k.text = tempItems[i][0]; k.frame = CGRectMake(10, 8, tcw-20, 20);
-            UILabel *v = [self makeLabel:[RPTheme hero:32] color:[RPTheme accent]];
-            v.text = tempItems[i][1]; v.frame = CGRectMake(10, 32, tcw-20, 44);
-            [card addSubview:k]; [card addSubview:v];
-            [self.contentView addSubview:card];
-        }
-        CGFloat amsTop = ty + trows*(tch+tgap) + 2;
+        CGFloat tch = trows > 1 ? 118 : 148;
+        CGFloat ty = top + statusH + gap;
+        [self layoutTempCards:[tempItems subarrayWithRange:NSMakeRange(0, shown)]
+                       inRect:CGRectMake(m, ty, b.size.width-2*m, trows*tch + (trows-1)*8)];
+        CGFloat amsTop = ty + trows*tch + (trows-1)*8 + 2;
         [self layoutAMS:ams inRect:CGRectMake(m, amsTop, b.size.width-2*m, bottomY-amsTop) landscape:NO];
     }
 }
 
+- (NSArray *)tempItemsFrom:(NSDictionary *)temps {
+    NSMutableArray *tempItems = [NSMutableArray array];
+    [tempItems addObject:@[@"热床", [NSString stringWithFormat:@"%@°", temps[@"bed"] ?: @"-"]]];
+    [tempItems addObject:@[@"腔体", [NSString stringWithFormat:@"%@°", temps[@"chamber"] ?: @"-"]]];
+    [tempItems addObject:@[@"喷嘴", [NSString stringWithFormat:@"%@°", temps[@"nozzle"] ?: @"-"]]];
+    NSArray *nozzles = [temps[@"nozzles"] isKindOfClass:[NSArray class]] ? temps[@"nozzles"] : @[];
+    for (id rawNozzle in nozzles) {
+        if (![rawNozzle isKindOfClass:[NSDictionary class]]) continue;
+        NSDictionary *n = rawNozzle;
+        NSString *mark = [n[@"active"] boolValue] ? @"● " : @"";
+        [tempItems addObject:@[[NSString stringWithFormat:@"%@%@", mark, n[@"name"] ?: @"喷嘴"],
+                               [NSString stringWithFormat:@"%@°", n[@"temp"] ?: @"-"]]];
+    }
+    return tempItems;
+}
+- (void)layoutTempCards:(NSArray *)items inRect:(CGRect)rect {
+    NSInteger n = (NSInteger)items.count;
+    if (n <= 0 || rect.size.width < 20 || rect.size.height < 20) return;
+    NSInteger cols = (n <= 4) ? n : 3;
+    NSInteger rows = (n + cols - 1) / cols;
+    CGFloat gap = 8;
+    CGFloat cw = (rect.size.width - gap * (cols - 1)) / MAX(1, cols);
+    CGFloat ch = (rect.size.height - gap * (rows - 1)) / MAX(1, rows);
+    for (NSInteger i = 0; i < n; i++) {
+        NSInteger row = i / cols, col = i % cols;
+        if (row >= rows) break;
+        UIView *card = [self makeCard];
+        card.frame = CGRectMake(rect.origin.x + col * (cw + gap), rect.origin.y + row * (ch + gap), cw, ch);
+        CGFloat labelH = MIN(32.0, MAX(22.0, ch * 0.22));
+        CGFloat valueH = MIN(96.0, MAX(44.0, ch * 0.58));
+        CGFloat y0 = MAX(2.0, (ch - labelH - valueH) / 2.0);
+        UILabel *k = [self makeLabel:[RPTheme title:MIN(26, labelH)] color:[RPTheme textDim]];
+        k.textAlignment = NSTextAlignmentCenter;
+        k.text = items[i][0];
+        k.frame = CGRectMake(6, y0, cw - 12, labelH);
+        UILabel *v = [self makeLabel:[RPTheme hero:MIN(78, valueH)] color:[RPTheme accent]];
+        v.textAlignment = NSTextAlignmentCenter;
+        v.adjustsFontSizeToFitWidth = YES;
+        v.minimumScaleFactor = 0.4f;
+        v.text = items[i][1];
+        v.frame = CGRectMake(4, y0 + labelH, cw - 8, valueH);
+        [card addSubview:k];
+        [card addSubview:v];
+        [self.contentView addSubview:card];
+    }
+}
+- (UIColor *)inkOnColor:(UIColor *)bg {
+    CGFloat r = 1, g = 1, b = 1, a = 1;
+    if (![bg getRed:&r green:&g blue:&b alpha:&a]) {
+        CGFloat w = 1;
+        if ([bg getWhite:&w alpha:&a]) r = g = b = w;
+    }
+    CGFloat y = 0.2126f * r + 0.7152f * g + 0.0722f * b;
+    return y > 0.62f ? [UIColor colorWithWhite:0.08 alpha:1] : [UIColor whiteColor];
+}
 - (void)layoutAMS:(NSArray *)ams inRect:(CGRect)rect landscape:(BOOL)landscape {
     if (ams.count == 0 || rect.size.height < 40) {
         UILabel *empty = [self makeLabel:[RPTheme body:16] color:[RPTheme textDim]];
@@ -1458,13 +1634,16 @@ static NSString *RPHashObject(id obj) {
     // Flatten slots with unit label
     NSMutableArray *flat = [NSMutableArray array];
     NSInteger unitNo = 0;
-    for (NSDictionary *unit in ams) {
+    for (id rawUnit in ams) {
+        if (![rawUnit isKindOfClass:[NSDictionary class]]) continue;
+        NSDictionary *unit = rawUnit;
         unitNo++;
         NSInteger rawIndex = unit[@"index"] ? [unit[@"index"] integerValue] : (unitNo - 1);
         NSString *amsNo = [NSString stringWithFormat:@"%ld", (long)(rawIndex + 1)];
-        NSArray *slots = unit[@"slots"] ?: @[];
-        for (NSDictionary *slot in slots) {
-            NSMutableDictionary *row = [NSMutableDictionary dictionaryWithDictionary:slot];
+        NSArray *slots = [unit[@"slots"] isKindOfClass:[NSArray class]] ? unit[@"slots"] : @[];
+        for (id rawSlot in slots) {
+            if (![rawSlot isKindOfClass:[NSDictionary class]]) continue;
+            NSMutableDictionary *row = [NSMutableDictionary dictionaryWithDictionary:rawSlot];
             row[@"_ams"] = amsNo;
             [flat addObject:row];
         }
@@ -1485,37 +1664,41 @@ static NSString *RPHashObject(id obj) {
     ch = MAX(92, ch);
     for (NSUInteger i=0; i<flat.count; i++) {
         NSDictionary *slot = flat[i];
-        NSDictionary *bound = slot[@"bound"] ?: @{};
+        id rawBound = slot[@"bound"];
+        NSDictionary *bound = [rawBound isKindOfClass:[NSDictionary class]] ? rawBound : @{};
         NSInteger row = i / cols, col = i % cols;
         if (gridTop + row*(ch+gap) + ch > rect.origin.y + rect.size.height + 1) break;
-        UIView *card = [self makeCardTinted:(NSInteger)i accent:[RPTheme tintTeal]];
-        card.frame = CGRectMake(rect.origin.x + col*(cw+gap), gridTop + row*(ch+gap), cw, ch);
-        NSString *hex = bound[@"colorHex"] ?: slot[@"colorHex"] ?: @"888888FF";
-        UIView *swatch = [[UIView alloc] initWithFrame:CGRectMake(10, 12, 18, 18)];
-        swatch.backgroundColor = [self colorFromHex:hex];
-        swatch.layer.cornerRadius = 4;
-        [card addSubview:swatch];
+        id rawHex = [bound[@"colorHex"] isKindOfClass:[NSString class]] ? bound[@"colorHex"] : slot[@"colorHex"];
+        NSString *hex = [rawHex isKindOfClass:[NSString class]] && [(NSString *)rawHex length] >= 6 ? rawHex : @"888888FF";
+        UIColor *fill = [self colorFromHex:hex];
+        UIColor *ink = [self inkOnColor:fill];
+        UIView *card = [[UIView alloc] initWithFrame:CGRectMake(rect.origin.x + col*(cw+gap), gridTop + row*(ch+gap), cw, ch)];
+        card.backgroundColor = fill;
+        card.layer.cornerRadius = 14;
+        card.clipsToBounds = YES;
         double pct = [bound[@"remainingPercent"] doubleValue];
         if (pct == 0 && slot[@"remainPercent"]) pct = [slot[@"remainPercent"] doubleValue];
         if (pct < 0) pct = 0;
         NSInteger slotNo = slot[@"slot"] ? [slot[@"slot"] integerValue] + 1 : (NSInteger)i + 1;
-        UILabel *num = [self makeLabel:[RPTheme title:28] color:[RPTheme accent]];
+        UILabel *num = [self makeLabel:[RPTheme title:22] color:ink];
+        num.textAlignment = NSTextAlignmentCenter;
         num.text = [NSString stringWithFormat:@"%ld", (long)slotNo];
-        num.frame = CGRectMake(8, 4, 40, 30);
-        UILabel *name = [self makeLabel:[RPTheme small:16] color:[RPTheme text]];
+        num.frame = CGRectMake(4, 6, cw-8, 26);
+        UILabel *name = [self makeLabel:[RPTheme small:16] color:ink];
         NSString *nm = [NSString stringWithFormat:@"%@", bound[@"name"] ?: slot[@"type"] ?: @"空"];
         name.text = nm;
+        name.textAlignment = NSTextAlignmentCenter;
         name.adjustsFontSizeToFitWidth = YES;
         name.minimumScaleFactor = 0.7f;
         name.numberOfLines = 1;
-        name.frame = CGRectMake(48, 8, cw-56, 22);
-        UILabel *rp = [self makeLabel:[RPTheme title:40] color:(pct < 15 ? [RPTheme bad] : [RPTheme text])];
+        name.frame = CGRectMake(6, 32, cw-12, 20);
+        UILabel *rp = [self makeLabel:[RPTheme title:40] color:ink];
         rp.text = [NSString stringWithFormat:@"%.0f%%", pct];
         rp.textAlignment = NSTextAlignmentCenter;
         rp.adjustsFontSizeToFitWidth = YES;
         rp.minimumScaleFactor = 0.6f;
-        rp.frame = CGRectMake(6, 34, cw-12, 44);
-        UILabel *typ = [self makeLabel:[RPTheme small:14] color:[RPTheme textDim]];
+        rp.frame = CGRectMake(6, 52, cw-12, 44);
+        UILabel *typ = [self makeLabel:[RPTheme small:13] color:[ink colorWithAlphaComponent:0.75]];
         typ.textAlignment = NSTextAlignmentCenter;
         typ.text = [NSString stringWithFormat:@"AMS %@ · %@", slot[@"_ams"] ?: @"", bound[@"type"] ?: slot[@"type"] ?: @""];
         typ.frame = CGRectMake(4, ch-22, cw-8, 16);
@@ -1622,7 +1805,7 @@ static NSString *RPHashObject(id obj) {
     for (NSUInteger i=0;i<(NSUInteger)n;i++) {
         NSDictionary *item=items[i];
         NSInteger row=i/cols, col=i%cols;
-        UIView *card=[self makeCardTinted:(NSInteger)i accent:[RPTheme tintOrange]];
+        UIView *card=[self makeCard];
         card.frame=CGRectMake(m+col*(cw+gap), top+row*(ch+gap), cw, ch);
         UIImageView *iv=[[UIImageView alloc] initWithFrame:CGRectMake(0,0,cw,imgH)];
         iv.contentMode=UIViewContentModeScaleAspectFill; iv.clipsToBounds=YES;
@@ -2067,54 +2250,40 @@ static NSString *RPHashObject(id obj) {
 @property (nonatomic, assign) BOOL pausedForAuth;
 @end
 
-@implementation RPSchedulePageVC
-/** Strip HTML / QP leftovers that often show up as “乱码” in calendar notes. */
-- (NSString *)cleanCalText:(id)raw {
-    if (![raw isKindOfClass:[NSString class]]) return @"";
-    NSString *s = (NSString *)raw;
-    if ([s isEqualToString:@"(null)"]) return @"";
-    // Quoted-printable that leaked through (ICS or mail-sourced notes).
-    if ([s rangeOfString:@"="].location != NSNotFound) {
-        NSMutableData *bytes = [NSMutableData data];
-        const char *utf8 = [s UTF8String];
-        if (utf8) {
-            for (size_t i = 0; utf8[i]; ) {
-                if (utf8[i] == '=' && isxdigit((unsigned char)utf8[i+1]) && isxdigit((unsigned char)utf8[i+2])) {
-                    unsigned int b = 0;
-                    sscanf(utf8 + i + 1, "%02x", &b);
-                    unsigned char c = (unsigned char)b;
-                    [bytes appendBytes:&c length:1];
-                    i += 3;
-                } else if (utf8[i] == '=' && (utf8[i+1] == '\r' || utf8[i+1] == '\n')) {
-                    i += (utf8[i+1] == '\r' && utf8[i+2] == '\n') ? 3 : 2;
-                } else {
-                    [bytes appendBytes:utf8 + i length:1];
-                    i += 1;
-                }
-            }
-            NSString *decoded = [[NSString alloc] initWithData:bytes encoding:NSUTF8StringEncoding];
-            if (decoded.length) s = decoded;
+/** A calendar row is worth showing when the title is ordinary text. Symbol soup is skipped. */
+static BOOL RPCalendarTitleOK(NSString *s) {
+    if (s.length == 0) return NO;
+    NSUInteger han = 0, alnum = 0, weird = 0;
+    NSCharacterSet *space = [NSCharacterSet whitespaceAndNewlineCharacterSet];
+    for (NSUInteger i = 0; i < s.length; i++) {
+        unichar c = [s characterAtIndex:i];
+        if ((c >= 0x4E00 && c <= 0x9FFF) || (c >= 0x3400 && c <= 0x4DBF)) han++;
+        else if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) alnum++;
+        else if ([space characterIsMember:c] || c == '-' || c == '_' || c == '.' || c == ',' || c == ':' ||
+                 c == '/' || c == '(' || c == ')' || c == 0x00B7) {
+        } else {
+            weird++;
         }
     }
-    s = [s stringByReplacingOccurrencesOfString:@"&amp;" withString:@"&"];
-    s = [s stringByReplacingOccurrencesOfString:@"&lt;" withString:@"<" ];
-    s = [s stringByReplacingOccurrencesOfString:@"&gt;" withString:@">"];
-    s = [s stringByReplacingOccurrencesOfString:@"&nbsp;" withString:@" "];
-    s = [s stringByReplacingOccurrencesOfString:@"\\n" withString:@" "];
-    s = [s stringByReplacingOccurrencesOfString:@"\\," withString:@","];
-    NSRegularExpression *tags = [NSRegularExpression regularExpressionWithPattern:@"<[^>]+>" options:0 error:nil];
-    s = [tags stringByReplacingMatchesInString:s options:0 range:NSMakeRange(0, s.length) withTemplate:@" "];
-    NSRegularExpression *space = [NSRegularExpression regularExpressionWithPattern:@"[ \\t\\x0B\\f\\r\\n]+" options:0 error:nil];
-    s = [space stringByReplacingMatchesInString:s options:0 range:NSMakeRange(0, s.length) withTemplate:@" "];
-    return [s stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (han > 0 && weird * 2 <= s.length) return YES;
+    if (alnum >= 1 && weird == 0) return YES;
+    return NO;
+}
+
+@implementation RPSchedulePageVC
+- (NSString *)cleanCalText:(id)raw {
+    if (![raw isKindOfClass:[NSString class]]) return @"";
+    NSString *s = [(NSString *)raw stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if ([s isEqualToString:@"(null)"]) return @"";
+    return s;
 }
 - (NSString *)lineForItem:(NSDictionary *)item reminder:(BOOL)reminder {
     NSString *when = [self cleanCalText:reminder ? item[@"due"] : item[@"date"]];
     NSString *clock = [self cleanCalText:item[@"time"]];
     NSString *title = [self cleanCalText:item[@"title"]];
     NSString *notes = [self cleanCalText:item[@"notes"]];
-    if (title.length == 0) title = reminder ? @"未命名提醒" : @"未命名日程";
-    // Cap notes — Exchange/Outlook dumps huge HTML that looks like garbage on a kiosk card.
+    if (!RPCalendarTitleOK(title)) return @"";
+    if (!RPCalendarTitleOK(notes)) notes = @"";
     if (notes.length > 80) notes = [[notes substringToIndex:80] stringByAppendingString:@"…"];
     NSMutableString *text = [NSMutableString string];
     if (when.length || clock.length) [text appendFormat:@"%@%@%@\n", when, (when.length && clock.length) ? @" " : @"", clock];
@@ -2152,11 +2321,14 @@ static NSString *RPHashObject(id obj) {
     NSString *when = ev.startDate ? [dayFmt stringFromDate:ev.startDate] : @"";
     NSString *clock = ev.allDay ? @"全天" : (ev.startDate ? [timeFmt stringFromDate:ev.startDate] : @"");
     NSString *title = [self cleanCalText:ev.title];
+    if (!RPCalendarTitleOK(title)) return nil;
+    NSString *notes = [self cleanCalText:ev.notes];
+    if (!RPCalendarTitleOK(notes)) notes = @"";
     return @{
         @"title": title.length ? title : @"未命名日程",
         @"date": when ?: @"",
         @"time": clock ?: @"",
-        @"notes": [self cleanCalText:ev.notes],
+        @"notes": notes ?: @"",
         @"calendar": [self cleanCalText:ev.calendar.title],
         @"sort": @([ev.startDate timeIntervalSince1970]),
         @"id": ev.eventIdentifier ?: @"",
@@ -2173,6 +2345,7 @@ static NSString *RPHashObject(id obj) {
         due = [compCal dateFromComponents:rem.dueDateComponents];
     }
     NSString *title = [self cleanCalText:rem.title];
+    if (!RPCalendarTitleOK(title)) return nil;
     return @{
         @"title": title.length ? title : @"未命名提醒",
         @"due": due ? [dayFmt stringFromDate:due] : @"",
@@ -2211,7 +2384,9 @@ static NSString *RPHashObject(id obj) {
         NSPredicate *pred = [self.store predicateForEventsWithStartDate:start endDate:end calendars:nil];
         for (EKEvent *ev in [self.store eventsMatchingPredicate:pred]) {
             if (![ev isKindOfClass:[EKEvent class]]) continue;
-            [events addObject:[self eventRow:ev dayFmt:dayFmt timeFmt:timeFmt]];
+            if (ev.startDate && [ev.startDate compare:start] == NSOrderedAscending) continue;
+            NSDictionary *row = [self eventRow:ev dayFmt:dayFmt timeFmt:timeFmt];
+            if (row) [events addObject:row];
         }
         [events sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
             return [a[@"sort"] compare:b[@"sort"]];
@@ -2234,10 +2409,14 @@ static NSString *RPHashObject(id obj) {
                 if (!weakSelf) return;
                 NSMutableArray *rows = [NSMutableArray array];
                 for (EKReminder *rem in openItems) {
-                    if ([rem isKindOfClass:[EKReminder class]]) [rows addObject:[weakSelf reminderRow:rem dayFmt:dayFmt timeFmt:timeFmt]];
+                    if (![rem isKindOfClass:[EKReminder class]]) continue;
+                    NSDictionary *row = [weakSelf reminderRow:rem dayFmt:dayFmt timeFmt:timeFmt];
+                    if (row) [rows addObject:row];
                 }
                 for (EKReminder *rem in doneItems) {
-                    if ([rem isKindOfClass:[EKReminder class]]) [rows addObject:[weakSelf reminderRow:rem dayFmt:dayFmt timeFmt:timeFmt]];
+                    if (![rem isKindOfClass:[EKReminder class]]) continue;
+                    NSDictionary *row = [weakSelf reminderRow:rem dayFmt:dayFmt timeFmt:timeFmt];
+                    if (row) [rows addObject:row];
                 }
                 [rows sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
                     BOOL ad = [a[@"completed"] boolValue];
@@ -2290,7 +2469,7 @@ static NSString *RPHashObject(id obj) {
         if ([date hasPrefix:todayMark]) [deviceToday addObject:item];
         else [deviceLater addObject:item];
     }
-    NSString *fp = [NSString stringWithFormat:@"sched3|%@|%@|%@|%@|%@|%@|%@|%d|%d",
+    NSString *fp = [NSString stringWithFormat:@"sched4|%@|%@|%@|%@|%@|%@|%@|%d|%d",
                     RPHashObject(deviceToday), RPHashObject(deviceLater), RPHashObject(self.deviceReminders),
                     RPHashObject(feedToday), RPHashObject(feedWeek), err, self.deviceNote ?: @"",
                     self.allowEvent, self.allowReminder];
@@ -2319,66 +2498,91 @@ static NSString *RPHashObject(id obj) {
         [scroll addSubview:bad];
         y += 42;
     }
-    y = [self addSection:@"今天" items:deviceToday reminder:NO y:y width:w margin:m scroll:scroll];
-    y = [self addSection:@"接下来" items:deviceLater reminder:NO y:y width:w margin:m scroll:scroll];
-    y = [self addReminderSection:self.deviceReminders y:y width:w margin:m scroll:scroll];
     NSMutableArray *subscribed = [NSMutableArray array];
-    [subscribed addObjectsFromArray:feedToday];
     for (id item in feedWeek) {
-        if ([item isKindOfClass:[NSDictionary class]]) [subscribed addObject:item];
+        if ([item isKindOfClass:[NSDictionary class]] && RPCalendarTitleOK([self cleanCalText:((NSDictionary *)item)[@"title"]])) [subscribed addObject:item];
     }
     for (id item in feedReminders) {
-        if ([item isKindOfClass:[NSDictionary class]]) [subscribed addObject:item];
+        if ([item isKindOfClass:[NSDictionary class]] && RPCalendarTitleOK([self cleanCalText:((NSDictionary *)item)[@"title"]])) [subscribed addObject:item];
     }
-    y = [self addSection:@"订阅" items:subscribed reminder:NO y:y width:w margin:m scroll:scroll];
+    NSMutableArray *feedTodayOK = [NSMutableArray array];
+    for (id item in feedToday) {
+        if ([item isKindOfClass:[NSDictionary class]] && RPCalendarTitleOK([self cleanCalText:((NSDictionary *)item)[@"title"]])) [feedTodayOK addObject:item];
+    }
+    [subscribed addObjectsFromArray:feedTodayOK];
+    NSInteger cols = [self isLandscape] ? 2 : 1;
+    y = [self addSection:@"今天" items:deviceToday reminder:NO y:y width:w margin:m scroll:scroll columns:cols];
+    y = [self addSection:@"接下来" items:deviceLater reminder:NO y:y width:w margin:m scroll:scroll columns:cols];
+    y = [self addReminderSection:self.deviceReminders y:y width:w margin:m scroll:scroll columns:cols];
+    y = [self addSection:@"订阅" items:subscribed reminder:NO y:y width:w margin:m scroll:scroll columns:cols];
     if (deviceToday.count == 0 && deviceLater.count == 0 && self.deviceReminders.count == 0 && subscribed.count == 0) {
-        UILabel *empty = [self makeLabel:[RPTheme readable:22] color:[RPTheme textDim]];
-        empty.numberOfLines = 4;
-        empty.text = self.calendarStarted && self.askedEvent
-            ? @"系统日历和提醒事项里，这几天还是空的。若刚弹出授权，允许之后会自动出现。"
-            : @"正在读取这台 iPad 的日历和提醒事项。";
-        empty.frame = CGRectMake(m, y, w, 110);
+        UILabel *empty = [self makeLabel:[RPTheme title:48] color:[RPTheme textDim]];
+        empty.textAlignment = NSTextAlignmentCenter;
+        empty.text = (self.calendarStarted && self.askedEvent) ? @"无" : @"正在读取";
+        empty.frame = CGRectMake(m, y, w, 72);
         [scroll addSubview:empty];
-        y += 120;
+        y += 80;
     }
     scroll.contentSize = CGSizeMake(b.size.width, y + 20);
+    if (self.view.window && self.askedEvent && self.askedReminder && ![self rpIntroHasPlayed]) {
+        [self rpReplayIntro];
+    }
 }
-- (CGFloat)addSection:(NSString *)name items:(NSArray *)items reminder:(BOOL)reminder y:(CGFloat)y width:(CGFloat)w margin:(CGFloat)m scroll:(UIScrollView *)scroll {
+- (void)pageWillAppear {
+    if ([self rpIntroHasPlayed]) return;
+    if (self.askedEvent && self.askedReminder) {
+        [self rpReplayIntro];
+        return;
+    }
+    self.contentView.alpha = 0;
+}
+- (CGFloat)addSection:(NSString *)name items:(NSArray *)items reminder:(BOOL)reminder y:(CGFloat)y width:(CGFloat)w margin:(CGFloat)m scroll:(UIScrollView *)scroll columns:(NSInteger)cols {
     if (items.count == 0) return y;
-    UILabel *head = [self makeLabel:[RPTheme title:22] color:reminder ? [RPTheme tintOrange] : [RPTheme accent]];
+    if (cols < 1) cols = 1;
+    UILabel *head = [self makeLabel:[RPTheme title:22] color:[RPTheme accent]];
     head.text = name;
     head.frame = CGRectMake(m, y, w, 28);
     [scroll addSubview:head];
     y += 34;
+    CGFloat gap = 10;
+    CGFloat cw = (w - gap * (cols - 1)) / cols;
+    CGFloat ch = 90;
     NSInteger shown = 0;
     for (id raw in items) {
         if (![raw isKindOfClass:[NSDictionary class]] || shown >= 8) break;
-        UIView *card = [self makeCardTinted:shown accent:reminder ? [RPTheme tintOrange] : [RPTheme tintTeal]];
-        card.frame = CGRectMake(m, y, w, 90);
-        // Pixel fonts miss many CJK glyphs used in calendar titles → looks like 乱码/tofu.
+        NSInteger col = shown % cols;
+        NSInteger row = shown / cols;
+        UIView *card = [self makeCard];
+        card.frame = CGRectMake(m + col * (cw + gap), y + row * (ch + gap), cw, ch);
         UILabel *lab = [self makeLabel:[RPTheme readable:17] color:[RPTheme text]];
         lab.text = [self lineForItem:raw reminder:reminder];
-        lab.frame = CGRectMake(16, 8, w - 28, 74);
+        lab.frame = CGRectMake(14, 8, cw - 28, ch - 16);
         [card addSubview:lab];
         [scroll addSubview:card];
-        y += 100;
         shown++;
     }
-    return y + 8;
+    NSInteger rows = (shown + cols - 1) / cols;
+    return y + rows * (ch + gap) + 8;
 }
-- (CGFloat)addReminderSection:(NSArray *)items y:(CGFloat)y width:(CGFloat)w margin:(CGFloat)m scroll:(UIScrollView *)scroll {
+- (CGFloat)addReminderSection:(NSArray *)items y:(CGFloat)y width:(CGFloat)w margin:(CGFloat)m scroll:(UIScrollView *)scroll columns:(NSInteger)cols {
     if (items.count == 0) return y;
-    UILabel *head = [self makeLabel:[RPTheme title:22] color:[RPTheme tintOrange]];
+    if (cols < 1) cols = 1;
+    UILabel *head = [self makeLabel:[RPTheme title:22] color:[RPTheme accent]];
     head.text = @"提醒事项";
     head.frame = CGRectMake(m, y, w, 28);
     [scroll addSubview:head];
     y += 34;
+    CGFloat gap = 10;
+    CGFloat cw = (w - gap * (cols - 1)) / cols;
+    CGFloat ch = 86;
     NSInteger shown = 0;
     for (NSDictionary *raw in items) {
         if (![raw isKindOfClass:[NSDictionary class]] || shown >= 12) break;
         BOOL done = [raw[@"completed"] boolValue];
-        UIView *card = [self makeCardTinted:shown accent:[RPTheme tintOrange]];
-        card.frame = CGRectMake(m, y, w, 86);
+        NSInteger col = shown % cols;
+        NSInteger row = shown / cols;
+        UIView *card = [self makeCard];
+        card.frame = CGRectMake(m + col * (cw + gap), y + row * (ch + gap), cw, ch);
         UIButton *check = [UIButton buttonWithType:UIButtonTypeSystem];
         check.frame = CGRectMake(8, 12, 52, 48);
         check.titleLabel.font = [RPTheme readable:28];
@@ -2389,13 +2593,13 @@ static NSString *RPHashObject(id obj) {
         [card addSubview:check];
         UILabel *lab = [self makeLabel:[RPTheme readable:17] color:done ? [RPTheme textDim] : [RPTheme text]];
         lab.text = [self lineForItem:raw reminder:YES];
-        lab.frame = CGRectMake(64, 8, w - 80, 70);
+        lab.frame = CGRectMake(64, 8, cw - 78, ch - 16);
         [card addSubview:lab];
         [scroll addSubview:card];
-        y += 96;
         shown++;
     }
-    return y + 8;
+    NSInteger rows = (shown + cols - 1) / cols;
+    return y + rows * (ch + gap) + 8;
 }
 @end
 
@@ -2661,6 +2865,270 @@ static UIColor *RPMoveColor(double percent) {
 }
 @end
 
+#pragma mark - Video
+
+static NSString *RPLastVideoKey = @"";
+
+static BOOL RPVideoExtensionOK(NSString *ext) {
+    ext = ext.lowercaseString ?: @"";
+    return [ext isEqualToString:@"mp4"] || [ext isEqualToString:@"mov"] || [ext isEqualToString:@"m4v"];
+}
+
+static id RPVideoPick(NSArray *items, NSString *identity) {
+    if (items.count == 0) return nil;
+    uint32_t n = (uint32_t)items.count;
+    uint32_t i = arc4random_uniform(n);
+    if (items.count > 1 && identity.length) {
+        id first = items[i];
+        NSString *mark = [first isKindOfClass:[PHAsset class]] ? ((PHAsset *)first).localIdentifier : [first description];
+        if ([mark isEqualToString:identity]) i = (i + 1) % n;
+    }
+    return items[i];
+}
+
+static NSArray *RPVideoLinksInPage(NSData *data, NSString *pageURL) {
+    NSString *html = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+    if (html.length == 0) html = [[NSString alloc] initWithData:data encoding:NSISOLatin1StringEncoding];
+    if (html.length == 0) return @[];
+    NSURL *base = [NSURL URLWithString:pageURL];
+    NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:@"href\\s*=\\s*['\\\"]([^'\\\"]+)['\\\"]" options:NSRegularExpressionCaseInsensitive error:nil];
+    NSMutableArray *urls = [NSMutableArray array];
+    NSMutableSet *seen = [NSMutableSet set];
+    for (NSTextCheckingResult *m in [re matchesInString:html options:0 range:NSMakeRange(0, html.length)]) {
+        if (m.numberOfRanges < 2) continue;
+        NSString *href = [html substringWithRange:[m rangeAtIndex:1]];
+        if ([href hasPrefix:@"#"] || [href hasPrefix:@"javascript:"]) continue;
+        NSURL *url = [NSURL URLWithString:href relativeToURL:base];
+        if (!url.scheme.length) continue;
+        if (!RPVideoExtensionOK(url.pathExtension)) continue;
+        NSString *abs = url.absoluteString;
+        if (abs.length == 0 || [seen containsObject:abs]) continue;
+        [seen addObject:abs];
+        [urls addObject:abs];
+        if (urls.count >= 40) break;
+    }
+    return urls;
+}
+
+@interface RPVideoPageVC ()
+@property (nonatomic, strong) RPPhotoSource *photos;
+@property (nonatomic, strong) AVPlayer *player;
+@property (nonatomic, strong) AVPlayerLayer *playerLayer;
+@property (nonatomic, strong) UILabel *statusLabel;
+@property (nonatomic, strong) NSTimer *watchTimer;
+@property (nonatomic, strong) NSTimer *capTimer;
+@property (nonatomic, assign) NSInteger playToken;
+@property (nonatomic, assign) PHImageRequestID videoRequest;
+@property (nonatomic, assign) BOOL advancing;
+@end
+
+@implementation RPVideoPageVC
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.view.backgroundColor = [UIColor blackColor];
+    self.contentView.backgroundColor = [UIColor blackColor];
+    self.statusLabel = [self makeLabel:[RPTheme readable:22] color:[UIColor colorWithWhite:0.9 alpha:1]];
+    self.statusLabel.textAlignment = NSTextAlignmentCenter;
+    self.statusLabel.numberOfLines = 0;
+    self.statusLabel.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    [self.contentView addSubview:self.statusLabel];
+}
+- (void)setPhotoSource:(id)photoSource slot:(NSInteger)slot {
+    (void)slot;
+    if ([photoSource isKindOfClass:[RPPhotoSource class]]) self.photos = photoSource;
+}
+- (void)viewDidLayoutSubviews {
+    [super viewDidLayoutSubviews];
+    self.playerLayer.frame = self.contentView.bounds;
+    self.statusLabel.frame = UIEdgeInsetsInsetRect(self.contentView.bounds, UIEdgeInsetsMake(48, 36, 48, 36));
+}
+- (void)parkMotionOffscreen {}
+- (void)playPageIntro {}
+- (void)playPageOutro:(void (^)(void))done {
+    [self stopPlayback];
+    if (done) done();
+}
+- (void)pageWillAppear {
+    self.advancing = NO;
+    self.playToken += 1;
+    [self stopPlayback];
+    [self showStatus:@"正在准备视频…"];
+    NSInteger token = self.playToken;
+    NSDictionary *cfg = RPVideoSettings();
+    NSString *source = cfg[@"source"] ?: @"album";
+    if ([source isEqualToString:@"files"]) {
+        [self playPickedFile:token];
+    } else if ([source isEqualToString:@"http"]) {
+        NSString *page = cfg[@"http"] ?: @"";
+        dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+            NSString *picked = [self pickHTTPVideo:page];
+            dispatch_async(dispatch_get_main_queue(), ^{
+                if (token != self.playToken) return;
+                if (picked.length == 0) {
+                    [self showStatus:page.length ? @"这个地址里没有 mp4、mov 或 m4v。" : @"还没有填写网络目录。\n用浏览器打开设置页填写 http 地址。"];
+                    return;
+                }
+                RPLastVideoKey = picked;
+                [self startPlayer:[AVPlayerItem playerItemWithURL:[NSURL URLWithString:picked]] name:picked];
+            });
+        });
+    } else {
+        [self playPickedAlbum:token album:cfg[@"album"] ?: @"" fallback:cfg[@"photo_album"] ?: @""];
+    }
+}
+- (void)pageDidDisappear {
+    self.playToken += 1;
+    [self stopPlayback];
+    [[NSNotificationCenter defaultCenter] postNotificationName:@"RPVideoHold" object:nil userInfo:@{ @"hold": @NO }];
+    [super pageDidDisappear];
+}
+- (void)applyState:(NSDictionary *)state baseURL:(NSString *)baseURL {
+    (void)state; (void)baseURL;
+}
+- (void)showStatus:(NSString *)text {
+    self.statusLabel.hidden = NO;
+    self.statusLabel.text = text;
+}
+- (void)playPickedFile:(NSInteger)token {
+    (void)token;
+    NSArray *files = RPVideoLocalFiles();
+    NSString *path = RPVideoPick(files, RPLastVideoKey);
+    if (path.length == 0) {
+        [self showStatus:@"还没有上传视频。\n用浏览器打开设置页，来源选「上传到这台 iPad」。"];
+        return;
+    }
+    RPLastVideoKey = path;
+    [self startPlayer:[AVPlayerItem playerItemWithURL:[NSURL fileURLWithPath:path]] name:path.lastPathComponent];
+}
+- (void)playPickedAlbum:(NSInteger)token album:(NSString *)album fallback:(NSString *)fallback {
+    if (!self.photos) self.photos = [[RPPhotoSource alloc] init];
+    [self.photos ensureAuthorization:^(BOOL granted) {
+        if (token != self.playToken) return;
+        if (!granted) {
+            [self showStatus:@"还没有允许访问照片，读不到相册里的视频。"];
+            return;
+        }
+        NSString *look = album.length ? album : fallback;
+        NSArray *assets = [self.photos videoAssetsInAlbumId:(look.length ? look : nil) limit:80];
+        if (assets.count == 0 && album.length == 0) assets = [self.photos videoAssetsInAlbumId:nil limit:80];
+        PHAsset *asset = RPVideoPick(assets, RPLastVideoKey);
+        if (!asset) {
+            [self showStatus:@"这个相册里没有视频。"];
+            return;
+        }
+        RPLastVideoKey = asset.localIdentifier;
+        PHVideoRequestOptions *opt = [[PHVideoRequestOptions alloc] init];
+        opt.networkAccessAllowed = YES;
+        opt.deliveryMode = PHVideoRequestOptionsDeliveryModeAutomatic;
+        self.videoRequest = [[PHImageManager defaultManager] requestAVAssetForVideo:asset options:opt resultHandler:^(AVAsset *av, AVAudioMix *mix, NSDictionary *info) {
+            (void)mix; (void)info;
+            dispatch_async(dispatch_get_main_queue(), ^{
+                if (token != self.playToken) return;
+                if (!av) {
+                    [self showStatus:@"这条视频打不开。"];
+                    return;
+                }
+                [self startPlayer:[AVPlayerItem playerItemWithAsset:av] name:asset.localIdentifier];
+            });
+        }];
+    }];
+}
+- (NSString *)pickHTTPVideo:(NSString *)page {
+    NSString *raw = [page stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (raw.length == 0) return @"";
+    if (![raw hasPrefix:@"http://"] && ![raw hasPrefix:@"https://"]) raw = [@"http://" stringByAppendingString:raw];
+    NSURL *url = [NSURL URLWithString:raw];
+    if (!url) return @"";
+    if (RPVideoExtensionOK(url.pathExtension)) return url.absoluteString;
+    NSError *err = nil;
+    NSData *data = [RPNet syncGET:url.absoluteString proxy:nil headers:nil timeout:12 error:&err];
+    (void)err;
+    NSArray *links = RPVideoLinksInPage(data, url.absoluteString);
+    return RPVideoPick(links, RPLastVideoKey) ?: @"";
+}
+- (void)startPlayer:(AVPlayerItem *)item name:(NSString *)name {
+    (void)name;
+    if (!item) {
+        [self showStatus:@"这条视频打不开。"];
+        return;
+    }
+    [self stopPlayback];
+    NSError *audioErr = nil;
+    [[AVAudioSession sharedInstance] setCategory:AVAudioSessionCategoryPlayback error:&audioErr];
+    [[AVAudioSession sharedInstance] setActive:YES error:&audioErr];
+    (void)audioErr;
+    self.player = [AVPlayer playerWithPlayerItem:item];
+    self.player.actionAtItemEnd = AVPlayerActionAtItemEndPause;
+    self.playerLayer = [AVPlayerLayer playerLayerWithPlayer:self.player];
+    self.playerLayer.videoGravity = AVLayerVideoGravityResizeAspect;
+    self.playerLayer.frame = self.contentView.bounds;
+    self.playerLayer.backgroundColor = [UIColor blackColor].CGColor;
+    [self.contentView.layer insertSublayer:self.playerLayer atIndex:0];
+    [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(onVideoEnded:) name:AVPlayerItemDidPlayToEndTimeNotification object:item];
+    [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(onVideoFailed:) name:AVPlayerItemFailedToPlayToEndTimeNotification object:item];
+    self.watchTimer = [NSTimer scheduledTimerWithTimeInterval:0.5 target:self selector:@selector(watchReady) userInfo:nil repeats:YES];
+    NSInteger mins = [RPVideoSettings()[@"max"] integerValue];
+    if (mins > 0) {
+        self.capTimer = [NSTimer scheduledTimerWithTimeInterval:(NSTimeInterval)mins * 60.0 target:self selector:@selector(onCap) userInfo:nil repeats:NO];
+    }
+    [self.player play];
+}
+- (void)watchReady {
+    AVPlayerItem *item = self.player.currentItem;
+    if (!item) return;
+    if (item.status == AVPlayerItemStatusReadyToPlay) {
+        [self.watchTimer invalidate];
+        self.watchTimer = nil;
+        self.statusLabel.hidden = YES;
+        [[NSNotificationCenter defaultCenter] postNotificationName:@"RPVideoHold" object:nil userInfo:@{ @"hold": @YES }];
+        if (self.player.rate < 0.1) [self.player play];
+        return;
+    }
+    if (item.status == AVPlayerItemStatusFailed) {
+        [self.watchTimer invalidate];
+        self.watchTimer = nil;
+        [self showStatus:@"这条视频播不了。请换 H.264 的 mp4。"];
+        [self stopPlayback];
+    }
+}
+- (void)onCap {
+    [self finishAndAdvance];
+}
+- (void)onVideoEnded:(NSNotification *)note {
+    (void)note;
+    [self finishAndAdvance];
+}
+- (void)onVideoFailed:(NSNotification *)note {
+    (void)note;
+    [self showStatus:@"播放中断了。"];
+    [self stopPlayback];
+}
+- (void)finishAndAdvance {
+    if (self.advancing) return;
+    self.advancing = YES;
+    [self stopPlayback];
+    [[NSNotificationCenter defaultCenter] postNotificationName:@"RPVideoHold" object:nil userInfo:@{ @"hold": @NO }];
+    [[NSNotificationCenter defaultCenter] postNotificationName:@"RPVideoAdvance" object:nil];
+}
+- (void)stopPlayback {
+    [self.watchTimer invalidate];
+    self.watchTimer = nil;
+    [self.capTimer invalidate];
+    self.capTimer = nil;
+    if (self.videoRequest) {
+        [[PHImageManager defaultManager] cancelImageRequest:self.videoRequest];
+        self.videoRequest = 0;
+    }
+    [[NSNotificationCenter defaultCenter] removeObserver:self name:AVPlayerItemDidPlayToEndTimeNotification object:nil];
+    [[NSNotificationCenter defaultCenter] removeObserver:self name:AVPlayerItemFailedToPlayToEndTimeNotification object:nil];
+    [self.player pause];
+    self.player = nil;
+    [self.playerLayer removeFromSuperlayer];
+    self.playerLayer = nil;
+    [[AVAudioSession sharedInstance] setActive:NO withOptions:AVAudioSessionSetActiveOptionNotifyOthersOnDeactivation error:nil];
+}
+@end
+
 #pragma mark - Factory
 
 @implementation RPPageFactory
@@ -2693,6 +3161,7 @@ static UIColor *RPMoveColor(double percent) {
     else if ([pid isEqualToString:@"gamer520-pc-latest"]) { RPGameListPageVC *g=[[RPGameListPageVC alloc] init]; g.kind=@"pc"; vc=g; }
     else if ([pid isEqualToString:@"gamer520-switch-latest"]) { RPGameListPageVC *g=[[RPGameListPageVC alloc] init]; g.kind=@"switch"; vc=g; }
     else if ([pid isEqualToString:@"ps5-games-latest"]) { RPGameListPageVC *g=[[RPGameListPageVC alloc] init]; g.kind=@"ps5"; vc=g; }
+    else if ([pid isEqualToString:@"local-video"]) vc = [[RPVideoPageVC alloc] init];
     else if ([pid hasPrefix:@"person-photo-local"] || [pid rangeOfString:@"person-photo"].location != NSNotFound) {
         RPPhotoPageVC *p=[[RPPhotoPageVC alloc] init];
         p.slot = ([pid rangeOfString:@"landscape"].location != NSNotFound) || [pid hasSuffix:@"-2"] ? 1 : 0;

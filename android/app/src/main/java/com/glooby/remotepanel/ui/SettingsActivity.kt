@@ -20,6 +20,13 @@ class SettingsActivity : AppCompatActivity() {
     private lateinit var dwellGlobal: EditText
     private lateinit var weatherCity: EditText
     private lateinit var newsRss: EditText
+    private lateinit var proxyField: EditText
+    private lateinit var helloKey: EditText
+    private lateinit var vpsToken: EditText
+    private lateinit var photoDir: EditText
+    private lateinit var videoSmb: EditText
+    private lateinit var shareUser: EditText
+    private lateinit var sharePass: EditText
     private val pageRows = mutableListOf<PageRow>()
     private val webRows = mutableListOf<WebRow>()
     private lateinit var webHost: LinearLayout
@@ -58,6 +65,39 @@ class SettingsActivity : AppCompatActivity() {
         section(getString(R.string.news_rss))
         newsRss = edit(Prefs.sourceUrl("daily-news"))
         container.addView(newsRss)
+
+        section("代理")
+        proxyField = edit(Prefs.proxy())
+        proxyField.hint = "socks5://地址:端口"
+        container.addView(proxyField)
+
+        section("问候密钥（可留空）")
+        helloKey = edit(Prefs.helloKey())
+        helloKey.hint = "不填就用本地问候"
+        container.addView(helloKey)
+
+        section("VPS 令牌（可留空）")
+        vpsToken = edit(Prefs.vpsToken())
+        container.addView(vpsToken)
+
+        section("照片目录")
+        photoDir = edit(Prefs.photoDir())
+        photoDir.hint = "smb://主机/共享/照片 或 http://地址/photos/"
+        container.addView(photoDir)
+
+        section("视频 SMB 文件夹")
+        videoSmb = edit(Prefs.videoSmb())
+        videoSmb.hint = "smb://主机/共享/视频"
+        container.addView(videoSmb)
+
+        section("共享账号 / 密码")
+        shareUser = edit(Prefs.shareUser())
+        shareUser.hint = "用户名，访客可留空"
+        container.addView(shareUser)
+        sharePass = edit(Prefs.sharePass())
+        sharePass.hint = "密码"
+        sharePass.inputType = android.text.InputType.TYPE_CLASS_TEXT or android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD
+        container.addView(sharePass)
 
         section(getString(R.string.pages_section))
         val inflater = LayoutInflater.from(this)
@@ -181,6 +221,13 @@ class SettingsActivity : AppCompatActivity() {
         Prefs.setDwellOverride(dwellGlobal.text?.toString()?.toIntOrNull() ?: 0)
         Prefs.setSourceUrl("weather", weatherCity.text?.toString().orEmpty())
         Prefs.setSourceUrl("daily-news", newsRss.text?.toString().orEmpty())
+        Prefs.setProxy(proxyField.text?.toString().orEmpty())
+        Prefs.setHelloKey(helloKey.text?.toString().orEmpty())
+        Prefs.setVpsToken(vpsToken.text?.toString().orEmpty())
+        Prefs.setPhotoDir(photoDir.text?.toString().orEmpty())
+        Prefs.setVideoSmb(videoSmb.text?.toString().orEmpty())
+        Prefs.setShareUser(shareUser.text?.toString().orEmpty())
+        Prefs.setSharePass(sharePass.text?.toString().orEmpty())
         for (row in pageRows) {
             Prefs.setPageEnabled(row.id, row.enabled.isChecked)
             Prefs.setPageDwell(row.id, row.dwell.text?.toString()?.toIntOrNull() ?: 0)

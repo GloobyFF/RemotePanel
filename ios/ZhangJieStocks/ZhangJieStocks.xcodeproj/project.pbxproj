@@ -1,0 +1,321 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 51;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		A1BF01000000000000000001 /* main.m in Sources */ = {isa = PBXBuildFile; fileRef = A10100000000000000000001 /* main.m */; };
+		A1BF01000000000000000002 /* AppDelegate.m in Sources */ = {isa = PBXBuildFile; fileRef = A10100000000000000000002 /* AppDelegate.m */; };
+		A1BF01000000000000000003 /* ZJStore.m in Sources */ = {isa = PBXBuildFile; fileRef = A10100000000000000000003 /* ZJStore.m */; };
+		A1BF01000000000000000004 /* ZJQuote.m in Sources */ = {isa = PBXBuildFile; fileRef = A10100000000000000000004 /* ZJQuote.m */; };
+		A1BF01000000000000000005 /* ZJRootVC.m in Sources */ = {isa = PBXBuildFile; fileRef = A10100000000000000000005 /* ZJRootVC.m */; };
+		A1BF01000000000000000006 /* ZJSettingsVC.m in Sources */ = {isa = PBXBuildFile; fileRef = A10100000000000000000006 /* ZJSettingsVC.m */; };
+		A1BF01000000000000000021 /* LaunchScreen.storyboard in Resources */ = {isa = PBXBuildFile; fileRef = A10100000000000000000021 /* LaunchScreen.storyboard */; };
+		A1BF01000000000000000040 /* Images.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = A10100000000000000000040 /* Images.xcassets */; };
+		F1BF01000000000000000001 /* UIKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = F10100000000000000000001 /* UIKit.framework */; };
+		F1BF01000000000000000002 /* Foundation.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = F10100000000000000000002 /* Foundation.framework */; };
+		F1BF01000000000000000003 /* CoreGraphics.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = F10100000000000000000003 /* CoreGraphics.framework */; };
+		F1BF01000000000000000004 /* QuartzCore.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = F10100000000000000000004 /* QuartzCore.framework */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXFileReference section */
+		A10100000000000000000001 /* main.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = main.m; sourceTree = "<group>"; };
+		A10100000000000000000002 /* AppDelegate.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = AppDelegate.m; sourceTree = "<group>"; };
+		A10100000000000000000003 /* ZJStore.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = ZJStore.m; sourceTree = "<group>"; };
+		A10100000000000000000004 /* ZJQuote.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = ZJQuote.m; sourceTree = "<group>"; };
+		A10100000000000000000005 /* ZJRootVC.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = ZJRootVC.m; sourceTree = "<group>"; };
+		A10100000000000000000006 /* ZJSettingsVC.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = ZJSettingsVC.m; sourceTree = "<group>"; };
+		A10100000000000000000012 /* AppDelegate.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = AppDelegate.h; sourceTree = "<group>"; };
+		A10100000000000000000013 /* ZJStore.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = ZJStore.h; sourceTree = "<group>"; };
+		A10100000000000000000014 /* ZJQuote.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = ZJQuote.h; sourceTree = "<group>"; };
+		A10100000000000000000015 /* ZJRootVC.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = ZJRootVC.h; sourceTree = "<group>"; };
+		A10100000000000000000016 /* ZJSettingsVC.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = ZJSettingsVC.h; sourceTree = "<group>"; };
+		A10100000000000000000017 /* ZJTheme.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = ZJTheme.h; sourceTree = "<group>"; };
+		A10100000000000000000020 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		A10100000000000000000021 /* LaunchScreen.storyboard */ = {isa = PBXFileReference; lastKnownFileType = file.storyboard; path = LaunchScreen.storyboard; sourceTree = "<group>"; };
+		A10100000000000000000040 /* Images.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Images.xcassets; sourceTree = "<group>"; };
+		A15000000000000000000001 /* ZhangJieStocks.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = ZhangJieStocks.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		F10100000000000000000001 /* UIKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = UIKit.framework; path = System/Library/Frameworks/UIKit.framework; sourceTree = SDKROOT; };
+		F10100000000000000000002 /* Foundation.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Foundation.framework; path = System/Library/Frameworks/Foundation.framework; sourceTree = SDKROOT; };
+		F10100000000000000000003 /* CoreGraphics.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = CoreGraphics.framework; path = System/Library/Frameworks/CoreGraphics.framework; sourceTree = SDKROOT; };
+		F10100000000000000000004 /* QuartzCore.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = QuartzCore.framework; path = System/Library/Frameworks/QuartzCore.framework; sourceTree = SDKROOT; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		A10000000000000000000004 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				F1BF01000000000000000001 /* UIKit.framework in Frameworks */,
+				F1BF01000000000000000002 /* Foundation.framework in Frameworks */,
+				F1BF01000000000000000003 /* CoreGraphics.framework in Frameworks */,
+				F1BF01000000000000000004 /* QuartzCore.framework in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		A10000000000000000000010 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				A15000000000000000000001 /* ZhangJieStocks.app */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		A10000000000000000000013 /* Frameworks */ = {
+			isa = PBXGroup;
+			children = (
+				F10100000000000000000001 /* UIKit.framework */,
+				F10100000000000000000002 /* Foundation.framework */,
+				F10100000000000000000003 /* CoreGraphics.framework */,
+				F10100000000000000000004 /* QuartzCore.framework */,
+			);
+			name = Frameworks;
+			sourceTree = "<group>";
+		};
+		A10000000000000000000012 /* ZhangJieStocks */ = {
+			isa = PBXGroup;
+			children = (
+				A10100000000000000000001 /* main.m */,
+				A10100000000000000000002 /* AppDelegate.m */,
+				A10100000000000000000012 /* AppDelegate.h */,
+				A10100000000000000000003 /* ZJStore.m */,
+				A10100000000000000000013 /* ZJStore.h */,
+				A10100000000000000000004 /* ZJQuote.m */,
+				A10100000000000000000014 /* ZJQuote.h */,
+				A10100000000000000000005 /* ZJRootVC.m */,
+				A10100000000000000000015 /* ZJRootVC.h */,
+				A10100000000000000000006 /* ZJSettingsVC.m */,
+				A10100000000000000000016 /* ZJSettingsVC.h */,
+				A10100000000000000000017 /* ZJTheme.h */,
+				A10100000000000000000020 /* Info.plist */,
+				A10100000000000000000021 /* LaunchScreen.storyboard */,
+				A10100000000000000000040 /* Images.xcassets */,
+			);
+			path = ZhangJieStocks;
+			sourceTree = "<group>";
+		};
+		A10000000000000000000011 /* Root */ = {
+			isa = PBXGroup;
+			children = (
+				A10000000000000000000012 /* ZhangJieStocks */,
+				A10000000000000000000013 /* Frameworks */,
+				A10000000000000000000010 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		A10000000000000000000002 /* ZhangJieStocks */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = A10000000000000000000025 /* Build configuration list for PBXNativeTarget "ZhangJieStocks" */;
+			buildPhases = (
+				A10000000000000000000003 /* Sources */,
+				A10000000000000000000004 /* Frameworks */,
+				A10000000000000000000005 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = ZhangJieStocks;
+			productName = ZhangJieStocks;
+			productReference = A15000000000000000000001 /* ZhangJieStocks.app */;
+			productType = "com.apple.product-type.application";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		A10000000000000000000001 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				LastUpgradeCheck = 1010;
+				TargetAttributes = {
+					A10000000000000000000002 = {
+						CreatedOnToolsVersion = 10.1;
+						DevelopmentTeam = FLFYQXCCZM;
+						ProvisioningStyle = Manual;
+					};
+				};
+			};
+			buildConfigurationList = A10000000000000000000024 /* Build configuration list for PBXProject "ZhangJieStocks" */;
+			compatibilityVersion = "Xcode 9.3";
+			developmentRegion = zh_Hans;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				en,
+				Base,
+				"zh-Hans",
+			);
+			mainGroup = A10000000000000000000011 /* Root */;
+			productRefGroup = A10000000000000000000010 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				A10000000000000000000002 /* ZhangJieStocks */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		A10000000000000000000005 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A1BF01000000000000000021 /* LaunchScreen.storyboard in Resources */,
+				A1BF01000000000000000040 /* Images.xcassets in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		A10000000000000000000003 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A1BF01000000000000000001 /* main.m in Sources */,
+				A1BF01000000000000000002 /* AppDelegate.m in Sources */,
+				A1BF01000000000000000003 /* ZJStore.m in Sources */,
+				A1BF01000000000000000004 /* ZJQuote.m in Sources */,
+				A1BF01000000000000000005 /* ZJRootVC.m in Sources */,
+				A1BF01000000000000000006 /* ZJSettingsVC.m in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin XCBuildConfiguration section */
+		A10000000000000000000020 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN_UNUSED_VARIABLE = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"DEBUG=1",
+					"$(inherited)",
+				);
+				IPHONEOS_DEPLOYMENT_TARGET = 9.3;
+				ONLY_ACTIVE_ARCH = NO;
+				SDKROOT = iphoneos;
+			};
+			name = Debug;
+		};
+		A10000000000000000000021 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN_UNUSED_VARIABLE = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_NO_COMMON_BLOCKS = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 9.3;
+				SDKROOT = iphoneos;
+				VALIDATE_PRODUCT = YES;
+			};
+			name = Release;
+		};
+		A10000000000000000000022 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ARCHS = armv7;
+				"ARCHS[sdk=iphoneos*]" = armv7;
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_IDENTITY = "iPhone Developer";
+				CODE_SIGN_STYLE = Automatic;
+				DEVELOPMENT_TEAM = FLFYQXCCZM;
+				ENABLE_BITCODE = NO;
+				INFOPLIST_FILE = ZhangJieStocks/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 9.3;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				ONLY_ACTIVE_ARCH = NO;
+				PRODUCT_BUNDLE_IDENTIFIER = com.glooby.ZhangJieStocks;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = 2;
+			};
+			name = Debug;
+		};
+		A10000000000000000000023 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ARCHS = armv7;
+				"ARCHS[sdk=iphoneos*]" = armv7;
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_IDENTITY = "iPhone Developer";
+				CODE_SIGN_STYLE = Automatic;
+				DEVELOPMENT_TEAM = FLFYQXCCZM;
+				ENABLE_BITCODE = NO;
+				INFOPLIST_FILE = ZhangJieStocks/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 9.3;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.glooby.ZhangJieStocks;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = 2;
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		A10000000000000000000024 /* Build configuration list for PBXProject "ZhangJieStocks" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				A10000000000000000000020 /* Debug */,
+				A10000000000000000000021 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		A10000000000000000000025 /* Build configuration list for PBXNativeTarget "ZhangJieStocks" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				A10000000000000000000022 /* Debug */,
+				A10000000000000000000023 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = A10000000000000000000001 /* Project object */;
+}

@@ -1,10 +1,14 @@
 package com.glooby.remotepanel.data
 
 import com.glooby.remotepanel.net.HttpClient
+import kotlin.math.abs
+import kotlin.math.round
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.withContext
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONObject
 import java.net.URLEncoder
 import java.nio.charset.StandardCharsets
@@ -40,12 +44,59 @@ data class QuoteItem(
     val market: String
 )
 
+data class RepoCard(
+    val name: String,
+    val description: String,
+    val stars: String,
+    val language: String
+)
+
+data class TrendCard(val title: String, val original: String, val blurb: String)
+
+data class PostCard(val title: String, val summary: String, val imageUrl: String)
+
+data class CoverCard(val title: String, val meta: String, val imageUrl: String)
+
+data class VpsState(
+    val used: String,
+    val remain: String,
+    val status: String,
+    val cycle: String
+)
+
+data class TempChip(val label: String, val value: String)
+
+data class FilamentSlot(val name: String, val percent: String, val color: Int, val kind: String)
+
+data class PrintState(
+    val online: Boolean,
+    val title: String,
+    val status: String,
+    val progress: String,
+    val detail: String,
+    val temps: List<TempChip>,
+    val slots: List<FilamentSlot>
+)
+
 data class PanelState(
     val hello: String = "",
+    val helloPeriod: String = "",
     val weather: WeatherState? = null,
+    val vps: VpsState? = null,
     val dailyNews: List<NewsItem> = emptyList(),
+    val github: List<RepoCard> = emptyList(),
+    val trends: List<TrendCard> = emptyList(),
+    val xhs: List<PostCard> = emptyList(),
+    val bili: List<PostCard> = emptyList(),
     val stocks: List<QuoteItem> = emptyList(),
     val crypto: List<QuoteItem> = emptyList(),
+    val movies: List<CoverCard> = emptyList(),
+    val steamNew: List<CoverCard> = emptyList(),
+    val steamHot: List<CoverCard> = emptyList(),
+    val pcGames: List<CoverCard> = emptyList(),
+    val switchGames: List<CoverCard> = emptyList(),
+    val ps5Games: List<CoverCard> = emptyList(),
+    val printer: PrintState? = null,
     val updatedAt: Long = System.currentTimeMillis(),
     val errors: List<String> = emptyList()
 )
@@ -89,12 +140,37 @@ object FeedRepository {
                 runCatching { fetchCrypto() }.onFailure { errors += "加密: ${it.message}" }.getOrNull()
             }
             val hello = buildHello()
+            val githubDef = async { guarded("GitHub", errors) { MoreFeeds.github() } }
+            val xDef = async { guarded("X", errors) { MoreFeeds.trends() } }
+            val xhsDef = async { guarded("小红书", errors) { MoreFeeds.xiaohongshu() } }
+            val biliDef = async { guarded("哔哩哔哩", errors) { MoreFeeds.bilibili() } }
+            val moviesDef = async { guarded("电影", errors) { MoreFeeds.movies() } }
+            val steamDef = async { guarded("Steam", errors) { MoreFeeds.steam() } }
+            val pcDef = async { guarded("PC", errors) { MoreFeeds.covers("gamer520-pc-latest", "pc") } }
+            val swDef = async { guarded("Switch", errors) { MoreFeeds.covers("gamer520-switch-latest", "switch") } }
+            val psDef = async { guarded("PS5", errors) { MoreFeeds.covers("ps5-games-latest", "ps5") } }
+            val vpsDef = async { guarded("VPS", errors) { MoreFeeds.vps() } }
+            val printDef = async { guarded("打印机", errors) { MoreFeeds.printer() } }
+            val steam = steamDef.await()
             val state = PanelState(
-                hello = hello,
+                hello = hello.second,
+                helloPeriod = hello.first,
                 weather = weatherDef.await(),
+                vps = vpsDef.await(),
                 dailyNews = newsDef.await().orEmpty(),
+                github = githubDef.await().orEmpty(),
+                trends = xDef.await().orEmpty(),
+                xhs = xhsDef.await().orEmpty(),
+                bili = biliDef.await().orEmpty(),
                 stocks = stocksDef.await().orEmpty(),
                 crypto = cryptoDef.await().orEmpty(),
+                movies = moviesDef.await().orEmpty(),
+                steamNew = steam?.first.orEmpty(),
+                steamHot = steam?.second.orEmpty(),
+                pcGames = pcDef.await().orEmpty(),
+                switchGames = swDef.await().orEmpty(),
+                ps5Games = psDef.await().orEmpty(),
+                printer = printDef.await(),
                 errors = errors.toList()
             )
             lastState = state
@@ -102,14 +178,60 @@ object FeedRepository {
         }
     }
 
-    private fun buildHello(): String {
+    private fun <T> guarded(name: String, errors: MutableList<String>, block: () -> T?): T? {
+        return runCatching { block() }.onFailure { errors += "$name: ${it.message ?: "失败"}" }.getOrNull()
+    }
+
+    private fun buildHello(): Pair<String, String> {
         val hour = java.util.Calendar.getInstance().get(java.util.Calendar.HOUR_OF_DAY)
         val greet = when {
             hour in 5..10 -> "早上好"
             hour in 11..16 -> "中午好"
             else -> "晚上好"
         }
-        return "$greet\n家庭信息屏 · RemotePanel"
+        val cached = cache["hello"]
+        if (cached != null && System.currentTimeMillis() - cached.first < 6 * 3600_000L) {
+            val saved = cached.second as? Pair<*, *>
+            val period = saved?.first as? String
+            val text = saved?.second as? String
+            if (!period.isNullOrBlank() && !text.isNullOrBlank()) return period to text
+        }
+        val key = Prefs.helloKey()
+        val base = Prefs.sourceUrl("hello").ifBlank { "https://apiclaude.cc" }.trimEnd('/')
+        if (key.isNotEmpty()) {
+            val body = org.json.JSONObject()
+                .put("model", "gpt-6-astra")
+                .put(
+                    "messages",
+                    org.json.JSONArray().put(
+                        org.json.JSONObject()
+                            .put("role", "user")
+                            .put("content", "用一句中文跟家人打招呼，20到40个字，不要标题。现在是$greet。")
+                    )
+                )
+            val raw = runCatching {
+                val req = okhttp3.Request.Builder()
+                    .url("$base/v1/chat/completions")
+                    .header("Authorization", "Bearer $key")
+                    .header("Content-Type", "application/json")
+                    .post(body.toString().toRequestBody("application/json".toMediaType()))
+                    .build()
+                okhttp3.OkHttpClient().newCall(req).execute().use { resp ->
+                    if (!resp.isSuccessful) error("HTTP ${resp.code}")
+                    resp.body?.string().orEmpty()
+                }
+            }.getOrNull()
+            val text = raw?.let {
+                org.json.JSONObject(it).optJSONArray("choices")
+                    ?.optJSONObject(0)?.optJSONObject("message")?.optString("content")
+            }?.trim().orEmpty()
+            if (text.isNotEmpty()) {
+                cache["hello"] = System.currentTimeMillis() to (greet to text)
+                return greet to text
+            }
+        }
+        val line = "$greet。今天是家庭信息屏的一页，看看天气和后面的安排。"
+        return greet to line
     }
 
     private fun weatherText(code: Int): String = when (code) {
@@ -158,14 +280,14 @@ object FeedRepository {
         for (i in 0 until minOf(7, times.length())) {
             val day = times.getString(i)
             val desc = weatherText(codes.getInt(i))
-            val range = "${mins.getDouble(i).toInt()}° / ${maxes.getDouble(i).toInt()}°"
+            val range = "${shortNum(mins.getDouble(i))}° / ${shortNum(maxes.getDouble(i))}°"
             weekly += Triple(day, range, desc)
         }
         val state = WeatherState(
             city = name,
-            temperature = "${cur.getDouble("temperature_2m").toInt()}°",
+            temperature = "${shortNum(cur.getDouble("temperature_2m"))}°",
             description = weatherText(cur.getInt("weather_code")),
-            wind = "风 ${cur.getDouble("wind_speed_10m").toInt()} km/h",
+            wind = "风 ${shortNum(cur.getDouble("wind_speed_10m"))}",
             weekly = weekly
         )
         cache["weather"] = System.currentTimeMillis() to state
@@ -340,8 +462,9 @@ object FeedRepository {
             }
         }
         if (wanted.isEmpty()) error("没有认出币种")
+        val proxy = if (Prefs.useProxy("crypto")) Prefs.proxy() else null
         val json = JSONObject(
-            HttpClient.getString("https://www.okx.com/api/v5/market/tickers?instType=SPOT")
+            HttpClient.getString("https://www.okx.com/api/v5/market/tickers?instType=SPOT", proxy = proxy)
         )
         val rows = json.optJSONArray("data") ?: error("没有解析到行情")
         val byId = mutableMapOf<String, JSONObject>()
@@ -375,5 +498,10 @@ object FeedRepository {
         if (items.isEmpty()) error("没有解析到行情")
         cache["crypto"] = System.currentTimeMillis() to items
         return items
+    }
+
+    private fun shortNum(v: Double): String {
+        if (abs(v - round(v)) < 0.05) return round(v).toInt().toString()
+        return String.format(java.util.Locale.US, "%.1f", v)
     }
 }

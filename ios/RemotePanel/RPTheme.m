@@ -79,7 +79,8 @@ static const unsigned RPWeekPalette[7][4] = {
 
 + (UIColor *)cardTint:(NSInteger)index {
     NSArray *tints = @[[self tintTeal], [self tintBlue], [self tintPurple], [self tintOrange], [self tintPink], [self tintGreen]];
-    NSInteger n = (index + [self dayIndex]) % tints.count;
+    NSInteger n = index % (NSInteger)tints.count;
+    if (n < 0) n += (NSInteger)tints.count;
     return tints[n];
 }
 

@@ -43,6 +43,10 @@ static BOOL RPDefaultUseProxy(NSString *pid) { return RPLocalDefaultUseProxy(pid
 @property (nonatomic, strong) UILabel *statusPill;
 @property (nonatomic, strong) UIButton *logBtn;
 @property (nonatomic, strong) UIButton *bellBtn;
+@property (nonatomic, strong) UIButton *prevBtn;
+@property (nonatomic, strong) UIButton *nextBtn;
+@property (nonatomic, strong) UIButton *prevFloat;
+@property (nonatomic, strong) UIButton *nextFloat;
 @property (nonatomic, strong) UILabel *bellBadge;
 @property (nonatomic, strong) UIView *toast;
 @property (nonatomic, strong) UILabel *toastLabel;
@@ -69,6 +73,7 @@ static BOOL RPDefaultUseProxy(NSString *pid) { return RPLocalDefaultUseProxy(pid
 @property (nonatomic, strong) NSTimer *pollTimer;
 @property (nonatomic, assign) NSTimeInterval dwellTotal;
 @property (nonatomic, assign) NSTimeInterval dwellLeft;
+@property (nonatomic, assign) BOOL videoHold;
 @property (nonatomic, assign) BOOL stale;
 @property (nonatomic, strong) UIView *settingsDim;
 @property (nonatomic, strong) UIView *settingsSheet;
@@ -134,6 +139,8 @@ static BOOL RPDefaultUseProxy(NSString *pid) { return RPLocalDefaultUseProxy(pid
     [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(onCollectAlbums:) name:@"RPCollectAlbums" object:nil];
     [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(onRemoteSettings) name:@"RPRemoteSettingsChanged" object:nil];
     [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(onFeedProgress:) name:RPFeedProgressNotification object:nil];
+    [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(onVideoHold:) name:@"RPVideoHold" object:nil];
+    [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(onVideoAdvance) name:@"RPVideoAdvance" object:nil];
     [self rebuildEnabledPages];
     [self buildUI];
     [self installGestures];
@@ -163,7 +170,7 @@ static NSString *RPStringish(id value) {
         d.title = r[@"title"];
         d.dwell = [r[@"dwell"] integerValue];
         NSString *ek = [kPageEnabledPrefix stringByAppendingString:d.pid];
-        if ([ud objectForKey:ek] == nil) d.enabled = YES;
+        if ([ud objectForKey:ek] == nil) d.enabled = RPLocalPageDefaultOn(d.pid);
         else d.enabled = [ud boolForKey:ek];
         NSInteger pd = [ud integerForKey:[kPageDwellPrefix stringByAppendingString:d.pid]];
         if (pd > 0) d.dwell = pd;
@@ -192,7 +199,7 @@ static NSString *RPStringish(id value) {
         } else {
             NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
             NSString *ek = [kPageEnabledPrefix stringByAppendingString:d.pid];
-            if ([ud objectForKey:ek] == nil) d.enabled = YES;
+            if ([ud objectForKey:ek] == nil) d.enabled = RPLocalPageDefaultOn(d.pid);
             else d.enabled = [ud boolForKey:ek];
         }
         if (d.enabled) [en addObject:d];
@@ -288,6 +295,16 @@ static NSString *RPStringish(id value) {
     [self.bellBtn setTitle:@"✉" forState:UIControlStateNormal];
     [self styleChromeIcon:self.bellBtn color:[RPTheme accent] action:@selector(showTickerDetail)];
     [self.chrome addSubview:self.bellBtn];
+
+    self.prevBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    [self.prevBtn setTitle:@"◀" forState:UIControlStateNormal];
+    [self styleChromeIcon:self.prevBtn color:[RPTheme accent] action:@selector(prevPage)];
+    [self.chrome addSubview:self.prevBtn];
+
+    self.nextBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    [self.nextBtn setTitle:@"▶" forState:UIControlStateNormal];
+    [self styleChromeIcon:self.nextBtn color:[RPTheme accent] action:@selector(nextPage)];
+    [self.chrome addSubview:self.nextBtn];
     self.bellBadge = [[UILabel alloc] initWithFrame:CGRectMake(30, 0, 20, 18)];
     self.bellBadge.backgroundColor = [RPTheme bad];
     self.bellBadge.textColor = [UIColor whiteColor];
@@ -321,7 +338,7 @@ static NSString *RPStringish(id value) {
     [self.toast addGestureRecognizer:toastTap];
 
     self.progressTrack = [[UIView alloc] init];
-    self.progressTrack.backgroundColor = [RPTheme cardBorder];
+    self.progressTrack.backgroundColor = [UIColor colorWithWhite:1 alpha:0.22];
     self.progressTrack.translatesAutoresizingMaskIntoConstraints = NO;
     [self.view addSubview:self.progressTrack];
     self.progressFill = [[UIView alloc] init];
@@ -329,12 +346,12 @@ static NSString *RPStringish(id value) {
     self.progressFill.translatesAutoresizingMaskIntoConstraints = NO;
     [self.progressTrack addSubview:self.progressFill];
 
-    NSDictionary *views = NSDictionaryOfVariableBindings(_chrome, _pageHost, _progressTrack, _titleLabel, _clockLabel, _indexLabel, _statusPill, _progressFill, _settingsBtn, _logBtn, _bellBtn);
+    NSDictionary *views = NSDictionaryOfVariableBindings(_chrome, _pageHost, _progressTrack, _titleLabel, _clockLabel, _indexLabel, _statusPill, _progressFill, _settingsBtn, _logBtn, _bellBtn, _prevBtn, _nextBtn);
     [self.view addConstraints:[NSLayoutConstraint constraintsWithVisualFormat:@"H:|-16-[_chrome]-16-|" options:0 metrics:nil views:views]];
     [self.view addConstraints:[NSLayoutConstraint constraintsWithVisualFormat:@"H:|-0-[_pageHost]-0-|" options:0 metrics:nil views:views]];
     [self.view addConstraints:[NSLayoutConstraint constraintsWithVisualFormat:@"H:|-0-[_progressTrack]-0-|" options:0 metrics:nil views:views]];
     [self.view addConstraints:[NSLayoutConstraint constraintsWithVisualFormat:@"V:|-8-[_chrome(72)]" options:0 metrics:nil views:views]];
-    [self.view addConstraints:[NSLayoutConstraint constraintsWithVisualFormat:@"V:[_progressTrack(4)]-0-|" options:0 metrics:nil views:views]];
+    [self.view addConstraints:[NSLayoutConstraint constraintsWithVisualFormat:@"V:[_progressTrack(6)]-0-|" options:0 metrics:nil views:views]];
     // Normal: pageHost between chrome and progress. Web fullscreen: pin to edges (constants flipped in setKioskChromeHidden:).
     self.pageHostTop = [NSLayoutConstraint constraintWithItem:self.pageHost attribute:NSLayoutAttributeTop relatedBy:NSLayoutRelationEqual toItem:self.chrome attribute:NSLayoutAttributeBottom multiplier:1 constant:0];
     self.pageHostBottom = [NSLayoutConstraint constraintWithItem:self.pageHost attribute:NSLayoutAttributeBottom relatedBy:NSLayoutRelationEqual toItem:self.progressTrack attribute:NSLayoutAttributeTop multiplier:1 constant:0];
@@ -344,61 +361,66 @@ static NSString *RPStringish(id value) {
     [self.indexLabel setContentCompressionResistancePriority:UILayoutPriorityDefaultLow forAxis:UILayoutConstraintAxisHorizontal];
     self.indexLabel.adjustsFontSizeToFitWidth = YES;
     self.indexLabel.minimumScaleFactor = 0.7;
-    [self.chrome addConstraints:[NSLayoutConstraint constraintsWithVisualFormat:@"H:|[_titleLabel]-(6)-[_statusPill(72)]-4-[_indexLabel(120)]-4-[_clockLabel(188)]-4-[_bellBtn(56)]-2-[_logBtn(56)]-2-[_settingsBtn(56)]|" options:NSLayoutFormatAlignAllCenterY metrics:nil views:views]];
+    [self.chrome addConstraints:[NSLayoutConstraint constraintsWithVisualFormat:@"H:|[_prevBtn(56)]-2-[_titleLabel]-(6)-[_statusPill(72)]-4-[_indexLabel(96)]-4-[_clockLabel(150)]-4-[_bellBtn(56)]-2-[_logBtn(56)]-2-[_settingsBtn(56)]-2-[_nextBtn(56)]|" options:NSLayoutFormatAlignAllCenterY metrics:nil views:views]];
     [self.chrome addConstraints:[NSLayoutConstraint constraintsWithVisualFormat:@"V:|[_titleLabel]|" options:0 metrics:nil views:views]];
     [self.progressTrack addConstraints:[NSLayoutConstraint constraintsWithVisualFormat:@"V:|[_progressFill]|" options:0 metrics:nil views:views]];
     [self.progressTrack addConstraint:[NSLayoutConstraint constraintWithItem:self.progressFill attribute:NSLayoutAttributeLeading relatedBy:NSLayoutRelationEqual toItem:self.progressTrack attribute:NSLayoutAttributeLeading multiplier:1 constant:0]];
-    self.progressWidth = [NSLayoutConstraint constraintWithItem:self.progressFill attribute:NSLayoutAttributeWidth relatedBy:NSLayoutRelationEqual toItem:self.progressTrack attribute:NSLayoutAttributeWidth multiplier:0 constant:0];
+    self.progressTrack.clipsToBounds = YES;
+    self.progressWidth = [NSLayoutConstraint constraintWithItem:self.progressFill attribute:NSLayoutAttributeWidth relatedBy:NSLayoutRelationEqual toItem:nil attribute:NSLayoutAttributeNotAnAttribute multiplier:1 constant:0];
     [self.view addConstraint:self.progressWidth];
 
-    // Edge catchers so WKWebView cannot swallow left/right page-flip taps.
+    // Full-height edge strips used to steal taps from cards and checkboxes.
+    // Page turns are the top-bar buttons and a horizontal swipe.
     self.edgeLeft = [[UIView alloc] initWithFrame:CGRectZero];
     self.edgeRight = [[UIView alloc] initWithFrame:CGRectZero];
+    self.edgeLeft.userInteractionEnabled = NO;
+    self.edgeRight.userInteractionEnabled = NO;
+    self.edgeLeft.hidden = YES;
+    self.edgeRight.hidden = YES;
     self.chromePeek = [[UIView alloc] initWithFrame:CGRectZero];
-    for (UIView *edge in @[self.edgeLeft, self.edgeRight, self.chromePeek]) {
-        edge.backgroundColor = [UIColor clearColor];
-        edge.userInteractionEnabled = YES;
-        [self.view addSubview:edge];
-        UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(onEdgeTap:)];
-        [edge addGestureRecognizer:tap];
-        UILongPressGestureRecognizer *lp = [[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(onLongPress:)];
-        lp.minimumPressDuration = 0.85;
-        [edge addGestureRecognizer:lp];
-    }
-    self.edgeLeft.tag = 1;
-    self.edgeRight.tag = 2;
-    self.chromePeek.tag = 3;
+    self.chromePeek.backgroundColor = [UIColor clearColor];
     self.chromePeek.hidden = YES;
+    [self.view addSubview:self.chromePeek];
+    UILongPressGestureRecognizer *peek = [[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(onLongPress:)];
+    peek.minimumPressDuration = 0.85;
+    [self.chromePeek addGestureRecognizer:peek];
+
+    self.prevFloat = [UIButton buttonWithType:UIButtonTypeSystem];
+    [self.prevFloat setTitle:@"◀" forState:UIControlStateNormal];
+    [self styleChromeIcon:self.prevFloat color:[UIColor whiteColor] action:@selector(prevPage)];
+    self.prevFloat.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.45];
+    self.prevFloat.translatesAutoresizingMaskIntoConstraints = YES;
+    self.prevFloat.hidden = YES;
+    [self.view addSubview:self.prevFloat];
+    self.nextFloat = [UIButton buttonWithType:UIButtonTypeSystem];
+    [self.nextFloat setTitle:@"▶" forState:UIControlStateNormal];
+    [self styleChromeIcon:self.nextFloat color:[UIColor whiteColor] action:@selector(nextPage)];
+    self.nextFloat.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.45];
+    self.nextFloat.translatesAutoresizingMaskIntoConstraints = YES;
+    self.nextFloat.hidden = YES;
+    [self.view addSubview:self.nextFloat];
 }
 
 - (void)layoutEdgeCatchers {
     CGFloat w = self.view.bounds.size.width;
-    CGFloat h = self.view.bounds.size.height;
-    CGFloat strip = MAX(72.0, w * 0.22);
-    // When chrome is visible, don't cover the top bar (settings / clock still tappable).
-    CGFloat top = self.chromeHidden ? 0 : CGRectGetMaxY(self.chrome.frame);
-    CGFloat bottom = self.chromeHidden ? h : CGRectGetMinY(self.progressTrack.frame);
-    if (bottom < top) bottom = h;
-    CGFloat eh = MAX(0, bottom - top);
-    self.edgeLeft.frame = CGRectMake(0, top, strip, eh);
-    self.edgeRight.frame = CGRectMake(w - strip, top, strip, eh);
-    self.chromePeek.frame = CGRectMake(0, 0, w, 44);
+    self.edgeLeft.hidden = YES;
+    self.edgeRight.hidden = YES;
+    self.chromePeek.frame = CGRectMake(72, 0, MAX(0, w - 144), 44);
     self.chromePeek.hidden = !self.chromeHidden;
-    [self.view bringSubviewToFront:self.edgeLeft];
-    [self.view bringSubviewToFront:self.edgeRight];
-    if (self.chromeHidden) [self.view bringSubviewToFront:self.chromePeek];
+    self.prevFloat.hidden = !self.chromeHidden;
+    self.nextFloat.hidden = !self.chromeHidden;
+    self.prevFloat.frame = CGRectMake(0, 0, 72, 44);
+    self.nextFloat.frame = CGRectMake(w - 72, 0, 72, 44);
+    if (self.chromeHidden) {
+        [self.view bringSubviewToFront:self.chromePeek];
+        [self.view bringSubviewToFront:self.prevFloat];
+        [self.view bringSubviewToFront:self.nextFloat];
+    }
     if (self.chrome && !self.chrome.hidden) [self.view bringSubviewToFront:self.chrome];
     if (self.progressTrack && !self.progressTrack.hidden) [self.view bringSubviewToFront:self.progressTrack];
     if (self.toast && !self.toast.hidden) [self.view bringSubviewToFront:self.toast];
     if (self.settingsDim) [self.view bringSubviewToFront:self.settingsDim];
     if (self.overlayDim) [self.view bringSubviewToFront:self.overlayDim];
-}
-
-- (void)onEdgeTap:(UITapGestureRecognizer *)gr {
-    if (gr.state != UIGestureRecognizerStateEnded) return;
-    if (self.settingsDim || self.overlayDim) return;
-    if (gr.view == self.edgeLeft) [self prevPage];
-    else if (gr.view == self.edgeRight) [self nextPage];
 }
 
 - (void)setKioskChromeHidden:(BOOL)hidden {
@@ -460,7 +482,7 @@ static NSString *RPStringish(id value) {
         NSDictionary *state = info[@"state"];
         if ([state isKindOfClass:[NSDictionary class]] && state.count) {
             self.lastState = state;
-            [self.currentPage applyState:state baseURL:@""];
+            [self applyCurrentPageState];
         }
     } else if ([status isEqualToString:@"skip"]) {
         [self.logBtn setTitleColor:[RPTheme textDim] forState:UIControlStateNormal];
@@ -613,23 +635,23 @@ static NSString *RPStringish(id value) {
 - (void)installGestures {
     UILongPressGestureRecognizer *lp = [[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(onLongPress:)];
     lp.minimumPressDuration = 0.85;
+    lp.cancelsTouchesInView = NO;
     [self.view addGestureRecognizer:lp];
-    UITapGestureRecognizer *left = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(onTap:)];
+    UISwipeGestureRecognizer *left = [[UISwipeGestureRecognizer alloc] initWithTarget:self action:@selector(onSwipe:)];
+    left.direction = UISwipeGestureRecognizerDirectionLeft;
+    left.cancelsTouchesInView = NO;
+    UISwipeGestureRecognizer *right = [[UISwipeGestureRecognizer alloc] initWithTarget:self action:@selector(onSwipe:)];
+    right.direction = UISwipeGestureRecognizerDirectionRight;
+    right.cancelsTouchesInView = NO;
     [self.view addGestureRecognizer:left];
+    [self.view addGestureRecognizer:right];
 }
 
-- (void)onTap:(UITapGestureRecognizer *)gr {
+- (void)onSwipe:(UISwipeGestureRecognizer *)gr {
     if (gr.state != UIGestureRecognizerStateEnded) return;
     if (self.settingsDim || self.overlayDim) return;
-    CGPoint p = [gr locationInView:self.view];
-    if (!self.toast.hidden && CGRectContainsPoint(self.toast.frame, p)) return;
-    CGPoint inChrome = [self.view convertPoint:p toView:self.chrome];
-    if (CGRectContainsPoint(self.settingsBtn.frame, inChrome) || CGRectContainsPoint(self.logBtn.frame, inChrome) || CGRectContainsPoint(self.bellBtn.frame, inChrome)) return;
-    if (p.x < self.view.bounds.size.width * 0.28) {
-        [self prevPage];
-    } else if (p.x > self.view.bounds.size.width * 0.72) {
-        [self nextPage];
-    }
+    if (gr.direction == UISwipeGestureRecognizerDirectionLeft) [self nextPage];
+    else if (gr.direction == UISwipeGestureRecognizerDirectionRight) [self prevPage];
 }
 
 - (void)onLongPress:(UILongPressGestureRecognizer *)gr {
@@ -638,8 +660,23 @@ static NSString *RPStringish(id value) {
 
 #pragma mark - Pages
 
+- (void)applyCurrentPageState {
+    if (!self.currentPage) return;
+    @try {
+        [self.currentPage applyState:self.lastState ?: @{} baseURL:self.baseURL ?: @""];
+    } @catch (NSException *ex) {
+        NSString *why = ex.reason.length ? ex.reason : (ex.name ?: @"未知错误");
+        [[RPLocalFeed sharedFeed] appendLog:self.titleLabel.text ?: @"页面" status:@"fail" detail:[NSString stringWithFormat:@"这一页没能画出来：%@", why]];
+    }
+    if ([self.currentPage isKindOfClass:[RPBasePageVC class]]) {
+        RPBasePageVC *page = (RPBasePageVC *)self.currentPage;
+        if (![page rpIntroHasPlayed]) [page parkMotionOffscreen];
+    }
+}
+
 - (void)showPageAtIndex:(NSInteger)idx resetDwell:(BOOL)reset {
     self.transitionToken += 1;
+    self.videoHold = NO;
     self.pageTransitioning = NO;
     if (self.pages.count == 0) return;
     if (idx < 0) idx = self.pages.count - 1;
@@ -671,7 +708,7 @@ static NSString *RPStringish(id value) {
     self.indexLabel.text = [NSString stringWithFormat:@"%ld/%lu · %lds", (long)(idx+1), (unsigned long)self.pages.count, (long)[self dwellForDef:def]];
     BOOL web = [RPPageFactory isWebPageId:def.pid];
     [self setKioskChromeHidden:web];
-    if (self.lastState || web) [page applyState:self.lastState ?: @{} baseURL:self.baseURL ?: @""];
+    if (self.lastState || web) [self applyCurrentPageState];
     [page pageWillAppear];
     [self layoutEdgeCatchers];
 
@@ -699,8 +736,24 @@ static NSString *RPStringish(id value) {
     [self updateProgress];
 }
 
+- (void)onVideoHold:(NSNotification *)note {
+    self.videoHold = [note.userInfo[@"hold"] boolValue];
+    if (!self.videoHold) return;
+    self.indexLabel.text = [NSString stringWithFormat:@"%ld/%lu · 播放", (long)(self.index + 1), (unsigned long)self.pages.count];
+}
+- (void)onVideoAdvance {
+    self.videoHold = NO;
+    if (self.index < 0 || self.index >= (NSInteger)self.pages.count) return;
+    RPPageDef *def = self.pages[self.index];
+    if (![def.pid isEqualToString:@"local-video"]) return;
+    [self nextPage];
+}
 - (void)dwellTick {
     if (self.pageTransitioning) return;
+    if (self.videoHold) {
+        self.indexLabel.text = [NSString stringWithFormat:@"%ld/%lu · 播放", (long)(self.index + 1), (unsigned long)self.pages.count];
+        return;
+    }
     self.dwellLeft -= 0.25;
     // Warm the next page's cover art so fly-in can start with images already in cache.
     if (self.dwellLeft <= 12.0 && self.dwellLeft > 11.5) {
@@ -732,9 +785,14 @@ static NSString *RPStringish(id value) {
 - (void)updateProgress {
     CGFloat p = (self.dwellTotal > 0) ? (1.0 - self.dwellLeft/self.dwellTotal) : 0;
     if (p < 0) p = 0; if (p > 1) p = 1;
+    [self.progressTrack layoutIfNeeded];
+    CGFloat full = CGRectGetWidth(self.progressTrack.bounds);
+    if (full < 1) full = CGRectGetWidth(self.view.bounds);
     [self.view removeConstraint:self.progressWidth];
-    self.progressWidth = [NSLayoutConstraint constraintWithItem:self.progressFill attribute:NSLayoutAttributeWidth relatedBy:NSLayoutRelationEqual toItem:self.progressTrack attribute:NSLayoutAttributeWidth multiplier:p constant:0];
+    self.progressWidth = [NSLayoutConstraint constraintWithItem:self.progressFill attribute:NSLayoutAttributeWidth relatedBy:NSLayoutRelationEqual toItem:nil attribute:NSLayoutAttributeNotAnAttribute multiplier:1 constant:full * p];
     [self.view addConstraint:self.progressWidth];
+    [self.view bringSubviewToFront:self.progressTrack];
+    [self.view layoutIfNeeded];
 }
 
 - (void)turnBy:(NSInteger)delta {
@@ -766,9 +824,12 @@ static NSString *RPStringish(id value) {
     BOOL sizeChanged = (fabs(sLastHostSize.width - sz.width) > 0.5 || fabs(sLastHostSize.height - sz.height) > 0.5);
     if (sizeChanged && self.currentPage && self.lastState && sz.width > 1 && sz.height > 1) {
         sLastHostSize = sz;
-        [self.currentPage applyState:self.lastState baseURL:self.baseURL];
+        [self applyCurrentPageState];
         if ([self.currentPage isKindOfClass:[RPBasePageVC class]]) {
-            [(RPBasePageVC *)self.currentPage playPageIntro];
+            RPBasePageVC *page = (RPBasePageVC *)self.currentPage;
+            // A size change rebuilds at rest. If the fly-in has not started, keep
+            // the blocks off-canvas instead of flashing the finished layout.
+            if (![page rpIntroHasPlayed]) [page parkMotionOffscreen];
         }
     }
 }
@@ -784,7 +845,7 @@ static NSString *RPStringish(id value) {
     NSString *day = [RPTheme dayName];
     if (self.themeDayName.length && ![self.themeDayName isEqualToString:day]) {
         self.view.backgroundColor = [RPTheme bg];
-        self.progressTrack.backgroundColor = [RPTheme cardBorder];
+        self.progressTrack.backgroundColor = [UIColor colorWithWhite:1 alpha:0.22];
         self.progressFill.backgroundColor = [RPTheme accent];
         self.titleLabel.textColor = [RPTheme text];
         self.clockLabel.textColor = [RPTheme textDim];
@@ -792,7 +853,9 @@ static NSString *RPStringish(id value) {
         [self.settingsBtn setTitleColor:[RPTheme accent] forState:UIControlStateNormal];
         [self.bellBtn setTitleColor:[RPTheme accent] forState:UIControlStateNormal];
         [self.logBtn setTitleColor:[RPTheme textDim] forState:UIControlStateNormal];
-        if (self.lastState && self.currentPage) [self.currentPage applyState:self.lastState baseURL:self.baseURL ?: @""];
+        [self.prevBtn setTitleColor:[RPTheme accent] forState:UIControlStateNormal];
+        [self.nextBtn setTitleColor:[RPTheme accent] forState:UIControlStateNormal];
+        if (self.lastState && self.currentPage) [self applyCurrentPageState];
     }
     self.themeDayName = day;
     NSDateFormatter *f = [[NSDateFormatter alloc] init];
@@ -814,7 +877,7 @@ static NSString *RPStringish(id value) {
                 weakSelf.statusPill.text = @" LIVE ";
                 weakSelf.statusPill.backgroundColor = [RPTheme ok];
             }
-            [weakSelf.currentPage applyState:state baseURL:@""];
+            [weakSelf applyCurrentPageState];
             [weakSelf applyTickerMessages:[[RPLocalFeed sharedFeed] tickerMessages]];
         } else {
             weakSelf.stale = YES;
@@ -1074,7 +1137,7 @@ static NSString *RPStringish(id value) {
 
         UISwitch *sw = [[UISwitch alloc] initWithFrame:CGRectMake(rowW-74, 8, 51, 31)];
         NSString *ek = [kPageEnabledPrefix stringByAppendingString:d.pid];
-        BOOL on = ([ud objectForKey:ek] == nil) ? YES : [ud boolForKey:ek];
+        BOOL on = ([ud objectForKey:ek] == nil) ? RPLocalPageDefaultOn(d.pid) : [ud boolForKey:ek];
         sw.on = on;
         sw.onTintColor = [RPTheme accent];
         [row addSubview:sw];

@@ -28,6 +28,12 @@ NSArray *RPLocalRefreshChoices(void);
 NSArray *RPLocalRefreshChoiceTitles(void);
 NSInteger RPLocalRefreshChoiceIndex(NSTimeInterval ttl);
 NSArray *RPLocalPageCatalog(void);
+/** Built-in pages are on unless the catalog marks default_off. */
+BOOL RPLocalPageDefaultOn(NSString *pid);
+NSString *RPVideoDirectory(void);
+NSArray *RPVideoLocalFiles(void);
+/** source / album / http / max / photo_album */
+NSDictionary *RPVideoSettings(void);
 
 /** Custom fullscreen WebView pages (max 8). Each: id/title/url/enabled/dwell. */
 extern NSString * const RPWebPagesDefaultsKey;
@@ -43,4 +49,5 @@ NSMutableDictionary *RPWebPageNormalize(NSDictionary *raw, NSInteger indexHint);
 - (void)refreshWithCompletion:(void (^)(NSDictionary *state, NSError *error))completion;
 - (NSArray *)activityLog;
 - (NSArray *)tickerMessages;
+- (void)appendLog:(NSString *)name status:(NSString *)status detail:(NSString *)detail;
 @end

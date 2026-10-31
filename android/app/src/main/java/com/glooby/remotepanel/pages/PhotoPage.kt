@@ -1,104 +1,100 @@
 package com.glooby.remotepanel.pages
 
-import android.Manifest
-import android.content.ContentUris
-import android.content.pm.PackageManager
-import android.net.Uri
-import android.os.Build
+import android.graphics.Color
 import android.os.Handler
 import android.os.Looper
-import android.provider.MediaStore
-import android.view.LayoutInflater
-import android.view.View
+import android.view.Gravity
+import android.widget.FrameLayout
 import android.widget.ImageView
 import android.widget.TextView
-import androidx.core.content.ContextCompat
 import com.bumptech.glide.Glide
-import com.glooby.remotepanel.R
 import com.glooby.remotepanel.data.PanelState
+import com.glooby.remotepanel.data.Prefs
+import com.glooby.remotepanel.data.Theme
+import com.glooby.remotepanel.net.NetShare
+import kotlin.random.Random
 
+/** Full-screen random photo from a network folder (SMB or HTTP directory). */
 class PhotoPage(private val context: android.content.Context) : PanelPage {
-    override val root = LayoutInflater.from(context).inflate(R.layout.page_photo, null)
-    private val photoView: ImageView = root.findViewById(R.id.photoView)
-    private val caption: TextView = root.findViewById(R.id.caption)
-    private val empty: TextView = root.findViewById(R.id.empty)
-    private val uris = mutableListOf<Uri>()
-    private var index = 0
+    private val photoView = ImageView(context).apply {
+        scaleType = ImageView.ScaleType.FIT_CENTER
+        setBackgroundColor(Color.BLACK)
+    }
+    private val caption = TextView(context).apply {
+        setTextColor(Color.WHITE)
+        textSize = 14f
+        setBackgroundColor(0x88000000.toInt())
+        setPadding(24, 12, 24, 12)
+    }
+    override val root = FrameLayout(context).apply {
+        setBackgroundColor(Theme.bg())
+        addView(photoView, FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.MATCH_PARENT,
+            FrameLayout.LayoutParams.MATCH_PARENT
+        ))
+        addView(caption, FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.MATCH_PARENT,
+            FrameLayout.LayoutParams.WRAP_CONTENT,
+            Gravity.BOTTOM
+        ))
+    }
+    private val names = mutableListOf<NetShare.FileRef>()
+    private var token = 0
     private val handler = Handler(Looper.getMainLooper())
-    private val tick = object : Runnable {
-        override fun run() {
-            if (uris.size > 1) {
-                index = (index + 1) % uris.size
-                showCurrent()
-            }
-            handler.postDelayed(this, 8000L)
-        }
-    }
+    private val tick = Runnable { showRandom() }
 
-    override fun bind(state: PanelState) {
-        // Photos are local; feed state unused.
-    }
+    override fun bind(state: PanelState) = Unit
 
     override fun onAppear() {
-        loadAlbum()
-        handler.removeCallbacks(tick)
-        handler.postDelayed(tick, 8000L)
+        val dir = Prefs.photoDir()
+        if (dir.isBlank()) {
+            caption.text = "在设置里填写照片目录，例如 smb://192.168.1.10/share/photos 或 http://地址/photos/"
+            photoView.setImageDrawable(null)
+            return
+        }
+        caption.text = "正在读取 $dir"
+        val mine = ++token
+        Thread {
+            val files = runCatching { NetShare.listImages(dir) }.getOrElse {
+                handler.post {
+                    if (mine == token) caption.text = "目录读不到：${it.message ?: "失败"}"
+                }
+                return@Thread
+            }
+            handler.post {
+                if (mine != token) return@post
+                names.clear()
+                names += files
+                if (names.isEmpty()) {
+                    caption.text = "这个目录里没有 jpg / png / webp"
+                } else {
+                    showRandom()
+                }
+            }
+        }.start()
     }
 
     override fun onDisappear() {
+        token++
         handler.removeCallbacks(tick)
         photoView.setImageDrawable(null)
     }
 
-    private fun hasPermission(): Boolean {
-        return if (Build.VERSION.SDK_INT >= 33) {
-            ContextCompat.checkSelfPermission(context, Manifest.permission.READ_MEDIA_IMAGES) ==
-                PackageManager.PERMISSION_GRANTED
-        } else {
-            ContextCompat.checkSelfPermission(context, Manifest.permission.READ_EXTERNAL_STORAGE) ==
-                PackageManager.PERMISSION_GRANTED
-        }
-    }
-
-    private fun loadAlbum() {
-        uris.clear()
-        if (!hasPermission()) {
-            empty.visibility = View.VISIBLE
-            empty.text = "请授予照片读取权限（设置里也可再次触发）"
-            caption.text = "无相册权限"
-            return
-        }
-        val collection = MediaStore.Images.Media.EXTERNAL_CONTENT_URI
-        val projection = arrayOf(MediaStore.Images.Media._ID, MediaStore.Images.Media.DATE_ADDED)
-        context.contentResolver.query(
-            collection,
-            projection,
-            null,
-            null,
-            "${MediaStore.Images.Media.DATE_ADDED} DESC"
-        )?.use { c ->
-            val idCol = c.getColumnIndexOrThrow(MediaStore.Images.Media._ID)
-            var n = 0
-            while (c.moveToNext() && n < 80) {
-                val id = c.getLong(idCol)
-                uris += ContentUris.withAppendedId(collection, id)
-                n++
+    private fun showRandom() {
+        if (names.isEmpty()) return
+        val file = names[Random.nextInt(names.size)]
+        caption.text = "${file.name}  ·  ${names.size} 张里随机"
+        Thread {
+            val bytes = runCatching { NetShare.readBytes(file.url) }.getOrNull()
+            handler.post {
+                if (bytes == null || bytes.isEmpty()) {
+                    caption.text = "这张读不出来：${file.name}"
+                } else {
+                    Glide.with(context.applicationContext).load(bytes).fitCenter().into(photoView)
+                }
+                handler.removeCallbacks(tick)
+                handler.postDelayed(tick, 8000L)
             }
-        }
-        if (uris.isEmpty()) {
-            empty.visibility = View.VISIBLE
-            caption.text = "相册 · 0"
-        } else {
-            empty.visibility = View.GONE
-            index = 0
-            showCurrent()
-        }
-    }
-
-    private fun showCurrent() {
-        if (uris.isEmpty()) return
-        val uri = uris[index]
-        Glide.with(photoView).load(uri).centerCrop().into(photoView)
-        caption.text = "本地相册 · ${index + 1}/${uris.size}"
+        }.start()
     }
 }

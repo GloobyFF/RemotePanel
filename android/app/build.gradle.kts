@@ -12,7 +12,7 @@ android {
         minSdk = 28
         targetSdk = 34
         versionCode = 1
-        versionName = "1.0.0-p0"
+        versionName = "1.2.0"
     }
 
     buildTypes {
@@ -48,4 +48,5 @@ dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.7.0")
     implementation("com.github.bumptech.glide:glide:4.16.0")
+    implementation("eu.agno3.jcifs:jcifs-ng:2.1.9")
 }

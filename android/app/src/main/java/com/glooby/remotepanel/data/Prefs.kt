@@ -16,10 +16,51 @@ object Prefs {
     fun dwellOverride(): Int = sp.getInt("dwellOverride", 0)
     fun setDwellOverride(v: Int) = sp.edit().putInt("dwellOverride", v.coerceIn(0, 3600)).apply()
 
-    fun pageEnabled(id: String, default: Boolean = true): Boolean {
+    fun pageEnabled(id: String, default: Boolean = PageCatalog.defaultOn(id)): Boolean {
         val key = "page.enabled.$id"
         return if (sp.contains(key)) sp.getBoolean(key, default) else default
     }
+
+    fun proxy(): String {
+        val saved = sp.getString("proxy", null)?.trim().orEmpty()
+        return saved.ifEmpty { "socks5h://192.168.28.77:1080" }
+    }
+
+    fun setProxy(value: String) = sp.edit().putString("proxy", value.trim()).apply()
+
+    fun useProxy(id: String): Boolean {
+        val key = "page.proxy.$id"
+        return if (sp.contains(key)) sp.getBoolean(key, false) else PageCatalog.defaultProxy(id)
+    }
+
+    fun setUseProxy(id: String, on: Boolean) = sp.edit().putBoolean("page.proxy.$id", on).apply()
+
+    fun helloKey(): String = sp.getString("hello.key", null)?.trim().orEmpty()
+
+    fun setHelloKey(value: String) = sp.edit().putString("hello.key", value.trim()).apply()
+
+    fun vpsToken(): String = sp.getString("vps.token", null)?.trim().orEmpty()
+
+    fun setVpsToken(value: String) = sp.edit().putString("vps.token", value.trim()).apply()
+
+    fun vpsUrl(): String {
+        val saved = sp.getString("vps.url", null)?.trim().orEmpty()
+        return saved.ifEmpty { "https://igobeat.com/api/traffic" }
+    }
+
+    fun setVpsUrl(value: String) = sp.edit().putString("vps.url", value.trim()).apply()
+
+    fun photoDir(): String = sp.getString("photo.dir", null)?.trim().orEmpty()
+    fun setPhotoDir(value: String) = sp.edit().putString("photo.dir", value.trim()).apply()
+
+    fun videoSmb(): String = sp.getString("video.smb", null)?.trim().orEmpty()
+    fun setVideoSmb(value: String) = sp.edit().putString("video.smb", value.trim()).apply()
+
+    fun shareUser(): String = sp.getString("share.user", null)?.trim().orEmpty()
+    fun setShareUser(value: String) = sp.edit().putString("share.user", value.trim()).apply()
+
+    fun sharePass(): String = sp.getString("share.pass", null).orEmpty()
+    fun setSharePass(value: String) = sp.edit().putString("share.pass", value).apply()
 
     fun setPageEnabled(id: String, enabled: Boolean) =
         sp.edit().putBoolean("page.enabled.$id", enabled).apply()

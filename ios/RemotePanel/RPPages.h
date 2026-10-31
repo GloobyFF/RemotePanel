@@ -19,6 +19,9 @@
 - (void)clearContent;
 - (void)playPageIntro;
 - (void)playPageOutro:(void (^)(void))done;
+/** Put each block off-canvas before the first paint, so the fly-in is the first thing shown. */
+- (void)parkMotionOffscreen;
+- (BOOL)rpIntroHasPlayed;
 - (NSURL *)absURL:(NSString *)path base:(NSString *)base;
 - (void)loadImageURL:(NSURL *)url into:(UIImageView *)iv;
 /** Drop decoded bitmaps held by this page (call on leave / memory warning). */
@@ -73,6 +76,9 @@ void RPPurgeImageCache(void);
 @end
 /** Fullscreen user-configured webpage (pageId prefix web-). */
 @interface RPWebPageVC : RPBasePageVC
+@end
+/** One random local/album/http video, then advance. No fly-in. Off until enabled. */
+@interface RPVideoPageVC : RPBasePageVC
 @end
 
 @interface RPPageFactory : NSObject

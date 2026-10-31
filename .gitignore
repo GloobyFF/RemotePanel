@@ -18,6 +18,7 @@ android/**/build/
 android/*.iml
 android/.idea/
 *.apk
+*.ipa
 *.aab
 *.ap_
 *.dex

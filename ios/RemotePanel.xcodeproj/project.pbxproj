@@ -35,6 +35,8 @@
 		F08BF0000000000000000000 /* Security.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = F08000000000000000000000 /* Security.framework */; };
 		F09BF0000000000000000000 /* AudioToolbox.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = F09000000000000000000000 /* AudioToolbox.framework */; };
 		F10BF0000000000000000000 /* EventKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = F10000000000000000000000 /* EventKit.framework */; };
+		F11BF0000000000000000000 /* ImageIO.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = F11000000000000000000000 /* ImageIO.framework */; };
+		F12BF0000000000000000000 /* AVFoundation.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = F12000000000000000000000 /* AVFoundation.framework */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -75,6 +77,8 @@
 		F08000000000000000000000 /* Security.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Security.framework; path = System/Library/Frameworks/Security.framework; sourceTree = SDKROOT; };
 		F09000000000000000000000 /* AudioToolbox.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = AudioToolbox.framework; path = System/Library/Frameworks/AudioToolbox.framework; sourceTree = SDKROOT; };
 		F10000000000000000000000 /* EventKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = EventKit.framework; path = System/Library/Frameworks/EventKit.framework; sourceTree = SDKROOT; };
+		F11000000000000000000000 /* ImageIO.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = ImageIO.framework; path = System/Library/Frameworks/ImageIO.framework; sourceTree = SDKROOT; };
+		F12000000000000000000000 /* AVFoundation.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = AVFoundation.framework; path = System/Library/Frameworks/AVFoundation.framework; sourceTree = SDKROOT; };
 		B150000000000000000000000 /* RemotePanel.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = RemotePanel.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
@@ -93,6 +97,8 @@
 				F08BF0000000000000000000 /* Security.framework in Frameworks */,
 				F09BF0000000000000000000 /* AudioToolbox.framework in Frameworks */,
 				F10BF0000000000000000000 /* EventKit.framework in Frameworks */,
+				F11BF0000000000000000000 /* ImageIO.framework in Frameworks */,
+				F12BF0000000000000000000 /* AVFoundation.framework in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -120,6 +126,8 @@
 				F08000000000000000000000 /* Security.framework */,
 				F09000000000000000000000 /* AudioToolbox.framework */,
 				F10000000000000000000000 /* EventKit.framework */,
+				F11000000000000000000000 /* ImageIO.framework */,
+				F12000000000000000000000 /* AVFoundation.framework */,
 			);
 			name = Frameworks;
 			sourceTree = "<group>";
