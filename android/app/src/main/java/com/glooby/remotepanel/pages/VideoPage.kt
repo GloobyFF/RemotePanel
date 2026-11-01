@@ -12,16 +12,14 @@ import com.glooby.remotepanel.data.Theme
 import com.glooby.remotepanel.net.NetShare
 import com.glooby.remotepanel.net.SmbStreamServer
 import com.glooby.remotepanel.ui.KioskActivity
+import com.glooby.remotepanel.ui.Ui
 import kotlin.random.Random
 
 /** Plays one random file from an SMB folder, then advances. */
 class VideoPage(private val context: android.content.Context) : PanelPage {
     private val video = VideoView(context)
-    private val status = TextView(context).apply {
-        setTextColor(Color.WHITE)
-        textSize = 16f
-        gravity = Gravity.CENTER
-        setPadding(36, 36, 36, 36)
+    private val status = Ui.text(context, "", Ui.H2, Color.WHITE, lines = 4, gravity = Gravity.CENTER).apply {
+        setPadding(Ui.px(60), Ui.px(60), Ui.px(60), Ui.px(60))
     }
     override val root = FrameLayout(context).apply {
         setBackgroundColor(Color.BLACK)

@@ -37,6 +37,8 @@ object Prefs {
 
     fun helloKey(): String = sp.getString("hello.key", null)?.trim().orEmpty()
 
+    fun helloModel(): String = sp.getString("hello.model", null)?.trim().orEmpty().ifEmpty { "gpt-6-astra" }
+
     fun setHelloKey(value: String) = sp.edit().putString("hello.key", value.trim()).apply()
 
     fun vpsToken(): String = sp.getString("vps.token", null)?.trim().orEmpty()

@@ -1,7 +1,7 @@
 package com.glooby.remotepanel.data
 
 import android.graphics.Color
-import com.glooby.remotepanel.net.HttpClient
+import com.glooby.remotepanel.ui.Fmt
 import org.json.JSONArray
 import org.json.JSONObject
 import java.net.URLDecoder
@@ -9,320 +9,294 @@ import java.net.URLEncoder
 import java.text.SimpleDateFormat
 import java.util.Calendar
 import java.util.Locale
-import java.util.concurrent.ConcurrentHashMap
 
 object MoreFeeds {
-    private val cache = ConcurrentHashMap<String, Pair<Long, Any>>()
+    private fun enc(s: String) = URLEncoder.encode(s, "UTF-8")
 
-    private fun proxyFor(id: String): String? = if (Prefs.useProxy(id)) Prefs.proxy() else null
-
-    private fun fresh(key: String, ttlMs: Long): Any? {
-        val hit = cache[key] ?: return null
-        if (System.currentTimeMillis() - hit.first > ttlMs) return null
-        return hit.second
-    }
-
-    private fun store(key: String, value: Any) {
-        cache[key] = System.currentTimeMillis() to value
-    }
-
-    fun github(): List<RepoCard> {
-        if (!Prefs.pageEnabled("github-news")) return emptyList()
-        fresh("github", 12 * 3600_000L)?.let { @Suppress("UNCHECKED_CAST") return it as List<RepoCard> }
-        val base = Prefs.sourceUrl("github-news")
-        val proxy = proxyFor("github-news")
-        val items = if (base.contains("/rss") || base.contains("feed") || base.endsWith(".xml")) {
-            val xml = HttpClient.getString(base, proxy = proxy)
-            Regex("<item[\\s\\S]*?</item>", RegexOption.IGNORE_CASE).findAll(xml).take(6).map { block ->
-                val title = textTag(block.value, "title")
-                RepoCard(title, textTag(block.value, "description"), "", "RSS")
-            }.filter { it.name.isNotBlank() }.toList()
-        } else {
-            val day = SimpleDateFormat("yyyy-MM-dd", Locale.US).format(
-                Calendar.getInstance().apply { add(Calendar.DAY_OF_YEAR, -30) }.time
-            )
-            val q = URLEncoder.encode("topic:ai created:>=$day fork:false archived:false", "UTF-8")
-            val url = "https://api.github.com/search/repositories?q=$q&sort=stars&order=desc&per_page=8"
-            val json = JSONObject(HttpClient.getString(url, mapOf("Accept" to "application/vnd.github+json"), proxy))
-            val arr = json.optJSONArray("items") ?: JSONArray()
-            buildList {
-                for (i in 0 until arr.length()) {
-                    if (size >= 6) break
-                    val repo = arr.optJSONObject(i) ?: continue
-                    val name = repo.optString("full_name")
-                    if (name.isBlank()) continue
-                    add(
-                        RepoCard(
-                            name = name,
-                            description = repo.optString("description").ifBlank { "这个项目没有简介。" },
-                            stars = "★ ${repo.optInt("stargazers_count")}  ${repo.optString("language")}",
-                            language = repo.optString("language")
-                        )
+    fun github(): List<RepoCard>? {
+        if (!Prefs.pageEnabled("github-news")) return null
+        return FeedCache.get("github", 6 * 3600_000L) {
+            val base = Prefs.sourceUrl("github-news")
+            val items = if (base.contains("/rss") || base.contains("feed") || base.endsWith(".xml")) {
+                Regex("<item[\\s\\S]*?</item>", RegexOption.IGNORE_CASE).findAll(FeedText.fetch("github-news", base)).take(8).map { b ->
+                    RepoCard(FeedText.decode(FeedText.slice(b.value, "title")), FeedText.decode(FeedText.slice(b.value, "description")), 0, 0, "", emptyList())
+                }.filter { it.name.isNotBlank() }.toList()
+            } else {
+                val day = SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Calendar.getInstance().apply { add(Calendar.DAY_OF_YEAR, -30) }.time)
+                val q = enc("topic:ai created:>=$day fork:false archived:false")
+                val json = JSONObject(FeedText.fetch("github-news", "https://api.github.com/search/repositories?q=$q&sort=stars&order=desc&per_page=12", mapOf("Accept" to "application/vnd.github+json")))
+                val arr = json.optJSONArray("items") ?: JSONArray()
+                (0 until arr.length()).mapNotNull { arr.optJSONObject(it) }.map { r ->
+                    val topics = r.optJSONArray("topics")?.let { t -> (0 until t.length()).map { t.optString(it) } }.orEmpty()
+                    RepoCard(
+                        r.optString("full_name"), r.optString("description").ifBlank { "这个项目没有简介。" },
+                        r.optInt("stargazers_count"), r.optInt("forks_count"), r.optString("language").takeIf { it != "null" }.orEmpty(),
+                        topics.filter { it != "ai" }.take(3),
                     )
-                }
+                }.filter { it.name.isNotBlank() }.take(8)
+            }
+            items.ifEmpty { error("没有解析到项目") }
+        }
+    }
+
+    fun trends(): TrendState? {
+        if (!Prefs.pageEnabled("x-news")) return null
+        return FeedCache.get("x", 60 * 60_000L) {
+            val html = FeedText.fetch("x-news", Prefs.sourceUrl("x-news").ifBlank { "https://getdaytrends.com/united-states/" })
+            fun rows(table: String): List<TrendItem> =
+                Regex("""<tr><th[^>]*>(\d+)</th><td class="main"><a[^>]*href="[^"]*/trend/([^"/]+)/?"[^>]*>([^<]*)</a>(?:</td><td class="details[^"]*">([^<]*)</td>)?""")
+                    .findAll(table).map { m ->
+                        val name = FeedText.decode(m.groupValues[3]).ifBlank { URLDecoder.decode(m.groupValues[2], "UTF-8") }
+                        TrendItem(m.groupValues[1].toIntOrNull() ?: 0, name, m.groupValues[4].trim())
+                    }.filter { it.name.isNotBlank() }.toList()
+            // The ranking is split over two tables (1–15, 16–50); “Most Tweeted” follows them.
+            val ranked = html.substringBefore("Most Tweeted")
+            val most = html.substringAfter("Most Tweeted", "").substringAfter("<table", "").substringBefore("</table>")
+            val state = TrendState(rows(ranked).distinctBy { it.rank }.take(20), rows(most).take(6))
+            if (state.now.isEmpty()) error("没有解析到话题")
+            state
+        }
+    }
+
+    fun xiaohongshu(): List<PostCard>? {
+        if (!Prefs.pageEnabled("xiaohongshu-hot")) return null
+        return FeedCache.get("xhs", 2 * 3600_000L) {
+            val page = Prefs.sourceUrl("xiaohongshu-hot")
+            val html = runCatching { FeedText.fetch("xiaohongshu-hot", page) }.getOrDefault("")
+            var rows = Regex("""<a class="rank-item-container"[\s\S]*?</a>""").findAll(html).mapNotNull { m ->
+                val title = FeedText.decode(Regex("""class="s-title">([^<]+)<""").find(m.value)?.groupValues?.get(1).orEmpty())
+                val heat = Regex("""class="s-tie-count">([^<]+)<""").find(m.value)?.groupValues?.get(1).orEmpty().trim()
+                val img = Regex("""url\(['"]?([^'")]+)['"]?\)""").find(m.value)?.groupValues?.get(1).orEmpty()
+                if (title.isBlank()) null else PostCard(title, img, heat = heat)
+            }.toList()
+            if (rows.isEmpty()) {
+                val text = FeedText.fetch("xiaohongshu-hot", "https://r.jina.ai/$page")
+                rows = Regex("""\d+\.\[([^\]]+)\]\((https://www\.xiaohongshu\.com/search_result[^)]+)\)([0-9.]+[wW万]?)""")
+                    .findAll(text).map { PostCard(it.groupValues[1], "", heat = it.groupValues[3]) }.toList()
+            }
+            if (rows.isEmpty()) error("没有解析到热门")
+            val seen = HashSet<String>()
+            rows.take(16).mapIndexed { i, p ->
+                if (i >= 7 || p.imageUrl.startsWith("http")) return@mapIndexed p
+                val img = runCatching { topicImage(p.title) }.getOrDefault("")
+                if (img.isNotBlank() && seen.add(img)) p.copy(imageUrl = img) else p
             }
         }
-        if (items.isEmpty()) error("没有解析到项目")
-        store("github", items)
-        return items
     }
 
-    fun trends(): List<TrendCard> {
-        if (!Prefs.pageEnabled("x-news")) return emptyList()
-        fresh("x", 2 * 3600_000L)?.let { @Suppress("UNCHECKED_CAST") return it as List<TrendCard> }
-        val url = Prefs.sourceUrl("x-news").ifBlank { "https://getdaytrends.com/united-states/" }
-        val html = HttpClient.getString(url, proxy = proxyFor("x-news"))
-        val found = LinkedHashSet<String>()
-        Regex("""/trend/([^"'/?#]+)""").findAll(html).forEach { m ->
-            val name = URLDecoder.decode(m.groupValues[1], "UTF-8").replace('+', ' ').trim()
-            if (name.length in 2..40) found += name
+    /** Best-matching photo for a topic from 360 image search (same approach as the iPad app). */
+    private fun topicImage(query: String): String {
+        val json = JSONObject(FeedText.fetch("", "https://image.so.com/j?q=${enc(query)}&src=srp&sn=0&pn=12", mapOf("Referer" to "https://image.so.com/")))
+        val list = json.optJSONArray("list") ?: return ""
+        var best = ""
+        var bestScore = 3
+        var bestArea = 0.0
+        for (i in 0 until list.length()) {
+            val r = list.optJSONObject(i) ?: continue
+            val w = r.optDouble("width", 0.0)
+            val h = r.optDouble("height", 0.0)
+            if (w in 1.0..359.0 || h in 1.0..219.0 || (h > 0 && w / h < 0.9)) continue
+            var thumb = r.optString("thumb").ifBlank { r.optString("_thumb") }
+            if (thumb.startsWith("http://")) thumb = "https://" + thumb.removePrefix("http://")
+            if (!thumb.startsWith("https://")) continue
+            val score = FeedText.overlap(query, r.optString("title"))
+            if (score > bestScore || (score == bestScore && w * h > bestArea)) {
+                best = thumb; bestScore = score; bestArea = w * h
+            }
         }
-        val items = found.take(6).map { TrendCard(it, it, "美国区热门话题") }
-        if (items.isEmpty()) error("没有解析到话题")
-        store("x", items)
-        return items
+        return best
     }
 
-    fun xiaohongshu(): List<PostCard> {
-        if (!Prefs.pageEnabled("xiaohongshu-hot")) return emptyList()
-        fresh("xhs", 2 * 3600_000L)?.let { @Suppress("UNCHECKED_CAST") return it as List<PostCard> }
-        val page = Prefs.sourceUrl("xiaohongshu-hot")
-        val text = HttpClient.getString("https://r.jina.ai/$page", proxy = proxyFor("xiaohongshu-hot"))
-        val re = Regex("""\d+\.\[([^\]]+)\]\((https://www\.xiaohongshu\.com/search_result[^)]+)\)([0-9.]+[wW]?)""")
-        val items = re.findAll(text).take(6).map { m ->
-            PostCard(m.groupValues[1], "热度 ${m.groupValues[3]}", "")
-        }.toList()
-        if (items.isEmpty()) error("没有解析到热门")
-        store("xhs", items)
-        return items
-    }
-
-    fun bilibili(): List<PostCard> {
-        if (!Prefs.pageEnabled("bilibili-hot")) return emptyList()
-        fresh("bili", 2 * 3600_000L)?.let { @Suppress("UNCHECKED_CAST") return it as List<PostCard> }
-        val url = Prefs.sourceUrl("bilibili-hot").ifBlank {
-            "https://api.bilibili.com/x/web-interface/popular?ps=8&pn=1"
-        }
-        val json = JSONObject(
-            HttpClient.getString(url, mapOf("Referer" to "https://www.bilibili.com"), proxyFor("bilibili-hot"))
-        )
-        val list = json.optJSONObject("data")?.optJSONArray("list") ?: error("没有解析到热门")
-        val items = buildList {
-            for (i in 0 until list.length()) {
-                if (size >= 6) break
-                val row = list.optJSONObject(i) ?: continue
-                val title = row.optString("title")
-                if (title.isBlank()) continue
-                val owner = row.optJSONObject("owner")?.optString("name").orEmpty()
-                val views = row.optJSONObject("stat")?.optLong("view") ?: 0L
-                val dur = row.optInt("duration")
-                val desc = row.optString("desc").take(80)
-                val viewText = if (views >= 10000) {
-                    String.format(Locale.US, "%.1f万", views / 10000.0)
-                } else {
-                    views.toString()
-                }
-                val bits = listOfNotNull(
-                    owner.takeIf { it.isNotBlank() },
-                    if (views > 0) "播放 $viewText" else null,
-                    desc.takeIf { it.isNotBlank() },
-                    if (dur > 0) "时长 ${dur / 60}:${(dur % 60).toString().padStart(2, '0')}" else null
+    fun bilibili(): List<PostCard>? {
+        if (!Prefs.pageEnabled("bilibili-hot")) return null
+        return FeedCache.get("bili", 60 * 60_000L) {
+            val url = Prefs.sourceUrl("bilibili-hot").ifBlank { "https://api.bilibili.com/x/web-interface/popular?ps=10&pn=1" }
+            val list = JSONObject(FeedText.fetch("bilibili-hot", url, mapOf("Referer" to "https://www.bilibili.com"))).optJSONObject("data")?.optJSONArray("list")
+                ?: error("没有解析到热门")
+            (0 until list.length()).mapNotNull { list.optJSONObject(it) }.mapNotNull { r ->
+                val title = FeedText.decode(r.optString("title")).ifBlank { return@mapNotNull null }
+                val stat = r.optJSONObject("stat") ?: JSONObject()
+                PostCard(
+                    title = title,
+                    imageUrl = r.optString("pic"),
+                    heat = Fmt.count(stat.optLong("view")),
+                    author = r.optJSONObject("owner")?.optString("name").orEmpty(),
+                    stats = listOfNotNull(
+                        Fmt.count(stat.optLong("like")).takeIf { it.isNotBlank() }?.let { "赞 $it" },
+                        Fmt.count(stat.optLong("danmaku")).takeIf { it.isNotBlank() }?.let { "弹幕 $it" },
+                    ),
+                    badge = r.optString("tname"),
+                    duration = Fmt.duration(r.optInt("duration")),
                 )
-                var pic = row.optString("pic")
-                if (pic.startsWith("http://")) pic = "https://" + pic.removePrefix("http://")
-                add(PostCard(title, bits.joinToString(" · "), pic))
+            }.take(10).ifEmpty { error("没有解析到热门") }
+        }
+    }
+
+    fun movies(): List<CoverCard>? {
+        if (!Prefs.pageEnabled("movie-now-showing")) return null
+        return FeedCache.get("movies", 6 * 3600_000L) {
+            val list = JSONObject(FeedText.fetch("movie-now-showing", Prefs.sourceUrl("movie-now-showing"))).optJSONArray("movieList")
+                ?: error("没有解析到电影")
+            (0 until list.length()).mapNotNull { list.optJSONObject(it) }.mapNotNull { m ->
+                val title = m.optString("nm").ifBlank { return@mapNotNull null }
+                val sc = m.optDouble("sc", 0.0)
+                val wish = m.optLong("wish")
+                CoverCard(
+                    title = title,
+                    imageUrl = m.optString("img"),
+                    subtitle = m.optString("star"),
+                    meta = m.optString("showInfo").ifBlank { m.optString("rt").let { if (it.isBlank()) "" else "$it 上映" } },
+                    badge = m.optString("version").uppercase().replace("V2D", "").replace("V3D", "3D").trim(),
+                    score = if (sc > 0) String.format(Locale.US, "%.1f", sc) else if (wish > 0) "${Fmt.count(wish)}想看" else "",
+                )
+            }.take(8).ifEmpty { error("没有解析到电影") }
+        }
+    }
+
+    fun steam(): SteamBoard? {
+        if (!Prefs.pageEnabled("steam-new-releases") && !Prefs.pageEnabled("steam-new-releases-2")) return null
+        return FeedCache.get("steam", 6 * 3600_000L) {
+            val json = JSONObject(FeedText.fetch("steam-new-releases", Prefs.sourceUrl("steam-new-releases")))
+            fun list(key: String, n: Int): List<CoverCard> {
+                val arr = json.optJSONObject(key)?.optJSONArray("items") ?: return emptyList()
+                val seen = HashSet<Int>()
+                return (0 until arr.length()).mapNotNull { arr.optJSONObject(it) }.mapNotNull { r ->
+                    if (!seen.add(r.optInt("id"))) return@mapNotNull null
+                    val name = r.optString("name").ifBlank { return@mapNotNull null }
+                    val fin = r.optInt("final_price")
+                    val orig = r.optInt("original_price", 0)
+                    val off = r.optInt("discount_percent")
+                    CoverCard(
+                        title = name,
+                        imageUrl = r.optString("header_image").ifBlank { r.optString("large_capsule_image") },
+                        price = if (fin > 0) "¥${fin / 100}" else if (r.isNull("original_price")) "" else "免费",
+                        oldPrice = if (off > 0 && orig > fin) "¥${orig / 100}" else "",
+                        badge = if (off > 0) "-$off%" else "",
+                    )
+                }.take(n)
             }
-        }
-        if (items.isEmpty()) error("没有解析到热门")
-        store("bili", items)
-        return items
-    }
-
-    fun movies(): List<CoverCard> {
-        if (!Prefs.pageEnabled("movie-now-showing")) return emptyList()
-        fresh("movies", 24 * 3600_000L)?.let { @Suppress("UNCHECKED_CAST") return it as List<CoverCard> }
-        val url = Prefs.sourceUrl("movie-now-showing")
-        val json = JSONObject(HttpClient.getString(url))
-        val list = json.optJSONArray("movieList") ?: error("没有解析到电影")
-        val items = buildList {
-            for (i in 0 until list.length()) {
-                if (size >= 8) break
-                val movie = list.optJSONObject(i) ?: continue
-                val title = movie.optString("nm")
-                if (title.isBlank()) continue
-                add(CoverCard(title, movie.optString("rt"), movie.optString("img")))
-            }
-        }
-        if (items.isEmpty()) error("没有解析到电影")
-        store("movies", items)
-        return items
-    }
-
-    fun steam(): Pair<List<CoverCard>, List<CoverCard>> {
-        val want = Prefs.pageEnabled("steam-new-releases") || Prefs.pageEnabled("steam-new-releases-2")
-        if (!want) return emptyList<CoverCard>() to emptyList()
-        fresh("steam", 24 * 3600_000L)?.let {
-            @Suppress("UNCHECKED_CAST")
-            return it as Pair<List<CoverCard>, List<CoverCard>>
-        }
-        val url = Prefs.sourceUrl("steam-new-releases")
-        val json = JSONObject(HttpClient.getString(url, proxy = proxyFor("steam-new-releases")))
-        val freshItems = steamList(json.optJSONObject("new_releases")?.optJSONArray("items"))
-        val hot = steamList(json.optJSONObject("top_sellers")?.optJSONArray("items"))
-        if (freshItems.isEmpty() && hot.isEmpty()) error("没有解析到游戏")
-        val pair = freshItems to hot
-        store("steam", pair)
-        return pair
-    }
-
-    private fun steamList(arr: JSONArray?): List<CoverCard> {
-        if (arr == null) return emptyList()
-        return buildList {
-            for (i in 0 until arr.length()) {
-                if (size >= 6) break
-                val row = arr.optJSONObject(i) ?: continue
-                val title = row.optString("name")
-                if (title.isBlank()) continue
-                val cents = row.optInt("final_price")
-                val price = if (cents > 0) "¥${cents / 100}" else ""
-                val off = row.optInt("discount_percent")
-                val meta = listOfNotNull(
-                    if (off > 0) "-$off%" else null,
-                    price.takeIf { it.isNotBlank() }
-                ).joinToString(" ")
-                val img = row.optString("header_image").ifBlank { row.optString("large_capsule_image") }
-                add(CoverCard(title, meta, img))
-            }
+            val board = SteamBoard(list("new_releases", 10), list("top_sellers", 10), list("specials", 6))
+            if (board.newReleases.isEmpty() && board.topSellers.isEmpty()) error("没有解析到游戏")
+            board
         }
     }
 
-    fun covers(pageId: String, cacheKey: String): List<CoverCard> {
-        if (!Prefs.pageEnabled(pageId)) return emptyList()
-        fresh(cacheKey, 24 * 3600_000L)?.let { @Suppress("UNCHECKED_CAST") return it as List<CoverCard> }
-        val url = Prefs.sourceUrl(pageId)
-        if (url.isBlank()) return emptyList()
-        val html = HttpClient.getString(url, proxy = proxyFor(pageId))
-        val items = mutableListOf<CoverCard>()
-        val imgRe = Regex("""<img[^>]+(?:data-src|src)=["']([^"']+)["']""", RegexOption.IGNORE_CASE)
-        for (m in imgRe.findAll(html)) {
-            if (items.size >= 9) break
-            var src = m.groupValues[1]
-            if (src.startsWith("//")) src = "https:$src"
-            if (!src.startsWith("http")) continue
-            val low = src.lowercase()
-            if (low.contains("logo") || low.contains("icon") || low.endsWith(".svg") || low.contains("avatar")) continue
-            val windowStart = (m.range.first - 80).coerceAtLeast(0)
-            val window = html.substring(windowStart, (m.range.last + 280).coerceAtMost(html.length))
-            val title = Regex("""alt=["']([^"']{2,48})["']""").find(window)?.groupValues?.get(1)
-                ?: Regex("""title=["']([^"']{2,48})["']""").find(window)?.groupValues?.get(1)
-                ?: continue
-            val clean = decode(title)
-            if (clean.length < 2) continue
-            items += CoverCard(clean, "", src)
+    private val hotTags = setOf("IGN必玩推荐榜", "3A巨作")
+    private val noise = setOf("解压即撸", "NSP", "NSZ", "XCI", "")
+    /** Version words that gamer520 glues onto the game name; “非虚拟机版” must come before “虚拟机版”. */
+    private val titleTags = listOf("非虚拟机版", "虚拟机版", "移植版", "解压即撸")
+
+    /** WordPress game listings (gamer520, 2468c): one <article> per game, cover in data-src. */
+    fun covers(pageId: String, cacheKey: String): List<CoverCard>? {
+        if (!Prefs.pageEnabled(pageId)) return null
+        val url = Prefs.sourceUrl(pageId).ifBlank { return null }
+        return FeedCache.get(cacheKey, 6 * 3600_000L) {
+            val html = FeedText.fetch(pageId, url)
+            Regex("<article[\\s\\S]*?</article>").findAll(html).mapNotNull { m ->
+                val a = m.value
+                val raw = FeedText.decode(Regex("""<h2 class="entry-title">\s*<a[^>]*>([\s\S]*?)</a>""").find(a)?.groupValues?.get(1).orEmpty())
+                if (raw.isBlank()) return@mapNotNull null
+                val parts = raw.split('|').map { it.trim() }
+                var title = parts.first()
+                val extra = mutableListOf<String>()
+                for (tag in titleTags) {
+                    if (!title.contains(tag)) continue
+                    title = title.replace(tag, "").replace(Regex("\\s+"), " ").trim()
+                    if (tag != "解压即撸") extra += tag
+                }
+                var sub = (extra + parts.drop(1).filter { it !in noise }).take(2).joinToString(" · ")
+                if (sub.isEmpty()) {
+                    // PS5 titles look like “中文名.English Name”
+                    val dot = title.indexOf('.')
+                    if (dot in 2 until title.length - 2) {
+                        sub = title.substring(dot + 1).trim(); title = title.substring(0, dot).trim()
+                    }
+                }
+                val img = Regex("""<img[^>]*?\b(?:data-src|data-original|data-lazy-src)=["'](https?://[^"']+)["']""").find(a)?.groupValues?.get(1)
+                    ?: Regex("""<img[^>]*?\bsrc=["'](https?://[^"']+)["']""").find(a)?.groupValues?.get(1).orEmpty()
+                val time = FeedText.parseDate(Regex("""<time datetime="([^"]+)"""").find(a)?.groupValues?.get(1).orEmpty())
+                val cats = Regex("""rel="category">\s*(?:<i[^>]*></i>)?([^<]+)<""").findAll(a).map { it.groupValues[1].trim() }.toList()
+                CoverCard(
+                    title = title, imageUrl = img, subtitle = sub, time = time,
+                    badge = cats.firstOrNull { it in hotTags }.orEmpty(),
+                )
+            }.take(12).toList().ifEmpty { error("封面没读到") }
         }
-        if (items.isEmpty()) error("封面没读到")
-        store(cacheKey, items)
-        return items
     }
 
     fun vps(): VpsState? {
         if (!Prefs.pageEnabled("weather")) return null
-        val token = Prefs.vpsToken()
-        if (token.isEmpty()) return null
-        fresh("vps", 24 * 3600_000L)?.let { return it as VpsState }
-        val raw = HttpClient.getString(
-            Prefs.vpsUrl(),
-            mapOf("Authorization" to "Bearer $token")
-        )
-        val json = JSONObject(raw)
-        val data = json.optJSONObject("data") ?: json
-        val state = VpsState(
-            used = data.optString("used").ifBlank { data.optString("used_traffic", "-") },
-            remain = data.optString("remain").ifBlank { data.optString("remaining", "-") },
-            status = data.optString("status").ifBlank { data.optString("message", "流量") },
-            cycle = data.optString("cycle").ifBlank { "本月" }
-        )
-        store("vps", state)
-        return state
+        val token = Prefs.vpsToken().ifEmpty { return null }
+        return FeedCache.get("vps", 3 * 3600_000L) {
+            val json = JSONObject(com.glooby.remotepanel.net.HttpClient.getString(Prefs.vpsUrl(), mapOf("Authorization" to "Bearer $token")))
+            val monthly = json.optJSONObject("monthly") ?: json.optJSONObject("data") ?: json
+            val cycle = json.optJSONObject("cycle")
+            val alert = json.optJSONObject("alert")
+            VpsState(
+                used = monthly.optString("used_human").ifBlank { monthly.optString("used", "-") },
+                remain = monthly.optString("remaining_human").ifBlank { monthly.optString("remain", "-") },
+                status = alert?.optString("message")?.ifBlank { alert.optString("level") } ?: monthly.optString("status", ""),
+                cycle = if (cycle != null) "${cycle.optString("start").take(10)} → ${cycle.optString("end").take(10)}" else monthly.optString("cycle", ""),
+                percent = monthly.optDouble("percent_used", Double.NaN),
+            )
+        }
     }
 
     fun printer(): PrintState? {
         if (!Prefs.pageEnabled("print")) return null
-        val url = Prefs.sourceUrl("print")
-        if (url.isBlank()) return null
-        fresh("print", 10 * 60_000L)?.let { return it as PrintState }
-        val body = HttpClient.getString(url, proxy = proxyFor("print"))
-        val parsed = JSONArray().also { arr ->
-            val trimmed = body.trim()
-            if (trimmed.startsWith("[")) {
-                val src = JSONArray(trimmed)
-                for (i in 0 until src.length()) arr.put(src.opt(i))
-            } else {
-                arr.put(JSONObject(trimmed))
-            }
-        }
-        var primary = parsed.optJSONObject(0) ?: JSONObject()
+        val url = Prefs.sourceUrl("print").ifBlank { return null }
+        return FeedCache.get("print", 2 * 60_000L) { parsePrinter(url) }
+    }
+
+    private fun parsePrinter(url: String): PrintState {
+        val body = FeedText.fetch("print", url).trim()
+        var primary = if (body.startsWith("[")) JSONArray(body).optJSONObject(0) ?: JSONObject() else JSONObject(body)
         val id = primary.optString("id")
         if (id.isNotBlank()) {
-            val detailUrl = if (url.endsWith("/")) "$url$id" else "$url/$id"
-            val detail = runCatching { JSONObject(HttpClient.getString(detailUrl, proxy = proxyFor("print"))) }.getOrNull()
-            if (detail != null && detail.length() > 0) primary = detail
+            runCatching { JSONObject(FeedText.fetch("print", if (url.endsWith("/")) "$url$id" else "$url/$id")) }.getOrNull()
+                ?.takeIf { it.length() > 0 }?.let { primary = it }
         }
         val temps = primary.optJSONObject("temps") ?: JSONObject()
-        val chips = mutableListOf<TempChip>()
-        fun addTemp(label: String, key: String) {
-            val v = temps.opt(key) ?: return
-            if (v == JSONObject.NULL) return
-            chips += TempChip(label, "$v°")
+        val chips = listOf("喷嘴" to "nozzle", "热床" to "bed", "腔体" to "chamber").mapNotNull { (label, key) ->
+            val v = temps.opt(key)
+            if (v == null || v == JSONObject.NULL) null else TempChip(label, "${(v as? Number)?.toInt() ?: v}°")
         }
-        addTemp("热床", "bed")
-        addTemp("腔体", "chamber")
-        addTemp("喷嘴", "nozzle")
         val slots = mutableListOf<FilamentSlot>()
         val ams = primary.optJSONArray("ams") ?: JSONArray()
         for (u in 0 until ams.length()) {
             val unit = ams.optJSONObject(u) ?: continue
-            val tray = unit.optJSONArray("trays") ?: unit.optJSONArray("slots") ?: JSONArray()
+            val tray = unit.optJSONArray("trays") ?: unit.optJSONArray("slots") ?: continue
             for (s in 0 until tray.length()) {
                 val slot = tray.optJSONObject(s) ?: continue
                 val bound = slot.optJSONObject("bound") ?: slot
-                val name = bound.optString("name").ifBlank { slot.optString("type").ifBlank { "空" } }
-                val pct = bound.optDouble("remainingPercent", slot.optDouble("remainPercent", 0.0))
-                val hex = bound.optString("colorHex").ifBlank { slot.optString("colorHex") }
+                val type = bound.optString("type").ifBlank { slot.optString("type") }
                 slots += FilamentSlot(
-                    name = name,
-                    percent = "${pct.toInt()}%",
-                    color = parseHex(hex),
-                    kind = "AMS ${u + 1} · ${bound.optString("type").ifBlank { slot.optString("type") }}"
+                    name = bound.optString("name").ifBlank { type.ifBlank { "空" } },
+                    percent = bound.optDouble("remainingPercent", slot.optDouble("remainPercent", -1.0)).toInt(),
+                    color = parseHex(bound.optString("colorHex").ifBlank { slot.optString("colorHex") }),
+                    kind = "A${u + 1}-${s + 1}" + if (type.isNotBlank()) " $type" else "",
                 )
             }
         }
-        val prog = primary.optDouble("progress", 0.0)
-        val state = PrintState(
+        val layer = primary.optString("layer")
+        val total = primary.optString("totalLayers")
+        return PrintState(
             online = primary.optBoolean("online"),
-            title = listOf(primary.optString("name"), primary.optString("model")).filter { it.isNotBlank() }.joinToString(" · ").ifBlank { "打印机" },
+            title = run {
+                val name = primary.optString("name")
+                val model = primary.optString("model")
+                // “高级玩具H2D · H2D” → “高级玩具H2D”
+                val parts = if (model.isNotBlank() && !name.contains(model)) listOf(name, model) else listOf(name.ifBlank { model })
+                parts.filter { it.isNotBlank() }.joinToString(" · ").ifBlank { "打印机" }
+            },
             status = primary.optString("statusText").ifBlank { primary.optString("status").ifBlank { "-" } },
-            progress = "${prog.toInt()}%",
-            detail = primary.optString("fileName"),
+            progress = primary.optDouble("progress", 0.0),
+            fileName = primary.optString("fileName"),
+            remainMinutes = primary.optInt("remainingMinutes", -1),
+            layer = if (layer.isNotBlank() && total.isNotBlank()) "$layer / $total" else "",
             temps = chips,
-            slots = slots
+            slots = slots,
         )
-        store("print", state)
-        return state
-    }
-
-    private fun textTag(xml: String, tag: String): String {
-        val open = Regex("""<$tag[^>]*>""", RegexOption.IGNORE_CASE).find(xml) ?: return ""
-        val end = xml.indexOf("</$tag>", open.range.last, ignoreCase = true)
-        if (end < 0) return ""
-        return decode(xml.substring(open.range.last + 1, end))
-    }
-
-    private fun decode(text: String): String {
-        var s = text.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
-            .replace("&quot;", "\"").replace("&#39;", "'")
-        s = Regex("<[^>]+>").replace(s, " ")
-        return Regex("\\s+").replace(s, " ").trim()
     }
 
     private fun parseHex(raw: String): Int {

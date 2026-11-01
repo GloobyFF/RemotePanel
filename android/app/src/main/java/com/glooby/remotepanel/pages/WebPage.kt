@@ -61,8 +61,11 @@ class WebPage(
     }
 
     override fun onDisappear() {
+        // A new WebPage (and WebView) is created each time this page comes round, so free the old one.
         web.stopLoading()
-        web.loadUrl("about:blank")
+        web.webViewClient = WebViewClient()
+        (web.parent as? android.view.ViewGroup)?.removeView(web)
+        web.destroy()
         lastUrl = null
     }
 

@@ -9,6 +9,8 @@ interface PanelPage {
     fun bind(state: PanelState)
     fun onAppear() {}
     fun onDisappear() {}
+    /** Called about once a second while the page is on screen. */
+    fun tick() {}
 }
 
 interface PanelPageFactory {

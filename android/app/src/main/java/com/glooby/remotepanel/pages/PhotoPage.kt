@@ -12,6 +12,7 @@ import com.glooby.remotepanel.data.PanelState
 import com.glooby.remotepanel.data.Prefs
 import com.glooby.remotepanel.data.Theme
 import com.glooby.remotepanel.net.NetShare
+import com.glooby.remotepanel.ui.Ui
 import kotlin.random.Random
 
 /** Full-screen random photo from a network folder (SMB or HTTP directory). */
@@ -20,11 +21,9 @@ class PhotoPage(private val context: android.content.Context) : PanelPage {
         scaleType = ImageView.ScaleType.FIT_CENTER
         setBackgroundColor(Color.BLACK)
     }
-    private val caption = TextView(context).apply {
-        setTextColor(Color.WHITE)
-        textSize = 14f
-        setBackgroundColor(0x88000000.toInt())
-        setPadding(24, 12, 24, 12)
+    private val caption = Ui.text(context, "", Ui.BODY, Color.WHITE, lines = 2).apply {
+        setBackgroundColor(0x99000000.toInt())
+        setPadding(Ui.px(Ui.PAD), Ui.px(20), Ui.px(Ui.PAD), Ui.px(24))
     }
     override val root = FrameLayout(context).apply {
         setBackgroundColor(Theme.bg())
