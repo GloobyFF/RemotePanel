@@ -107,6 +107,19 @@ static NSString *const kDwellStock = @"ZJ.dwellStock";
     return NO;
 }
 
++ (BOOL)shouldFetch {
+    // Wider than marketIsOpen: the closing auction settles at 15:00, so keep fetching
+    // until 15:05 (and from 9:15 for the opening auction) or the close is never seen.
+    NSCalendar *cal = [[NSCalendar alloc] initWithCalendarIdentifier:NSCalendarIdentifierGregorian];
+    cal.timeZone = [NSTimeZone timeZoneWithName:@"Asia/Shanghai"];
+    NSDateComponents *c = [cal components:NSCalendarUnitWeekday | NSCalendarUnitHour | NSCalendarUnitMinute fromDate:[NSDate date]];
+    if (c.weekday < 2 || c.weekday > 6) return NO;
+    NSInteger m = c.hour * 60 + c.minute;
+    if (m >= 9 * 60 + 15 && m < 11 * 60 + 35) return YES;
+    if (m >= 12 * 60 + 55 && m < 15 * 60 + 5) return YES;
+    return NO;
+}
+
 + (NSString *)sessionTitle {
     return [self marketIsOpen] ? @"交易中 · 每分钟更新" : @"未开盘 · 最后成交";
 }

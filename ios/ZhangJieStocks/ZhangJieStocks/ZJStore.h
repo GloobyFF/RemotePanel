@@ -13,6 +13,8 @@
 + (NSDictionary *)quoteForCode:(NSString *)code;
 + (void)mergeQuotes:(NSArray *)items;
 + (BOOL)marketIsOpen;
+/** Fetch window: trading hours plus the opening (9:15) and closing (until 15:05) auctions. */
++ (BOOL)shouldFetch;
 + (NSInteger)dwellSummary;
 + (NSInteger)dwellStock;
 + (void)setDwellSummary:(NSInteger)summary stock:(NSInteger)stock;

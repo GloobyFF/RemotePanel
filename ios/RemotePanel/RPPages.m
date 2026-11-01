@@ -37,6 +37,15 @@ static char kRPDismissDimKey;
 static char kRPReminderID;
 /** Soft cap for decoded bitmaps on iPad 3 (1024×768 @2x still huge if kept full-res). */
 static const CGFloat kRPImageMaxSide = 480.0;
+/** String value or @"" (NSNull, numbers and the literal "(null)" all handled). */
+static NSString *RPStringish(id value) {
+    if ([value isKindOfClass:[NSString class]]) return [(NSString *)value isEqualToString:@"(null)"] ? @"" : value;
+    if ([value isKindOfClass:[NSNumber class]]) return [(NSNumber *)value stringValue];
+    return @"";
+}
+
+/* Longest the fly-in waits for covers before starting with whatever has loaded.
+   Kept at 1.35 s: halving it would just start more pages with empty tiles. */
 static const NSTimeInterval kRPIntroImageWait = 1.35;
 
 static NSCache *RPImageCache(void) {
@@ -44,9 +53,11 @@ static NSCache *RPImageCache(void) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         c = [[NSCache alloc] init];
-        c.countLimit = 16;
-        // iPad 3 dies if several full-size posters decode at once.
-        c.totalCostLimit = 12 * 1024 * 1024;
+        c.countLimit = 24;
+        // iPad 3 dies if several full-size posters decode at once. 24 MB holds one
+        // page of 10 covers at tile size (~1.3 MB each at 720×336) plus the next page's
+        // prefetch; NSCache evicts beyond that, and on memory warnings.
+        c.totalCostLimit = 24 * 1024 * 1024;
     });
     return c;
 }
@@ -129,7 +140,8 @@ void RPPrefetchImagesForPage(NSString *pageId, NSDictionary *state, NSString *ba
         if ([pageId isEqualToString:@"github-news"]) items = state[@"news"][@"github_items"] ?: state[@"news"][@"github"];
         else if ([pageId isEqualToString:@"x-news"]) items = state[@"news"][@"x_items"] ?: state[@"news"][@"x"];
         else if ([pageId isEqualToString:@"xiaohongshu-hot"]) items = state[@"news"][@"xhs_items"] ?: state[@"news"][@"xiaohongshu"];
-        else if ([pageId isEqualToString:@"bilibili-hot"]) items = state[@"bilibili"][@"items"] ?: state[@"news"][@"bilibili_items"];
+        // RPLocalFeed -assemble writes news.bili_items; the other keys are from the old :9121 server.
+        else if ([pageId isEqualToString:@"bilibili-hot"]) items = state[@"news"][@"bili_items"] ?: state[@"bilibili"][@"items"] ?: state[@"news"][@"bilibili_items"];
         else items = state[@"news"][@"daily_items"] ?: state[@"news"][@"daily"];
         NSInteger n = 0;
         for (NSDictionary *it in (items ?: @[])) {
@@ -150,7 +162,8 @@ void RPPrefetchImagesForPage(NSString *pageId, NSDictionary *state, NSString *ba
                 if (proxy.length == 0) proxy = RPLocalDefaultProxy();
             }
             NSData *data = [RPNet syncGET:key proxy:proxy headers:nil timeout:16 error:&error];
-            UIImage *img = RPImageFromData(data, kRPImageMaxSide);
+            // Match the size the cover pages now draw at, so the prefetched copy is used as-is.
+            UIImage *img = RPImageFromData(data, 720.0);
             if (img) RPCacheImage(key, img);
         }
     });
@@ -239,16 +252,14 @@ static NSString *RPHashObject(id obj) {
     if (_pendingImageLoads > 0) _pendingImageLoads -= 1;
     [self tryPlayIntro];
 }
+static void RPPurgeImages(UIView *root) {
+    if ([root isKindOfClass:[UIImageView class]]) ((UIImageView *)root).image = nil;
+    for (UIView *sub in root.subviews) RPPurgeImages(sub);
+}
 - (void)purgeDisplayedImages {
-    void (^walk)(UIView *) = nil;
-    __block void (^walkBlock)(UIView *) = ^(UIView *root) {
-        if ([root isKindOfClass:[UIImageView class]]) {
-            ((UIImageView *)root).image = nil;
-        }
-        for (UIView *sub in root.subviews) walkBlock(sub);
-    };
-    walk = walkBlock;
-    walk(self.contentView);
+    // A plain C function: the old self-referencing __block block was a retain cycle
+    // that leaked one block (and everything it captured) on every page turn.
+    RPPurgeImages(self.contentView);
 }
 - (NSInteger)rpMotionKind {
     NSArray *ids = @[@"hello", @"schedule", @"weather", @"daily-news", @"github-news", @"x-news", @"xiaohongshu-hot", @"bilibili-hot", @"stocks-cn", @"crypto", @"person-photo-local-1", @"print", @"movie-now-showing", @"steam-new-releases", @"steam-new-releases-2", @"gamer520-pc-latest", @"person-photo-local-2", @"gamer520-switch-latest", @"ps5-games-latest"];
@@ -327,7 +338,8 @@ static NSString *RPHashObject(id obj) {
             v.transform = start;
             v.alpha = 1;
         }];
-        [UIView animateWithDuration:2.3 delay:MIN(0.55, i * 0.07) options:UIViewAnimationOptionCurveEaseOut animations:^{
+        // Fly-in, half the old 2.3 s / 0.07 s stagger (owner asked for twice as fast).
+        [UIView animateWithDuration:1.15 delay:MIN(0.28, i * 0.035) options:UIViewAnimationOptionCurveEaseOut animations:^{
             v.transform = CGAffineTransformIdentity;
             v.alpha = 1;
         } completion:nil];
@@ -343,7 +355,8 @@ static NSString *RPHashObject(id obj) {
     __block NSInteger left = (NSInteger)views.count;
     [views enumerateObjectsUsingBlock:^(UIView *v, NSUInteger i, BOOL *stop) {
         [v.layer removeAllAnimations];
-        [UIView animateWithDuration:2.1 delay:MIN(0.35, i * 0.04) options:UIViewAnimationOptionCurveEaseIn animations:^{
+        // Fly-out, half the old 2.1 s / 0.04 s stagger.
+        [UIView animateWithDuration:1.05 delay:MIN(0.18, i * 0.02) options:UIViewAnimationOptionCurveEaseIn animations:^{
             v.transform = [self rpMotionShift:kind index:(NSInteger)i outro:YES];
             v.alpha = 0.15;
         } completion:^(BOOL finished) {
@@ -572,6 +585,10 @@ static NSString *RPHashObject(id obj) {
         return;
     }
     UIImage *cached = [RPImageCache() objectForKey:key];
+    // A copy decoded smaller than this tile needs (e.g. by an older prefetch) would
+    // look soft; ignore it and decode again at the right size.
+    CGFloat needPx = MAX(iv.bounds.size.width, iv.bounds.size.height) * MIN(2.0, [UIScreen mainScreen].scale);
+    if (cached && MAX(cached.size.width, cached.size.height) * cached.scale + 1 < MIN(1024.0, MAX(kRPImageMaxSide, needPx)) * 0.9) cached = nil;
     if (cached) {
         iv.image = cached;
         objc_setAssociatedObject(iv, &kRPImageURLKey, key, OBJC_ASSOCIATION_COPY_NONATOMIC);
@@ -579,6 +596,10 @@ static NSString *RPHashObject(id obj) {
     }
     objc_setAssociatedObject(iv, &kRPImageURLKey, key, OBJC_ASSOCIATION_COPY_NONATOMIC);
     [self noteImageLoadBegan];
+    // Decode at the tile's pixel size (retina ×2), not a fixed 480 px: the larger
+    // cover tiles are ~720 px wide and looked soft. Never above 1024 px per image.
+    CGFloat px = MAX(iv.bounds.size.width, iv.bounds.size.height) * MIN(2.0, [UIScreen mainScreen].scale);
+    CGFloat decodeSide = MIN(1024.0, MAX(kRPImageMaxSide, px));
     __weak typeof(self) weakSelf = self;
     __weak UIImageView *weakIV = iv;
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
@@ -589,7 +610,7 @@ static NSString *RPHashObject(id obj) {
             if (proxy.length == 0) proxy = RPLocalDefaultProxy();
         }
         NSData *data = [RPNet syncGET:key proxy:proxy headers:nil timeout:18 error:&error];
-        UIImage *img = RPImageFromData(data, kRPImageMaxSide);
+        UIImage *img = RPImageFromData(data, decodeSide);
         if (img) RPCacheImage(key, img);
         dispatch_async(dispatch_get_main_queue(), ^{
             UIImageView *strongIV = weakIV;
@@ -1140,7 +1161,11 @@ static NSString *RPShortNumber(id value) {
         [self layoutTrendGrid:items bounds:b];
         return;
     }
-    if ([kind isEqualToString:@"xhs"] || [kind isEqualToString:@"bili"]) {
+    if ([kind isEqualToString:@"xhs"]) {
+        [self layoutXhsBoard:items bounds:b base:baseURL];
+        return;
+    }
+    if ([kind isEqualToString:@"bili"]) {
         [self layoutCoverGrid:items bounds:b base:baseURL];
         return;
     }
@@ -1361,6 +1386,181 @@ static NSString *RPShortNumber(id value) {
         [self.contentView addSubview:card];
     }
 }
+/** Rank badge: 1 red, 2 orange, 3 accent, rest muted. */
+- (UILabel *)rpRankBadge:(NSInteger)rank side:(CGFloat)side {
+    UILabel *l = [self makeLabel:[RPTheme mono:floor(side * 0.56)] color:[UIColor whiteColor]];
+    l.text = [NSString stringWithFormat:@"%ld", (long)rank];
+    l.textAlignment = NSTextAlignmentCenter;
+    l.numberOfLines = 1;
+    l.adjustsFontSizeToFitWidth = YES;
+    l.minimumScaleFactor = 0.6;
+    UIColor *bg = rank == 1 ? [RPTheme bad] : rank == 2 ? [UIColor colorWithRed:1 green:0.55 blue:0.15 alpha:1] : rank == 3 ? [RPTheme accent] : [UIColor colorWithWhite:0 alpha:0.45];
+    l.backgroundColor = bg;
+    if (rank == 3) l.textColor = [UIColor blackColor];
+    l.layer.cornerRadius = 8;
+    l.clipsToBounds = YES;
+    l.frame = CGRectMake(0, 0, side, side);
+    return l;
+}
+
+/** Photo with a bottom gradient carrying title + heat, rank badge top-left. */
+- (UIView *)rpXhsPhotoTile:(NSDictionary *)it rank:(NSInteger)rank frame:(CGRect)f base:(NSString *)baseURL titleSize:(CGFloat)ts {
+    UIView *tile = [[UIView alloc] initWithFrame:f];
+    tile.layer.cornerRadius = 14;
+    tile.clipsToBounds = YES;
+    tile.backgroundColor = [RPTheme cardTint:rank + [self rpPageColorBias]];
+    UIImageView *iv = [[UIImageView alloc] initWithFrame:tile.bounds];
+    iv.contentMode = UIViewContentModeScaleAspectFill;
+    iv.clipsToBounds = YES;
+    [tile addSubview:iv];
+    NSString *title = RPStringish(it[@"title"]);
+    NSString *img = RPStringish(it[@"image_url"]);
+    if (img.length) {
+        [self loadImageURL:[self absURL:img base:baseURL] into:iv];
+    } else {
+        // No photo found: a large first character on the tint, not an empty hole.
+        UILabel *mark = [self makeLabel:[RPTheme title:floor(MIN(f.size.width, f.size.height) * 0.42)] color:[[UIColor whiteColor] colorWithAlphaComponent:0.85]];
+        mark.text = title.length ? [title substringToIndex:1] : @"红";
+        mark.textAlignment = NSTextAlignmentCenter;
+        mark.frame = CGRectMake(0, 0, f.size.width, f.size.height * 0.72);
+        [tile addSubview:mark];
+    }
+    CGFloat shadeH = MIN(f.size.height, ts * 2 + 70);
+    CAGradientLayer *shade = [CAGradientLayer layer];
+    shade.frame = CGRectMake(0, f.size.height - shadeH, f.size.width, shadeH);
+    shade.colors = @[ (id)[UIColor colorWithWhite:0 alpha:0].CGColor, (id)[UIColor colorWithWhite:0 alpha:0.82].CGColor ];
+    [tile.layer addSublayer:shade];
+    NSString *heat = RPStringish(it[@"heat"]);
+    UILabel *hl = [self makeLabel:[RPTheme body:MAX(18, ts * 0.72)] color:[UIColor colorWithRed:1 green:0.82 blue:0.6 alpha:1]];
+    hl.text = heat.length ? [NSString stringWithFormat:@"🔥 %@", heat] : @"";
+    hl.numberOfLines = 1;
+    CGFloat hlH = heat.length ? ceil(hl.font.lineHeight) : 0;
+    hl.frame = CGRectMake(14, f.size.height - hlH - 10, f.size.width - 28, hlH);
+    [tile addSubview:hl];
+    UILabel *tl = [self makeLabel:[RPTheme readable:ts] color:[UIColor whiteColor]];
+    tl.text = title;
+    tl.numberOfLines = 2;
+    CGFloat tlH = ceil(tl.font.lineHeight * 2.1);
+    tl.frame = CGRectMake(14, CGRectGetMinY(hl.frame) - tlH - 2, f.size.width - 28, tlH);
+    [tile addSubview:tl];
+    UILabel *badge = [self rpRankBadge:rank side:MAX(34, floor(ts * 1.5))];
+    badge.frame = CGRectOffset(badge.frame, 10, 10);
+    [tile addSubview:badge];
+    tile.userInteractionEnabled = YES;
+    UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(rpNewsTap:)];
+    [tile addGestureRecognizer:tap];
+    objc_setAssociatedObject(tile, &kRPImageURLKey, @{ @"item": it ?: @{}, @"base": baseURL ?: @"", @"github": @NO }, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    return tile;
+}
+
+/** Text row: rank badge, title, heat bar scaled to the hottest item, heat value. */
+- (UIView *)rpXhsListRow:(NSDictionary *)it rank:(NSInteger)rank frame:(CGRect)f maxHeat:(double)maxHeat {
+    UIView *row = [[UIView alloc] initWithFrame:f];
+    row.backgroundColor = [UIColor colorWithWhite:0 alpha:0.28];
+    row.layer.cornerRadius = 10;
+    row.clipsToBounds = YES;
+    CGFloat side = MIN(f.size.height - 12, 40);
+    UILabel *badge = [self rpRankBadge:rank side:side];
+    badge.frame = CGRectMake(10, (f.size.height - side) / 2.0, side, side);
+    [row addSubview:badge];
+    double v = [it[@"heat_value"] doubleValue];
+    CGFloat textX = CGRectGetMaxX(badge.frame) + 12;
+    CGFloat heatW = 108;
+    UILabel *tl = [self makeLabel:[RPTheme readable:22] color:[RPTheme text]];
+    tl.text = RPStringish(it[@"title"]);
+    tl.numberOfLines = 1;
+    tl.lineBreakMode = NSLineBreakByTruncatingTail;
+    tl.frame = CGRectMake(textX, 6, f.size.width - textX - heatW - 14, f.size.height - 20);
+    [row addSubview:tl];
+    // Heat bar under the title: share of the #1 item's heat.
+    CGFloat barW = f.size.width - textX - heatW - 14;
+    UIView *track = [[UIView alloc] initWithFrame:CGRectMake(textX, f.size.height - 12, barW, 5)];
+    track.backgroundColor = [UIColor colorWithWhite:1 alpha:0.12];
+    track.layer.cornerRadius = 2.5;
+    [row addSubview:track];
+    if (maxHeat > 0 && v > 0) {
+        UIView *fill = [[UIView alloc] initWithFrame:CGRectMake(0, 0, MAX(6, barW * MIN(1.0, v / maxHeat)), 5)];
+        fill.backgroundColor = [UIColor colorWithRed:1 green:0.36 blue:0.42 alpha:1];
+        fill.layer.cornerRadius = 2.5;
+        [track addSubview:fill];
+    }
+    UILabel *hl = [self makeLabel:[RPTheme mono:20] color:[RPTheme textDim]];
+    hl.text = RPStringish(it[@"heat"]);
+    hl.textAlignment = NSTextAlignmentRight;
+    hl.numberOfLines = 1;
+    hl.frame = CGRectMake(f.size.width - heatW - 12, 0, heatW, f.size.height);
+    [row addSubview:hl];
+    return row;
+}
+
+/* 小红书: up to 16 topics in three bands, filling the page instead of 4 small cards.
+   Portrait (768×~930): lead photo + 2×3 photo grid + 9-row ranked list.
+   Landscape (1024×~670): lead photo + 2×2 grid on the left, ranked list on the right. */
+- (void)layoutXhsBoard:(NSArray *)items bounds:(CGRect)b base:(NSString *)baseURL {
+    CGFloat m = [self mInset];
+    NSMutableArray *list = [NSMutableArray array];
+    for (id it in items) if ([it isKindOfClass:[NSDictionary class]] && RPStringish(it[@"title"]).length) [list addObject:it];
+    if (list.count == 0) {
+        UILabel *empty = [self makeLabel:[RPTheme body:24] color:[UIColor whiteColor]];
+        empty.text = @"正在读取小红书热榜，两小时更新一次。";
+        empty.frame = CGRectMake(m, 12, b.size.width - 2 * m, 80);
+        [self.contentView addSubview:empty];
+        return;
+    }
+    double maxHeat = 0;
+    for (NSDictionary *it in list) maxHeat = MAX(maxHeat, [it[@"heat_value"] doubleValue]);
+    CGFloat gap = 10;
+    CGFloat top = 6;
+    CGFloat W = b.size.width - 2 * m;
+    CGFloat H = b.size.height - top - m;
+    BOOL land = b.size.width > b.size.height;
+    NSInteger next = 0;
+    if (land) {
+        CGFloat leftW = floor(W * 0.58);
+        CGFloat leadH = floor(H * 0.48);
+        [self.contentView addSubview:[self rpXhsPhotoTile:list[0] rank:1 frame:CGRectMake(m, top, leftW, leadH) base:baseURL titleSize:30]];
+        next = 1;
+        CGFloat gridTop = top + leadH + gap;
+        CGFloat cellW = floor((leftW - gap) / 2.0);
+        CGFloat cellH = floor((H - leadH - gap * 2) / 2.0);
+        for (NSInteger i = 0; i < 4 && next < (NSInteger)list.count; i++, next++) {
+            CGRect f = CGRectMake(m + (i % 2) * (cellW + gap), gridTop + (i / 2) * (cellH + gap), cellW, cellH);
+            [self.contentView addSubview:[self rpXhsPhotoTile:list[next] rank:next + 1 frame:f base:baseURL titleSize:22]];
+        }
+        CGFloat listX = m + leftW + gap * 1.5;
+        CGFloat listW = W - leftW - gap * 1.5;
+        NSInteger rows = MIN(11, (NSInteger)list.count - next);
+        CGFloat rowH = rows > 0 ? floor((H - gap * 0.6 * (rows - 1)) / MAX(rows, 9)) : 0;
+        for (NSInteger r = 0; r < rows; r++, next++) {
+            CGRect f = CGRectMake(listX, top + r * (rowH + gap * 0.6), listW, rowH);
+            [self.contentView addSubview:[self rpXhsListRow:list[next] rank:next + 1 frame:f maxHeat:maxHeat]];
+        }
+        return;
+    }
+    CGFloat leadH = floor(H * 0.30);
+    [self.contentView addSubview:[self rpXhsPhotoTile:list[0] rank:1 frame:CGRectMake(m, top, W, leadH) base:baseURL titleSize:34]];
+    next = 1;
+    CGFloat gridTop = top + leadH + gap;
+    CGFloat cellW = floor((W - gap * 2) / 3.0);
+    CGFloat cellH = floor(H * 0.20);
+    for (NSInteger i = 0; i < 6 && next < (NSInteger)list.count; i++, next++) {
+        CGRect f = CGRectMake(m + (i % 3) * (cellW + gap), gridTop + (i / 3) * (cellH + gap), cellW, cellH);
+        [self.contentView addSubview:[self rpXhsPhotoTile:list[next] rank:next + 1 frame:f base:baseURL titleSize:20]];
+    }
+    NSInteger gridRows = MIN(2, (NSInteger)ceil((MIN(6, (NSInteger)list.count - 1)) / 3.0));
+    CGFloat listTop = gridTop + gridRows * (cellH + gap);
+    CGFloat listH = top + H - listTop;
+    NSInteger rows = MIN(9, (NSInteger)list.count - next);
+    if (rows <= 0) return;
+    CGFloat rowGap = 6;
+    CGFloat rowH = floor((listH - rowGap * (rows - 1)) / MAX(rows, 7));
+    rowH = MIN(rowH, 60);
+    for (NSInteger r = 0; r < rows; r++, next++) {
+        CGRect f = CGRectMake(m, listTop + r * (rowH + rowGap), W, rowH);
+        [self.contentView addSubview:[self rpXhsListRow:list[next] rank:next + 1 frame:f maxHeat:maxHeat]];
+    }
+}
+
 - (void)layoutCoverGrid:(NSArray *)items bounds:(CGRect)b base:(NSString *)baseURL {
     CGFloat m = [self mInset];
     CGFloat top = 8;
@@ -1717,6 +1917,54 @@ static NSString *RPShortNumber(id value) {
 
 #pragma mark - Media walls
 
+/* Cover grids sized to the artwork's real shape, so nothing is cropped.
+   Measured source ratios (w/h): Steam header 460×215 = 2.14, gamer520 PC/Switch
+   capsules 616×353 = 1.75, 2468c PS5 covers 280×360 = 0.78, Maoyan posters ≈ 0.72.
+   Picks the column count (from `cols`) whose cards are largest while all `n` cards fit
+   in `avail`, then centres the grid. Returns the card frames; `imgH` is the art height. */
+static NSArray *RPAspectGrid(CGRect avail, NSInteger n, NSArray *colChoices, CGFloat ratio, CGFloat captionH, CGFloat gap, CGFloat *imgHOut) {
+    if (n <= 0) return @[];
+    CGFloat bestW = 0;
+    NSInteger bestCols = 1;
+    for (NSNumber *c in colChoices) {
+        NSInteger cols = MAX(1, c.integerValue);
+        NSInteger rows = (n + cols - 1) / cols;
+        CGFloat w = floor((avail.size.width - gap * (cols - 1)) / cols);
+        CGFloat h = w / ratio + captionH;
+        CGFloat needH = rows * h + gap * (rows - 1);
+        if (needH > avail.size.height) {
+            // Shrink width until the rows fit the height.
+            CGFloat hFit = (avail.size.height - gap * (rows - 1)) / rows;
+            w = floor((hFit - captionH) * ratio);
+        }
+        if (w > bestW) { bestW = w; bestCols = cols; }
+    }
+    NSInteger cols = bestCols;
+    NSInteger rows = (n + cols - 1) / cols;
+    CGFloat cw = bestW;
+    CGFloat imgH = floor(cw / ratio);
+    CGFloat ch = imgH + captionH;
+    CGFloat gridW = cols * cw + gap * (cols - 1);
+    CGFloat gridH = rows * ch + gap * (rows - 1);
+    // Spread spare height between rows (up to 3× gap) before centring what is left.
+    CGFloat spareH = avail.size.height - gridH;
+    CGFloat rowGap = gap;
+    if (rows > 1 && spareH > 0) rowGap = MIN(gap * 3, gap + spareH / (rows - 1));
+    gridH = rows * ch + rowGap * (rows - 1);
+    CGFloat x0 = avail.origin.x + floor((avail.size.width - gridW) / 2.0);
+    CGFloat y0 = avail.origin.y + floor(MAX(0, avail.size.height - gridH) / 2.0);
+    NSMutableArray *frames = [NSMutableArray array];
+    for (NSInteger i = 0; i < n; i++) {
+        NSInteger r = i / cols, c = i % cols;
+        // Centre a short last row.
+        NSInteger inRow = (r == rows - 1) ? (n - r * cols) : cols;
+        CGFloat rowX = x0 + floor((gridW - (inRow * cw + gap * (inRow - 1))) / 2.0);
+        [frames addObject:[NSValue valueWithCGRect:CGRectMake(rowX + c * (cw + gap), y0 + r * (ch + rowGap), cw, ch)]];
+    }
+    if (imgHOut) *imgHOut = imgH;
+    return frames;
+}
+
 @implementation RPMoviePageVC
 - (void)applyState:(NSDictionary *)state baseURL:(NSString *)baseURL {
     CGRect b = self.contentView.bounds;
@@ -1726,37 +1974,35 @@ static NSString *RPShortNumber(id value) {
     [self clearContent];
     CGFloat m = [self mInset];
     BOOL landscape = [self isLandscape];
-    NSInteger cols = landscape ? 4 : 3;
-    NSInteger maxN = landscape ? 8 : 6;
-    CGFloat gap = 10;
-    CGFloat top = 8;
-    CGFloat cw = (b.size.width - 2*m - gap*(cols-1)) / cols;
-    CGFloat availH = b.size.height - top - m;
-    NSInteger n = MIN(maxN, (NSInteger)movies.count);
-    NSInteger rows = (n + cols - 1) / MAX(1,cols);
-    // poster ratio ~2:3, caption ~40
-    CGFloat ch = rows > 0 ? (availH - gap*(rows-1)) / MAX(1,rows) : 200;
-    CGFloat imgH = MAX(80, ch - 42);
-    ch = imgH + 42;
-    for (NSUInteger i=0;i<(NSUInteger)n;i++) {
-        NSDictionary *mov=movies[i];
-        NSInteger row=i/cols, col=i%cols;
-        UIView *card=[self makeCard];
-        card.frame=CGRectMake(m+col*(cw+gap), top+row*(ch+gap), cw, ch);
-        UIImageView *iv=[[UIImageView alloc] initWithFrame:CGRectMake(0,0,cw,imgH)];
-        iv.contentMode=UIViewContentModeScaleAspectFill; iv.clipsToBounds=YES;
-        iv.backgroundColor=[UIColor colorWithWhite:0.08 alpha:1];
+    NSInteger n = MIN(landscape ? 8 : 9, (NSInteger)movies.count);
+    // Maoyan posters are ≈0.72 (w/h). Full poster, title + date under it.
+    CGFloat captionH = 64;
+    CGFloat imgH = 0;
+    CGRect avail = CGRectMake(m, 8, b.size.width - 2 * m, b.size.height - 8 - m);
+    NSArray *frames = RPAspectGrid(avail, n, landscape ? @[@4, @5] : @[@3, @4], 0.72, captionH, 12, &imgH);
+    for (NSUInteger i = 0; i < frames.count; i++) {
+        NSDictionary *mov = movies[i];
+        CGRect f = [frames[i] CGRectValue];
+        UIView *card = [self makeCard];
+        card.frame = f;
+        [[card viewWithTag:8801] removeFromSuperview]; // accent bar would cover the poster's left edge
+        UIImageView *iv = [[UIImageView alloc] initWithFrame:CGRectMake(0, 0, f.size.width, imgH)];
+        iv.contentMode = UIViewContentModeScaleAspectFill;  // box already has the poster's ratio
+        iv.clipsToBounds = YES;
+        iv.backgroundColor = [UIColor colorWithWhite:0.08 alpha:1];
         [card addSubview:iv];
         [self loadImageURL:[self absURL:mov[@"poster_url"] base:baseURL] into:iv];
-        UILabel *t=[self makeLabel:[RPTheme body:14] color:[RPTheme text]];
-        t.text=[NSString stringWithFormat:@"%@", mov[@"title"]?:@""];
+        UILabel *t = [self makeLabel:[RPTheme title:22] color:[RPTheme text]];
+        t.text = RPStringish(mov[@"title"]);
         t.numberOfLines = 1;
         t.lineBreakMode = NSLineBreakByTruncatingTail;
-        t.frame=CGRectMake(6, imgH+4, cw-12, 20);
-        UILabel *rd=[self makeLabel:[RPTheme small:12] color:[RPTheme textDim]];
-        rd.text=[NSString stringWithFormat:@"%@", mov[@"release_date"]?:@""];
-        rd.frame=CGRectMake(6, imgH+24, cw-12, 16);
-        [card addSubview:t]; [card addSubview:rd];
+        t.frame = CGRectMake(10, imgH + 6, f.size.width - 20, 28);
+        UILabel *rd = [self makeLabel:[RPTheme small:18] color:[RPTheme textDim]];
+        rd.text = RPStringish(mov[@"release_date"]);
+        rd.numberOfLines = 1;
+        rd.frame = CGRectMake(10, imgH + 34, f.size.width - 20, 24);
+        [card addSubview:t];
+        [card addSubview:rd];
         [self.contentView addSubview:card];
     }
 }
@@ -1782,56 +2028,76 @@ static NSString *RPShortNumber(id value) {
     CGFloat m = [self mInset];
     BOOL landscape = [self isLandscape];
     (void)heading;
-    NSInteger cols = landscape ? 3 : 2;
-    NSInteger maxN = landscape ? 6 : 6;
-    CGFloat gap = 10;
-    CGFloat top = 8;
-    CGFloat cw = (b.size.width - 2*m - gap*(cols-1)) / cols;
-    CGFloat availH = b.size.height - top - m;
-    NSInteger n = MIN(maxN, (NSInteger)items.count);
-    NSInteger rows = MAX(1, (n + cols - 1) / cols);
-    CGFloat ch = (availH - gap*(rows-1)) / rows;
-    CGFloat imgH = MAX(60, ch - 58);
-    ch = imgH + 58;
-    // filter items missing art so we do not show a black hole slot
     NSMutableArray *vis = [NSMutableArray array];
     for (NSDictionary *item in items) {
         if (![item isKindOfClass:[NSDictionary class]]) continue;
-        NSString *img = item[@"header_url"] ?: item[@"capsule_url"] ?: item[@"image_url"] ?: @"";
-        if ([img isKindOfClass:[NSString class]] && img.length > 0) [vis addObject:item];
-        else if ([[NSString stringWithFormat:@"%@", item[@"title"]?:@""] length] > 0) [vis addObject:item];
+        if (RPStringish(item[@"title"]).length || RPStringish(item[@"header_url"]).length) [vis addObject:item];
     }
-    if (vis.count) { items = vis; n = MIN(maxN, (NSInteger)items.count); rows = MAX(1, (n + cols - 1) / cols); ch = (availH - gap*(rows-1)) / rows; imgH = MAX(60, ch - 58); ch = imgH + 58; }
-    for (NSUInteger i=0;i<(NSUInteger)n;i++) {
-        NSDictionary *item=items[i];
-        NSInteger row=i/cols, col=i%cols;
-        UIView *card=[self makeCard];
-        card.frame=CGRectMake(m+col*(cw+gap), top+row*(ch+gap), cw, ch);
-        UIImageView *iv=[[UIImageView alloc] initWithFrame:CGRectMake(0,0,cw,imgH)];
-        iv.contentMode=UIViewContentModeScaleAspectFill; iv.clipsToBounds=YES;
-        iv.backgroundColor=[UIColor colorWithRed:0.12 green:0.14 blue:0.2 alpha:1];
+    items = vis;
+    NSInteger n = MIN(landscape ? 9 : 10, (NSInteger)items.count);
+    // Steam header art is 460×215 (2.14). Show it whole, at that shape.
+    CGFloat captionH = 66;
+    CGFloat imgH = 0;
+    CGRect avail = CGRectMake(m, 8, b.size.width - 2 * m, b.size.height - 8 - m);
+    NSArray *frames = RPAspectGrid(avail, n, landscape ? @[@3] : @[@2], 460.0 / 215.0, captionH, 12, &imgH);
+    for (NSUInteger i = 0; i < frames.count; i++) {
+        NSDictionary *item = items[i];
+        CGRect f = [frames[i] CGRectValue];
+        UIView *card = [self makeCard];
+        card.frame = f;
+        [[card viewWithTag:8801] removeFromSuperview];
+        UIImageView *iv = [[UIImageView alloc] initWithFrame:CGRectMake(0, 0, f.size.width, imgH)];
+        iv.contentMode = UIViewContentModeScaleAspectFill;
+        iv.clipsToBounds = YES;
+        iv.backgroundColor = [UIColor colorWithRed:0.12 green:0.14 blue:0.2 alpha:1];
         [card addSubview:iv];
-        NSString *img = item[@"header_url"] ?: item[@"capsule_url"] ?: item[@"image_url"];
-        if ([img isKindOfClass:[NSString class]] && img.length) {
+        // header_image is the 2.14 art; the 616×353 capsule would be cropped in this box.
+        NSString *img = RPStringish(item[@"header_url"]);
+        if (img.length == 0) img = RPStringish(item[@"capsule_url"]);
+        if (img.length == 0) img = RPStringish(item[@"image_url"]);
+        if (img.length) {
             [self loadImageURL:[self absURL:img base:baseURL] into:iv];
         } else {
-            UILabel *ph=[self makeLabel:[RPTheme title:22] color:[RPTheme textDim]];
-            ph.text=@"暂无封面"; ph.textAlignment=NSTextAlignmentCenter;
-            ph.frame=iv.bounds; ph.autoresizingMask=UIViewAutoresizingFlexibleWidth|UIViewAutoresizingFlexibleHeight;
+            UILabel *ph = [self makeLabel:[RPTheme title:22] color:[RPTheme textDim]];
+            ph.text = @"暂无封面";
+            ph.textAlignment = NSTextAlignmentCenter;
+            ph.frame = iv.bounds;
             [iv addSubview:ph];
         }
-        UILabel *t=[self makeLabel:[RPTheme body:22] color:[RPTheme text]];
-        t.text=[NSString stringWithFormat:@"%@", item[@"title"]?:@""];
-        t.frame=CGRectMake(8, imgH+4, cw-16, 26);
+        NSString *discount = RPStringish(item[@"discount"]);
+        if (discount.length) {
+            UILabel *dl = [self makeLabel:[RPTheme title:20] color:[UIColor blackColor]];
+            dl.text = [NSString stringWithFormat:@" %@ ", discount];
+            dl.backgroundColor = [RPTheme ok];
+            dl.numberOfLines = 1;
+            [dl sizeToFit];
+            dl.layer.cornerRadius = 6;
+            dl.clipsToBounds = YES;
+            dl.frame = CGRectMake(f.size.width - dl.bounds.size.width - 8, 8, dl.bounds.size.width, dl.bounds.size.height + 4);
+            [card addSubview:dl];
+        }
+        if (self.pageOffset != 0) {
+            UILabel *rank = [self makeLabel:[RPTheme mono:20] color:[UIColor whiteColor]];
+            rank.text = [NSString stringWithFormat:@"%lu", (unsigned long)i + 1];
+            rank.textAlignment = NSTextAlignmentCenter;
+            rank.backgroundColor = [UIColor colorWithWhite:0 alpha:0.6];
+            rank.layer.cornerRadius = 6;
+            rank.clipsToBounds = YES;
+            rank.frame = CGRectMake(8, 8, 34, 30);
+            [card addSubview:rank];
+        }
+        UILabel *t = [self makeLabel:[RPTheme title:22] color:[RPTheme text]];
+        t.text = RPStringish(item[@"title"]);
         t.numberOfLines = 1;
         t.lineBreakMode = NSLineBreakByTruncatingTail;
+        t.frame = CGRectMake(10, imgH + 6, f.size.width - 20, 28);
         [card addSubview:t];
-        if (item[@"price"] || item[@"discount"]) {
-            UILabel *pr=[self makeLabel:[RPTheme small:13] color:[RPTheme accent]];
-            pr.text=[NSString stringWithFormat:@"%@ %@", item[@"discount"]?:@"", item[@"price"]?:@""];
-            pr.frame=CGRectMake(8, imgH+32, cw-16, 16);
-            [card addSubview:pr];
-        }
+        NSString *price = RPStringish(item[@"price"]);
+        UILabel *pr = [self makeLabel:[RPTheme title:20] color:discount.length ? [RPTheme ok] : [RPTheme accent]];
+        pr.text = price.length ? price : @"免费 / 未定价";
+        pr.numberOfLines = 1;
+        pr.frame = CGRectMake(10, imgH + 36, f.size.width - 20, 24);
+        [card addSubview:pr];
         [self.contentView addSubview:card];
     }
 }
@@ -1860,39 +2126,66 @@ static NSString *RPShortNumber(id value) {
     CGFloat m = [self mInset];
     BOOL landscape = [self isLandscape];
     (void)heading;
-    NSInteger cols = landscape ? 4 : 2;
-    NSInteger maxN = 8;
-    CGFloat gap = 10;
-    CGFloat top = 8;
-    CGFloat cw = (b.size.width - 2*m - gap*(cols-1)) / cols;
-    CGFloat availH = b.size.height - top - m;
-    NSInteger n = MIN(maxN, (NSInteger)items.count);
-    NSInteger rows = MAX(1, (n + cols - 1) / cols);
-    CGFloat ch = (availH - gap*(rows-1)) / rows;
-    CGFloat imgH = MAX(70, ch - 48);
-    ch = imgH + 48;
-    for (NSUInteger i=0;i<(NSUInteger)n;i++) {
-        NSDictionary *item=items[i];
-        NSInteger row=i/cols, col=i%cols;
-        UIView *card=[self makeCard];
-        card.frame=CGRectMake(m+col*(cw+gap), top+row*(ch+gap), cw, ch);
-        UIImageView *iv=[[UIImageView alloc] initWithFrame:CGRectMake(0,0,cw,imgH)];
-        iv.contentMode=UIViewContentModeScaleAspectFill; iv.clipsToBounds=YES;
-        iv.backgroundColor=[UIColor colorWithWhite:0.08 alpha:1];
+    // Source art shapes: gamer520 PC/Switch capsules 616×353 (1.75, Switch also
+    // 16:9 eShop art); 2468c PS5 box covers 280×360 (0.78, portrait).
+    BOOL ps5 = [self.kind isEqualToString:@"ps5"];
+    CGFloat ratio = ps5 ? (280.0 / 360.0) : (616.0 / 353.0);
+    NSInteger n = MIN(ps5 ? (landscape ? 10 : 9) : (landscape ? 9 : 10), (NSInteger)items.count);
+    NSArray *colChoices = ps5 ? (landscape ? @[@5] : @[@3]) : (landscape ? @[@3] : @[@2]);
+    CGFloat captionH = ps5 ? 66 : 72;
+    CGFloat imgH = 0;
+    CGRect avail = CGRectMake(m, 8, b.size.width - 2 * m, b.size.height - 8 - m);
+    NSArray *frames = RPAspectGrid(avail, n, colChoices, ratio, captionH, 12, &imgH);
+    for (NSUInteger i = 0; i < frames.count; i++) {
+        NSDictionary *item = items[i];
+        CGRect f = [frames[i] CGRectValue];
+        UIView *card = [self makeCard];
+        card.frame = f;
+        [[card viewWithTag:8801] removeFromSuperview];
+        UIImageView *iv = [[UIImageView alloc] initWithFrame:CGRectMake(0, 0, f.size.width, imgH)];
+        // Box matches the art, so AspectFill shows the whole cover. Switch art is
+        // 1.78 vs 1.75: under 2% is trimmed, not visible.
+        iv.contentMode = UIViewContentModeScaleAspectFill;
+        iv.clipsToBounds = YES;
+        iv.backgroundColor = [UIColor colorWithWhite:0.08 alpha:1];
         [card addSubview:iv];
-        NSString *img = item[@"image_url"] ?: item[@"cover_url"] ?: item[@"poster_url"];
+        NSString *img = RPStringish(item[@"image_url"]);
+        if (img.length == 0) img = RPStringish(item[@"cover_url"]);
+        if (img.length == 0) img = RPStringish(item[@"poster_url"]);
         [self loadImageURL:[self absURL:img base:baseURL] into:iv];
-        UILabel *t=[self makeLabel:[RPTheme body:22] color:[RPTheme text]];
-        NSString *titleText=[NSString stringWithFormat:@"%@", item[@"title"]?:@""];
-        // strip noisy pipes for readability
-        if (titleText.length > 0) {
-            NSArray *parts = [titleText componentsSeparatedByString:@"|"];
-            if (parts.count > 1) titleText = [parts[0] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        NSString *titleText = RPStringish(item[@"title"]);
+        NSString *subText = @"";
+        NSArray *parts = [titleText componentsSeparatedByString:@"|"];
+        if (parts.count > 1) {
+            titleText = [parts[0] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+            NSMutableArray *bits = [NSMutableArray array];
+            for (NSUInteger k = 1; k < parts.count && bits.count < 2; k++) {
+                NSString *p = [parts[k] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+                if (p.length && ![p isEqualToString:@"解压即撸"] && ![p isEqualToString:@"NSP"] && ![p isEqualToString:@"NSZ"]) [bits addObject:p];
+            }
+            subText = [bits componentsJoinedByString:@" · "];
+        } else if (ps5) {
+            // "中文名.English Name"
+            NSRange dot = [titleText rangeOfString:@"."];
+            if (dot.location != NSNotFound && dot.location > 1 && dot.location + 2 < titleText.length) {
+                subText = [[titleText substringFromIndex:dot.location + 1] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+                titleText = [titleText substringToIndex:dot.location];
+            }
         }
+        UILabel *t = [self makeLabel:[RPTheme title:ps5 ? 20 : 22] color:[RPTheme text]];
         t.text = titleText.length ? titleText : @" ";
-        t.frame=CGRectMake(8, imgH+6, cw-16, 48);
-        t.numberOfLines = 2;
+        t.numberOfLines = 1;
+        t.lineBreakMode = NSLineBreakByTruncatingTail;
+        t.frame = CGRectMake(10, imgH + 6, f.size.width - 20, 28);
         [card addSubview:t];
+        if (subText.length) {
+            UILabel *s = [self makeLabel:[RPTheme small:18] color:[RPTheme textDim]];
+            s.text = subText;
+            s.numberOfLines = 1;
+            s.lineBreakMode = NSLineBreakByTruncatingTail;
+            s.frame = CGRectMake(10, imgH + 36, f.size.width - 20, 24);
+            [card addSubview:s];
+        }
         [self.contentView addSubview:card];
     }
 }
@@ -1912,7 +2205,13 @@ static NSString *RPShortNumber(id value) {
 @property (nonatomic, strong) NSTimer *photoTimer;
 @property (nonatomic, strong) NSTimer *clockTimer;
 @property (nonatomic, copy) NSString *currentAssetId;
+@property (nonatomic, assign) uint64_t photoSeed;
+@property (nonatomic, strong) NSArray<NSNumber *> *photoHashes;
+@property (nonatomic, copy) NSString *photoAlbumKey;
 @end
+
+static uint64_t RPPhotoNewSeed(void);
+static NSArray<PHAsset *> *RPPhotoOrder(NSArray<PHAsset *> *pool, uint64_t seed, NSMutableArray<NSNumber *> *hashesOut);
 
 @implementation RPPhotoPageVC
 - (void)setPhotoSource:(id)photoSource slot:(NSInteger)slot {
@@ -1952,8 +2251,13 @@ static NSString *RPShortNumber(id value) {
     self.clockLabel.frame = CGRectMake(self.contentView.bounds.size.width-130, 12, 118, 32);
 }
 - (void)updateClock {
-    NSDateFormatter *f = [[NSDateFormatter alloc] init];
-    f.dateFormat = @"HH:mm";
+    static NSDateFormatter *f;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        f = [[NSDateFormatter alloc] init];
+        f.dateFormat = @"HH:mm";
+    });
+    f.timeZone = [NSTimeZone localTimeZone];
     self.clockLabel.text = [NSString stringWithFormat:@" %@ ", [f stringFromDate:[NSDate date]]];
 }
 - (void)pageWillAppear {
@@ -1975,7 +2279,8 @@ static NSString *RPShortNumber(id value) {
         [weakSelf.photoSource loadAlbumAssetsPreferFavorites:^(NSArray<PHAsset *> *assets, NSString *albumTitle) {
             weakSelf.albumTitle = albumTitle ?: @"相册";
             NSArray *filtered = [weakSelf partitionAssets:assets];
-            weakSelf.assets = filtered;
+            NSString *albumKey = weakSelf.photoSource.albumLocalIdentifier.length ? weakSelf.photoSource.albumLocalIdentifier : (albumTitle ?: @"");
+            [weakSelf rpLoadPlaylist:filtered album:albumKey];
             if (filtered.count == 0) {
                 weakSelf.errorLabel.hidden = NO;
                 weakSelf.errorLabel.text = @"相册无照片";
@@ -1985,13 +2290,10 @@ static NSString *RPShortNumber(id value) {
                 return;
             }
             weakSelf.errorLabel.hidden = YES;
-            weakSelf.caption.text = [NSString stringWithFormat:@"%@ · %lu 张 · 槽 %ld", weakSelf.albumTitle, (unsigned long)filtered.count, (long)(weakSelf.slot+1)];
-            if (filtered.count >= 2) {
-                weakSelf.assetIndex = (weakSelf.slot == 0) ? 0 : 1;
-            } else {
-                weakSelf.assetIndex = 0;
-            }
+            weakSelf.caption.text = [NSString stringWithFormat:@"%@ · %lu 张 · 随机播放", weakSelf.albumTitle, (unsigned long)filtered.count];
+            // assetIndex was set by rpLoadPlaylist: to where this slot left off.
             [weakSelf showCurrent];
+            [weakSelf rpSavePhotoProgress];
             [weakSelf.photoTimer invalidate];
             weakSelf.photoTimer = [NSTimer scheduledTimerWithTimeInterval:8.0 target:weakSelf selector:@selector(nextPhoto) userInfo:nil repeats:YES];
         }];
@@ -2006,26 +2308,96 @@ static NSString *RPShortNumber(id value) {
     self.currentAssetId = nil;
     [super pageDidDisappear];
 }
+/** Slot A (0) shows portrait photos, slot B (1) landscape; either falls back to
+    everything if the album has none of its kind. No more every-other-photo split:
+    each slot uses all photos of its orientation. */
 - (NSArray<PHAsset *> *)partitionAssets:(NSArray<PHAsset *> *)assets {
     if (assets.count == 0) return assets;
     NSMutableArray *pref = [NSMutableArray array];
-    NSMutableArray *rest = [NSMutableArray array];
     for (PHAsset *a in assets) {
         BOOL portrait = a.pixelHeight >= a.pixelWidth;
-        if (self.slot == 0 && portrait) [pref addObject:a];
-        else if (self.slot == 1 && !portrait) [pref addObject:a];
-        else [rest addObject:a];
+        if ((self.slot == 0) == portrait) [pref addObject:a];
     }
-    NSArray *pool = pref.count ? pref : assets;
-    if (pool.count < 2) {
-        return pool.count ? pool : assets;
+    return pref.count ? pref : assets;
+}
+
+#pragma mark Shuffle that survives restarts
+/* Order = sort by a seeded hash of each photo's localIdentifier. That gives a full
+   random permutation, and adding or deleting photos only inserts/removes entries
+   without reshuffling the rest. Progress is stored as (seed, hash of the last photo
+   shown): resuming starts at the first photo hashed after it, so nothing repeats
+   until the whole pool has been shown once, across page turns and app restarts.
+   When the cycle ends a new seed starts a fresh permutation. */
+
+static uint64_t RPPhotoHash(NSString *ident, uint64_t seed) {
+    uint64_t h = 1469598103934665603ULL ^ seed;           // FNV-1a 64
+    const char *s = ident.UTF8String ?: "";
+    for (; *s; s++) { h ^= (uint8_t)*s; h *= 1099511628211ULL; }
+    h ^= h >> 33; h *= 0xff51afd7ed558ccdULL; h ^= h >> 33; // final mix
+    return h ? h : 1;                                       // 0 means "nothing shown yet"
+}
+
+static NSString *RPPhotoCycleKey(NSInteger slot) {
+    return [NSString stringWithFormat:@"RemotePanel.photo.cycle.%ld", (long)slot];
+}
+
+static uint64_t RPPhotoNewSeed(void) {
+    return ((uint64_t)arc4random() << 32) | arc4random();
+}
+
+/** Sorted pool for `seed`, plus the hash of each entry in the same order. */
+static NSArray<PHAsset *> *RPPhotoOrder(NSArray<PHAsset *> *pool, uint64_t seed, NSMutableArray<NSNumber *> *hashesOut) {
+    NSMutableArray *pairs = [NSMutableArray arrayWithCapacity:pool.count];
+    for (PHAsset *a in pool) [pairs addObject:@[ @(RPPhotoHash(a.localIdentifier, seed)), a ]];
+    [pairs sortUsingComparator:^NSComparisonResult(NSArray *x, NSArray *y) {
+        uint64_t hx = [x[0] unsignedLongLongValue], hy = [y[0] unsignedLongLongValue];
+        return hx < hy ? NSOrderedAscending : (hx > hy ? NSOrderedDescending : NSOrderedSame);
+    }];
+    NSMutableArray *ordered = [NSMutableArray arrayWithCapacity:pairs.count];
+    for (NSArray *p in pairs) {
+        [ordered addObject:p[1]];
+        [hashesOut addObject:p[0]];
     }
-    NSMutableArray *mine = [NSMutableArray array];
-    for (NSUInteger i=0; i<pool.count; i++) {
-        if ((NSInteger)(i % 2) == self.slot) [mine addObject:pool[i]];
+    return ordered;
+}
+
+/** Build this slot's playlist and the index to resume from. */
+- (void)rpLoadPlaylist:(NSArray<PHAsset *> *)pool album:(NSString *)album {
+    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+    NSDictionary *saved = [ud dictionaryForKey:RPPhotoCycleKey(self.slot)];
+    uint64_t seed = [saved[@"seed"] unsignedLongLongValue];
+    uint64_t last = [saved[@"last"] unsignedLongLongValue];
+    // A different album is a different pool: start a new cycle for it.
+    if (seed == 0 || ![RPStringish(saved[@"album"]) isEqualToString:album ?: @""]) {
+        seed = RPPhotoNewSeed();
+        last = 0;
     }
-    if (mine.count == 0) return pool;
-    return mine;
+    NSMutableArray *hashes = [NSMutableArray array];
+    NSArray *ordered = RPPhotoOrder(pool, seed, hashes);
+    NSInteger start = 0;
+    while (start < (NSInteger)hashes.count && [hashes[start] unsignedLongLongValue] <= last) start++;
+    if (start >= (NSInteger)ordered.count) {
+        // Everything in this cycle has been shown: reshuffle.
+        seed = RPPhotoNewSeed();
+        [hashes removeAllObjects];
+        ordered = RPPhotoOrder(pool, seed, hashes);
+        start = 0;
+    }
+    self.photoSeed = seed;
+    self.photoHashes = hashes;
+    self.photoAlbumKey = album ?: @"";
+    self.assets = ordered;
+    self.assetIndex = start;
+}
+
+/** Remember that assets[assetIndex] has been shown. */
+- (void)rpSavePhotoProgress {
+    if (self.assetIndex < 0 || self.assetIndex >= (NSInteger)self.photoHashes.count) return;
+    [[NSUserDefaults standardUserDefaults] setObject:@{
+        @"seed": @(self.photoSeed),
+        @"last": self.photoHashes[self.assetIndex],
+        @"album": self.photoAlbumKey ?: @"",
+    } forKey:RPPhotoCycleKey(self.slot)];
 }
 - (void)showCurrent {
     if (self.assets.count == 0) {
@@ -2043,11 +2415,13 @@ static NSString *RPShortNumber(id value) {
     BOOL firstPaint = (self.imageView.image == nil);
     if (!firstPaint) [self noteImageLoadBegan];
     self.currentAssetId = a.localIdentifier;
-    // Cap decode size for iPad 3 memory; screen is 1024×768.
+    // Ask for the screen's real pixel size. iPad 3 is 2048×1536 (1024×768 pt @2x);
+    // the old 1024 px cap rendered photos at half resolution, stretched 2×.
+    // One 2048×1536 RGBA bitmap is ~12 MB, and only the visible photo is held.
     CGFloat scale = MIN(2.0, [UIScreen mainScreen].scale);
     CGSize host = self.contentView.bounds.size;
-    CGSize sz = CGSizeMake(MIN(1024.0, MAX(320.0, host.width * scale)),
-                           MIN(1024.0, MAX(320.0, host.height * scale)));
+    CGSize sz = CGSizeMake(MIN(2048.0, MAX(320.0, host.width * scale)),
+                           MIN(2048.0, MAX(320.0, host.height * scale)));
     __weak typeof(self) weakSelf = self;
     NSString *wantId = a.localIdentifier;
     [self.photoSource requestImageForAsset:a targetSize:sz completion:^(UIImage *image) {
@@ -2076,9 +2450,29 @@ static NSString *RPShortNumber(id value) {
 }
 - (void)nextPhoto {
     if (self.assets.count <= 1) return;
-    self.assetIndex = (self.assetIndex + 1) % self.assets.count;
+    NSInteger next = self.assetIndex + 1;
+    if (next >= (NSInteger)self.assets.count) {
+        // Cycle finished: new permutation. Don't open it with the photo just shown.
+        NSString *justShown = self.assets[self.assetIndex].localIdentifier;
+        NSArray *pool = self.assets;
+        uint64_t seed = RPPhotoNewSeed();
+        NSMutableArray *hashes = [NSMutableArray array];
+        NSArray *ordered = RPPhotoOrder(pool, seed, hashes);
+        if (ordered.count > 1 && [[ordered.firstObject localIdentifier] isEqualToString:justShown]) {
+            NSMutableArray *o = [ordered mutableCopy];
+            [o exchangeObjectAtIndex:0 withObjectAtIndex:1];
+            [hashes exchangeObjectAtIndex:0 withObjectAtIndex:1];
+            ordered = o;
+        }
+        self.photoSeed = seed;
+        self.photoHashes = hashes;
+        self.assets = ordered;
+        next = 0;
+    }
+    self.assetIndex = next;
     self.currentAssetId = nil;
     [self showCurrent];
+    [self rpSavePhotoProgress];
 }
 - (void)applyState:(NSDictionary *)state baseURL:(NSString *)baseURL { (void)state; (void)baseURL; }
 @end
@@ -2228,6 +2622,10 @@ static NSString *RPShortNumber(id value) {
     self.statusLabel.text = [NSString stringWithFormat:@"打不开这个网页\n%@", error.localizedDescription ?: @"网络错误"];
 }
 - (void)playPageIntro { /* fullscreen web: no motion */ }
+/* playPageIntro above never sets _introPlayed, so without this override the root VC's
+   applyCurrentPageState (and rotation) kept calling the base parkMotionOffscreen,
+   which translated the WKWebView a full screen width away: a blank page. */
+- (void)parkMotionOffscreen {}
 - (void)playPageOutro:(void (^)(void))done {
     if (done) done();
 }
@@ -2534,7 +2932,10 @@ static BOOL RPCalendarTitleOK(NSString *s) {
         [self rpReplayIntro];
         return;
     }
-    self.contentView.alpha = 0;
+    // Stay visible while EventKit answers. Hiding the content here (alpha 0) left the
+    // whole page black — including the "正在读取" placeholder — until both permission
+    // callbacks came back, which on a first run means until someone taps the prompts.
+    self.contentView.alpha = 1;
 }
 - (CGFloat)addSection:(NSString *)name items:(NSArray *)items reminder:(BOOL)reminder y:(CGFloat)y width:(CGFloat)w margin:(CGFloat)m scroll:(UIScrollView *)scroll columns:(NSInteger)cols {
     if (items.count == 0) return y;
@@ -2604,11 +3005,23 @@ static BOOL RPCalendarTitleOK(NSString *s) {
 @end
 
 static NSString *RPGrouped(double n, NSInteger frac) {
-    NSNumberFormatter *fmt = [[NSNumberFormatter alloc] init];
-    fmt.numberStyle = NSNumberFormatterDecimalStyle;
-    fmt.minimumFractionDigits = frac;
-    fmt.maximumFractionDigits = frac;
-    fmt.usesGroupingSeparator = YES;
+    // One formatter per fraction width (0–8), built once; this runs ~8 times per quote row.
+    static NSMutableDictionary *byFrac;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ byFrac = [NSMutableDictionary dictionary]; });
+    NSInteger f = MAX(0, MIN(8, frac));
+    NSNumberFormatter *fmt;
+    @synchronized (byFrac) {
+        fmt = byFrac[@(f)];
+        if (!fmt) {
+            fmt = [[NSNumberFormatter alloc] init];
+            fmt.numberStyle = NSNumberFormatterDecimalStyle;
+            fmt.minimumFractionDigits = f;
+            fmt.maximumFractionDigits = f;
+            fmt.usesGroupingSeparator = YES;
+            byFrac[@(f)] = fmt;
+        }
+    }
     return [fmt stringFromNumber:@(n)] ?: @"0";
 }
 

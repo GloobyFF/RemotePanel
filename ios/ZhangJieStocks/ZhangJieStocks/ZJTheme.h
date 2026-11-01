@@ -21,13 +21,21 @@ static inline UIColor *ZJMove(double n) {
     return ZJFlat();
 }
 
+static inline NSNumberFormatter *ZJGroupedFormatter(void) {
+    static NSNumberFormatter *fmt;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        fmt = [[NSNumberFormatter alloc] init];
+        fmt.numberStyle = NSNumberFormatterDecimalStyle;
+        fmt.minimumFractionDigits = 2;
+        fmt.maximumFractionDigits = 2;
+        fmt.usesGroupingSeparator = YES;
+    });
+    return fmt;
+}
+
 static inline NSString *ZJGrouped(double n) {
-    NSNumberFormatter *fmt = [[NSNumberFormatter alloc] init];
-    fmt.numberStyle = NSNumberFormatterDecimalStyle;
-    fmt.minimumFractionDigits = 2;
-    fmt.maximumFractionDigits = 2;
-    fmt.usesGroupingSeparator = YES;
-    return [fmt stringFromNumber:@(fabs(n))] ?: @"0.00";
+    return [ZJGroupedFormatter() stringFromNumber:@(fabs(n))] ?: @"0.00";
 }
 
 static inline NSString *ZJSigned(double n) {

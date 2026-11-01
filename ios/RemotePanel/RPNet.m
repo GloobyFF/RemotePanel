@@ -133,6 +133,14 @@ static int RPConnectAddr(struct addrinfo *ai, NSTimeInterval timeout) {
         return -1;
     }
     fcntl(fd, F_SETFL, flags & ~O_NONBLOCK);
+    /* Back in blocking mode, every read()/write() below (TLS handshake, SSLRead,
+       SOCKS/CONNECT replies) would wait forever on a peer that stops sending.
+       With these set they fail with EAGAIN instead and the normal error path runs. */
+    struct timeval io;
+    io.tv_sec = (time_t)MAX(10, timeout);
+    io.tv_usec = 0;
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &io, sizeof(io));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &io, sizeof(io));
     return fd;
 }
 
@@ -284,7 +292,35 @@ static BOOL RPExtract(NSData *raw, BOOL eof, NSData **bodyOut, NSInteger *status
     return YES;
 }
 
-static NSData *RPExchange(int fd, BOOL tls, NSString *peerName, NSString *hostHeader, NSString *path, NSString *method, NSData *bodyData, NSDictionary *headers, NSInteger *status, NSString **location, NSError **error) {
+/* Cheap check whether the buffered response could be complete, so RPExtract
+   (which re-parses headers and re-decodes chunked bodies) is not run after
+   every 8 KB read. That made large pages quadratic in CPU and memory. */
+static BOOL RPMaybeComplete(NSData *raw, BOOL eof) {
+    if (eof) return YES;
+    static NSData *sep = nil;
+    static NSData *lastChunk = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        sep = [@"\r\n\r\n" dataUsingEncoding:NSASCIIStringEncoding];
+        lastChunk = [@"0\r\n\r\n" dataUsingEncoding:NSASCIIStringEncoding];
+    });
+    NSRange hr = [raw rangeOfData:sep options:0 range:NSMakeRange(0, MIN(raw.length, (NSUInteger)16384))];
+    if (hr.location == NSNotFound) return NO;
+    NSString *head = [[[NSString alloc] initWithBytes:raw.bytes length:hr.location encoding:NSISOLatin1StringEncoding] lowercaseString] ?: @"";
+    NSRange cl = [head rangeOfString:@"\r\ncontent-length:"];
+    if ([head rangeOfString:@"chunked"].location != NSNotFound) {
+        if (raw.length < lastChunk.length) return NO;
+        NSRange tail = NSMakeRange(raw.length - lastChunk.length, lastChunk.length);
+        return [[raw subdataWithRange:tail] isEqualToData:lastChunk];
+    }
+    if (cl.location != NSNotFound) {
+        NSInteger want = [[head substringFromIndex:NSMaxRange(cl)] integerValue];
+        return raw.length >= NSMaxRange(hr) + (NSUInteger)MAX(0, want);
+    }
+    return NO;
+}
+
+static NSData *RPExchange(int fd, BOOL tls, NSString *peerName, NSString *hostHeader, NSString *path, NSString *method, NSData *bodyData, NSDictionary *headers, NSTimeInterval deadline, NSInteger *status, NSString **location, NSError **error) {
     SSLContextRef ssl = NULL;
     if (tls) {
         ssl = SSLCreateContext(kCFAllocatorDefault, kSSLClientSide, kSSLStreamType);
@@ -367,33 +403,41 @@ static NSData *RPExchange(int fd, BOOL tls, NSString *peerName, NSString *hostHe
     BOOL done = NO;
     NSInteger code = 0;
     NSString *loc = nil;
+    uint8_t tmp[8192];
     while (raw.length < kRPMaxBody) {
-        uint8_t tmp[8192];
-        ssize_t n = -1;
-        if (ssl) {
-            size_t processed = 0;
-            OSStatus st = SSLRead(ssl, tmp, sizeof(tmp), &processed);
-            if (processed > 0) n = (ssize_t)processed;
-            else if (st == errSSLWouldBlock) continue;
-            else if (st == noErr || st == errSSLClosedGraceful || st == errSSLClosedNoNotify) n = 0;
-            else {
+        @autoreleasepool {
+            if ([NSDate timeIntervalSinceReferenceDate] > deadline) {
                 if (ssl) CFRelease(ssl);
-                RPSetError(error, RPErr(st, [NSString stringWithFormat:@"读取中断 (%d)，已有 %lu 字节", (int)st, (unsigned long)raw.length]));
+                RPSetError(error, RPErr(14, [NSString stringWithFormat:@"读取超时，已有 %lu 字节", (unsigned long)raw.length]));
                 return nil;
             }
-        } else {
-            if (!RPWaitSocket(fd, NO)) n = -1;
-            else n = RPReadRaw(fd, tmp, sizeof(tmp));
+            ssize_t n = -1;
+            if (ssl) {
+                size_t processed = 0;
+                OSStatus st = SSLRead(ssl, tmp, sizeof(tmp), &processed);
+                if (processed > 0) n = (ssize_t)processed;
+                else if (st == errSSLWouldBlock) continue;
+                else if (st == noErr || st == errSSLClosedGraceful || st == errSSLClosedNoNotify) n = 0;
+                else {
+                    if (ssl) CFRelease(ssl);
+                    RPSetError(error, RPErr(st, [NSString stringWithFormat:@"读取中断 (%d)，已有 %lu 字节", (int)st, (unsigned long)raw.length]));
+                    return nil;
+                }
+            } else {
+                if (!RPWaitSocket(fd, NO)) n = -1;
+                else n = RPReadRaw(fd, tmp, sizeof(tmp));
+            }
+            BOOL eof = n <= 0;
+            if (n > 0) [raw appendBytes:tmp length:(NSUInteger)n];
+            if (!RPMaybeComplete(raw, eof)) continue;
+            BOOL ok = RPExtract(raw, eof, &body, &code, &loc, &done);
+            if (!ok) {
+                if (ssl) CFRelease(ssl);
+                RPSetError(error, RPErr(12, @"响应无法解析"));
+                return nil;
+            }
+            if (done || eof) break;
         }
-        BOOL eof = n <= 0;
-        if (n > 0) [raw appendBytes:tmp length:(NSUInteger)n];
-        BOOL ok = RPExtract(raw, eof, &body, &code, &loc, &done);
-        if (!ok) {
-            if (ssl) CFRelease(ssl);
-            RPSetError(error, RPErr(12, @"响应无法解析"));
-            return nil;
-        }
-        if (done || eof) break;
     }
     if (ssl) CFRelease(ssl);
     *status = code;
@@ -450,7 +494,9 @@ static NSData *RPFetch(NSString *urlString, NSString *method, NSData *bodyData, 
     }
     NSInteger status = 0;
     NSString *location = nil;
-    NSData *body = RPExchange(fd, tls, host, hostHeader, path, method, bodyData, headers, &status, &location, error);
+    /* Per-read timeouts stop a dead peer; this caps a peer that trickles bytes. */
+    NSTimeInterval deadline = [NSDate timeIntervalSinceReferenceDate] + MAX(30, timeout * 3);
+    NSData *body = RPExchange(fd, tls, host, hostHeader, path, method, bodyData, headers, deadline, &status, &location, error);
     close(fd);
     if (!body) return nil;
     if (status >= 300 && status < 400 && location.length && redirects < 4) {

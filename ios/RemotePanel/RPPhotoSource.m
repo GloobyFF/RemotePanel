@@ -114,17 +114,40 @@
 }
 
 - (void)loadAlbumAssetsPreferFavorites:(void(^)(NSArray<PHAsset *> *assets, NSString *albumTitle))completion {
-    const NSUInteger kLimit = 200;
+    // Up to six fetch-and-enumerate passes over a large library stalled the page
+    // turn when this ran on the main thread. PhotoKit fetches are thread-safe; the
+    // completion (which updates UI) still runs on the main queue.
+    NSString *albumId = self.albumLocalIdentifier;
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        NSString *title = nil;
+        NSString *stillValidId = albumId;
+        NSArray *arr = [self loadAssetsForAlbumId:albumId title:&title validId:&stillValidId];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            // Clear a stale pick on the main thread, where the property is read.
+            if (albumId.length && !stillValidId.length && [self.albumLocalIdentifier isEqualToString:albumId]) {
+                self.albumLocalIdentifier = nil;
+            }
+            if (completion) completion(arr, title);
+        });
+    });
+}
+
+/** Background-safe body of -loadAlbumAssetsPreferFavorites:. Does not touch self.albumLocalIdentifier. */
+- (NSArray *)loadAssetsForAlbumId:(NSString *)albumId title:(NSString **)titleOut validId:(NSString **)validIdOut {
+    // Read the whole album (was the newest 200), so the shuffle can reach old photos.
+    // PHAsset objects are metadata only; 5000 of them is a few MB and enumerates in
+    // well under a second on iPad 3. Pixels are only decoded for the photo on screen.
+    const NSUInteger kLimit = 5000;
     PHAssetCollection *col = nil;
     BOOL usedPersisted = NO;
 
-    if (self.albumLocalIdentifier.length) {
-        PHFetchResult *fr = [PHAssetCollection fetchAssetCollectionsWithLocalIdentifiers:@[self.albumLocalIdentifier] options:nil];
+    if (albumId.length) {
+        PHFetchResult *fr = [PHAssetCollection fetchAssetCollectionsWithLocalIdentifiers:@[albumId] options:nil];
         col = fr.firstObject;
         usedPersisted = YES;
         if (!col) {
             // Stale localIdentifier — reset so next time we use defaults
-            self.albumLocalIdentifier = nil;
+            if (validIdOut) *validIdOut = nil;
             usedPersisted = NO;
         }
     }
@@ -138,7 +161,7 @@
         // Persisted album empty or missing assets → fall through unless user explicitly picked an empty album with assets later.
         // If stale empty favorites-like pick with 0 assets, fall through.
         if (arr.count == 0 && usedPersisted) {
-            self.albumLocalIdentifier = nil;
+            if (validIdOut) *validIdOut = nil;
             col = nil;
             arr = nil;
         }
@@ -184,7 +207,8 @@
     }
     if (!title) title = arr.count ? @"相册" : @"无相册";
     if (!arr) arr = @[];
-    if (completion) completion(arr, title);
+    if (titleOut) *titleOut = title;
+    return arr;
 }
 
 - (void)requestImageForAsset:(PHAsset *)asset targetSize:(CGSize)size completion:(void(^)(UIImage *image))completion {
@@ -198,8 +222,11 @@
         size = CGSizeMake(1024, 1024);
     }
     PHImageRequestOptions *opts = [[PHImageRequestOptions alloc] init];
-    // FastFormat + sized request keeps peak memory down on iPad 3.
-    opts.deliveryMode = PHImageRequestOptionsDeliveryModeFastFormat;
+    // FastFormat means "whatever is quickest": on iPad 3 that is the small cached
+    // thumbnail, and no full-quality image follows, so every photo looked blurry.
+    // HighQualityFormat delivers one image decoded at targetSize. Memory stays
+    // bounded because the caller asks for the screen's pixel size, not the original.
+    opts.deliveryMode = PHImageRequestOptionsDeliveryModeHighQualityFormat;
     opts.resizeMode = PHImageRequestOptionsResizeModeExact;
     opts.networkAccessAllowed = YES;
     opts.synchronous = NO;

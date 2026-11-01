@@ -50,4 +50,7 @@ NSMutableDictionary *RPWebPageNormalize(NSDictionary *raw, NSInteger indexHint);
 - (NSArray *)activityLog;
 - (NSArray *)tickerMessages;
 - (void)appendLog:(NSString *)name status:(NSString *)status detail:(NSString *)detail;
+/** Expire every feed (except the greeting) and clear failure backoff, then let the
+    next poll refetch. Call after settings change. */
+- (void)invalidateForSettingsChange;
 @end

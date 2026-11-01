@@ -62,6 +62,7 @@ static BOOL RPDefaultUseProxy(NSString *pid) { return RPLocalDefaultUseProxy(pid
 @property (nonatomic, strong) UIView *progressTrack;
 @property (nonatomic, strong) UIView *progressFill;
 @property (nonatomic, strong) NSLayoutConstraint *progressWidth;
+@property (nonatomic, assign) BOOL passHadFailure;
 @property (nonatomic, strong) UIView *pageHost;
 @property (nonatomic, strong) RPAPIClient *api;
 @property (nonatomic, strong) RPPhotoSource *photos;
@@ -464,9 +465,13 @@ static NSString *RPStringish(id value) {
     NSString *detail = info[@"detail"] ?: @"";
     if ([status isEqualToString:@"start"]) {
         [self.logBtn setTitleColor:[RPTheme accent] forState:UIControlStateNormal];
-        self.statusPill.text = @"更新";
-        self.statusPill.backgroundColor = [RPTheme accent];
+        // Keep a FAIL from earlier in this pass visible until the pass ends.
+        if (!self.passHadFailure) {
+            self.statusPill.text = @"更新";
+            self.statusPill.backgroundColor = [RPTheme accent];
+        }
     } else if ([status isEqualToString:@"fail"]) {
+        self.passHadFailure = YES;
         [self.logBtn setTitleColor:[RPTheme bad] forState:UIControlStateNormal];
         self.statusPill.text = @" FAIL ";
         self.statusPill.backgroundColor = [RPTheme bad];
@@ -785,14 +790,12 @@ static NSString *RPStringish(id value) {
 - (void)updateProgress {
     CGFloat p = (self.dwellTotal > 0) ? (1.0 - self.dwellLeft/self.dwellTotal) : 0;
     if (p < 0) p = 0; if (p > 1) p = 1;
-    [self.progressTrack layoutIfNeeded];
     CGFloat full = CGRectGetWidth(self.progressTrack.bounds);
     if (full < 1) full = CGRectGetWidth(self.view.bounds);
-    [self.view removeConstraint:self.progressWidth];
-    self.progressWidth = [NSLayoutConstraint constraintWithItem:self.progressFill attribute:NSLayoutAttributeWidth relatedBy:NSLayoutRelationEqual toItem:nil attribute:NSLayoutAttributeNotAnAttribute multiplier:1 constant:full * p];
-    [self.view addConstraint:self.progressWidth];
-    [self.view bringSubviewToFront:self.progressTrack];
-    [self.view layoutIfNeeded];
+    // Runs 4×/s around the clock: update the existing constraint's constant instead
+    // of removing and re-adding a constraint and forcing a full-view layout each tick.
+    self.progressWidth.constant = full * p;
+    [self.progressFill.superview layoutIfNeeded];
 }
 
 - (void)turnBy:(NSInteger)delta {
@@ -858,8 +861,13 @@ static NSString *RPStringish(id value) {
         if (self.lastState && self.currentPage) [self applyCurrentPageState];
     }
     self.themeDayName = day;
-    NSDateFormatter *f = [[NSDateFormatter alloc] init];
-    f.dateFormat = @"HH:mm";
+    static NSDateFormatter *f;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        f = [[NSDateFormatter alloc] init];
+        f.dateFormat = @"HH:mm";
+    });
+    f.timeZone = [NSTimeZone localTimeZone]; // follow device time-zone changes; cheap vs. a new formatter
     self.clockLabel.text = [NSString stringWithFormat:@"%@ %@", day, [f stringFromDate:[NSDate date]]];
 }
 
@@ -873,10 +881,15 @@ static NSString *RPStringish(id value) {
         if (state.count) {
             weakSelf.lastState = state;
             weakSelf.stale = NO;
-            if (![weakSelf.statusPill.text isEqualToString:@" FAIL "]) {
+            // FAIL used to stick forever: only a pass that itself had a failure keeps it.
+            if (weakSelf.passHadFailure) {
+                weakSelf.statusPill.text = @" FAIL ";
+                weakSelf.statusPill.backgroundColor = [RPTheme bad];
+            } else {
                 weakSelf.statusPill.text = @" LIVE ";
                 weakSelf.statusPill.backgroundColor = [RPTheme ok];
             }
+            weakSelf.passHadFailure = NO;
             [weakSelf applyCurrentPageState];
             [weakSelf applyTickerMessages:[[RPLocalFeed sharedFeed] tickerMessages]];
         } else {
@@ -1535,6 +1548,9 @@ static NSString *RPStringish(id value) {
     }
     [self hideSettings];
     [self showPageAtIndex:newIdx resetDwell:YES];
+    // Without this a changed city or stock list kept showing the old data until
+    // that feed's TTL ran out (up to 6 h for weather). The browser path already did this.
+    [[RPLocalFeed sharedFeed] invalidateForSettingsChange];
     [self pollNow];
 }
 

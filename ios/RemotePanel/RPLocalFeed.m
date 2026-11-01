@@ -619,16 +619,35 @@ static NSDictionary *RPParseICS(NSData *data) {
         cur[key] = value ?: @"";
     }
     NSMutableArray *upcoming = [NSMutableArray array];
+    NSDateFormatter *utc = [[NSDateFormatter alloc] init];
+    utc.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
+    utc.timeZone = [NSTimeZone timeZoneWithAbbreviation:@"UTC"];
+    utc.dateFormat = @"yyyyMMddHHmm";
+    NSDateFormatter *localDay = [[NSDateFormatter alloc] init];
+    localDay.locale = utc.locale;
+    localDay.dateFormat = @"yyyyMMdd";
+    NSDateFormatter *localClock = [[NSDateFormatter alloc] init];
+    localClock.locale = utc.locale;
+    localClock.dateFormat = @"HH:mm";
     for (NSDictionary *ev in events) {
-        NSString *title = RPDecode([ev[@"SUMMARY"] ?: @"" stringByReplacingOccurrencesOfString:@"\n" withString:@" "]);
-        NSString *start = ev[@"DTSTART"] ?: @"";
+        NSString *title = RPDecode([RPString(ev[@"SUMMARY"]) stringByReplacingOccurrencesOfString:@"\n" withString:@" "]);
+        NSString *start = RPString(ev[@"DTSTART"]);
         NSString *day = @"";
         NSString *clock = @"";
         if ([start rangeOfString:@"T"].location != NSNotFound) {
             NSArray *parts = [start componentsSeparatedByString:@"T"];
             day = parts.firstObject;
-            NSString *tim = [parts.lastObject stringByReplacingOccurrencesOfString:@"Z" withString:@""];
-            if (tim.length >= 4) clock = [NSString stringWithFormat:@"%@:%@", [tim substringToIndex:2], [tim substringWithRange:NSMakeRange(2, 2)]];
+            NSString *tim = parts.lastObject;
+            if ([tim hasSuffix:@"Z"] && day.length >= 8 && tim.length >= 5) {
+                // Google Calendar exports UTC times ("…T013000Z"); show them in local time.
+                NSDate *at = [utc dateFromString:[[day substringToIndex:8] stringByAppendingString:[tim substringToIndex:4]]];
+                if (at) {
+                    day = [localDay stringFromDate:at];
+                    clock = [localClock stringFromDate:at];
+                }
+            } else if (tim.length >= 4) {
+                clock = [NSString stringWithFormat:@"%@:%@", [tim substringToIndex:2], [tim substringWithRange:NSMakeRange(2, 2)]];
+            }
         } else {
             day = start;
         }
@@ -636,12 +655,17 @@ static NSDictionary *RPParseICS(NSData *data) {
         if (digits.length < 8) continue;
         NSString *iso = [NSString stringWithFormat:@"%@-%@-%@", [digits substringToIndex:4], [digits substringWithRange:NSMakeRange(4, 2)], [digits substringWithRange:NSMakeRange(6, 2)]];
         if ([iso compare:today] == NSOrderedAscending) continue;
-        [upcoming addObject:@{ @"date": iso, @"time": clock, @"title": title.length ? title : @"未命名日程", @"notes": RPDecode(ev[@"DESCRIPTION"] ?: @""), @"id": ev[@"UID"] ?: title }];
-        if (upcoming.count >= 18) break;
+        NSString *uid = RPString(ev[@"UID"]);
+        [upcoming addObject:@{ @"date": iso, @"time": clock, @"title": title.length ? title : @"未命名日程", @"notes": RPDecode(RPString(ev[@"DESCRIPTION"])), @"id": uid.length ? uid : title }];
     }
+    // ICS files are not in date order: sort everything first, then keep the nearest 18.
     [upcoming sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
-        return [a[@"date"] compare:b[@"date"]];
+        NSComparisonResult byDay = [a[@"date"] compare:b[@"date"]];
+        if (byDay != NSOrderedSame) return byDay;
+        // All-day items (no time) first within a day.
+        return [a[@"time"] compare:b[@"time"]];
     }];
+    if (upcoming.count > 18) [upcoming removeObjectsInRange:NSMakeRange(18, upcoming.count - 18)];
     NSMutableArray *todayItems = [NSMutableArray array];
     for (NSDictionary *item in upcoming) if ([item[@"date"] isEqualToString:today]) [todayItems addObject:item];
     NSMutableArray *reminders = [NSMutableArray array];
@@ -704,6 +728,7 @@ static NSString *RPBestTopicImage(NSData *data, NSString *query) {
     return best;
 }
 
+static double RPHeatValue(NSString *heat);
 static NSArray *RPParseXiaohongshu(NSData *data, NSInteger limit) {
     NSString *html = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
     if (!html) return @[];
@@ -718,9 +743,55 @@ static NSArray *RPParseXiaohongshu(NSData *data, NSInteger limit) {
         NSString *link = [html substringWithRange:[m rangeAtIndex:2]];
         [items addObject:@{
             @"title": title,
+            @"heat": heat ?: @"",
+            @"heat_value": @(RPHeatValue(heat)),
             @"summary": heat.length ? [NSString stringWithFormat:@"热度 %@", heat] : @"小红书热榜",
             @"link": link ?: @"",
             @"image_url": @"",
+        }];
+        if ((NSInteger)items.count >= limit) break;
+    }
+    return items;
+}
+
+/** "918.6w" / "1.2万" / "3456" → number, for the heat bars. */
+static double RPHeatValue(NSString *heat) {
+    NSString *s = [[heat ?: @"" lowercaseString] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    double n = [s doubleValue];
+    if ([s hasSuffix:@"w"] || [s hasSuffix:@"万"]) n *= 10000;
+    else if ([s hasSuffix:@"亿"]) n *= 100000000;
+    return n;
+}
+
+/* tophub.today node page, current markup:
+   <a class="rank-item-container" href="…search_result?keyword=…">
+     <div class="number …">1</div> … <div class="s-title">标题</div>
+     … <div class="s-tie-count">918.6w</div> … url('…') … </a> */
+static NSArray *RPParseTophubCards(NSData *data, NSInteger limit) {
+    NSString *html = [[NSString alloc] initWithData:data ?: [NSData data] encoding:NSUTF8StringEncoding];
+    if (html.length == 0) return @[];
+    NSRegularExpression *card = [NSRegularExpression regularExpressionWithPattern:@"<a class=\"rank-item-container\"[^>]*href=\"([^\"]*)\"[^>]*>([\\s\\S]*?)</a>" options:0 error:nil];
+    NSRegularExpression *titleRe = [NSRegularExpression regularExpressionWithPattern:@"class=\"s-title\">([^<]+)<" options:0 error:nil];
+    NSRegularExpression *heatRe = [NSRegularExpression regularExpressionWithPattern:@"class=\"s-tie-count\">([^<]+)<" options:0 error:nil];
+    NSRegularExpression *imgRe = [NSRegularExpression regularExpressionWithPattern:@"url\\(['\"]?(https?://[^'\")]+)" options:0 error:nil];
+    NSMutableArray *items = [NSMutableArray array];
+    for (NSTextCheckingResult *m in [card matchesInString:html options:0 range:NSMakeRange(0, html.length)]) {
+        if (m.numberOfRanges < 3) continue;
+        NSString *body = [html substringWithRange:[m rangeAtIndex:2]];
+        NSTextCheckingResult *t = [titleRe firstMatchInString:body options:0 range:NSMakeRange(0, body.length)];
+        if (!t) continue;
+        NSString *title = RPDecode([body substringWithRange:[t rangeAtIndex:1]]);
+        if (title.length == 0) continue;
+        NSTextCheckingResult *h = [heatRe firstMatchInString:body options:0 range:NSMakeRange(0, body.length)];
+        NSString *heat = h ? RPDecode([body substringWithRange:[h rangeAtIndex:1]]) : @"";
+        NSTextCheckingResult *im = [imgRe firstMatchInString:body options:0 range:NSMakeRange(0, body.length)];
+        [items addObject:@{
+            @"title": title,
+            @"heat": heat,
+            @"heat_value": @(RPHeatValue(heat)),
+            @"summary": heat.length ? [NSString stringWithFormat:@"热度 %@", heat] : @"小红书热榜",
+            @"link": [html substringWithRange:[m rangeAtIndex:1]] ?: @"",
+            @"image_url": im ? [body substringWithRange:[im rangeAtIndex:1]] : @"",
         }];
         if ((NSInteger)items.count >= limit) break;
     }
@@ -740,6 +811,8 @@ static NSArray *RPParseXiaohongshuText(NSData *data, NSInteger limit) {
         NSString *heat = [text substringWithRange:[m rangeAtIndex:4]];
         [items addObject:@{
             @"title": title,
+            @"heat": heat ?: @"",
+            @"heat_value": @(RPHeatValue(heat)),
             @"summary": heat.length ? [NSString stringWithFormat:@"热度 %@", heat] : @"小红书热榜",
             @"link": [text substringWithRange:[m rangeAtIndex:3]] ?: @"",
             @"image_url": @"",
@@ -1216,9 +1289,42 @@ static NSString * const RPDwellPrefix = @"RemotePanel.page.dwell.";
 static NSString * const RPAlbumDefaultsKey = @"RemotePanel.albumLocalId";
 static NSString * const RPDwellOverrideDefaultsKey = @"RemotePanel.dwellOverride";
 
+/* Feeds hand us parsed JSON, which can hold NSNull (GitHub description, printer
+   fields, weather min/max). NSNull is not a plist type, so one of them made every
+   saveDisk fail, and on screen it showed as "<null>" or threw on -boolValue.
+   Replace it with @"" all the way down. */
+static id RPPlistSafe(id value) {
+    if (!value || value == [NSNull null]) return nil;
+    if ([value isKindOfClass:[NSDictionary class]]) {
+        NSMutableDictionary *out = [NSMutableDictionary dictionaryWithCapacity:[value count]];
+        [(NSDictionary *)value enumerateKeysAndObjectsUsingBlock:^(id k, id v, BOOL *stop) {
+            if (![k isKindOfClass:[NSString class]]) return;
+            id c = RPPlistSafe(v);
+            out[k] = c ?: @"";
+        }];
+        return out;
+    }
+    if ([value isKindOfClass:[NSArray class]]) {
+        NSMutableArray *out = [NSMutableArray arrayWithCapacity:[value count]];
+        for (id v in (NSArray *)value) {
+            id c = RPPlistSafe(v);
+            [out addObject:c ?: @""];
+        }
+        return out;
+    }
+    if ([value isKindOfClass:[NSString class]] || [value isKindOfClass:[NSNumber class]] ||
+        [value isKindOfClass:[NSDate class]] || [value isKindOfClass:[NSData class]]) return value;
+    return [value description] ?: @"";
+}
+
 @interface RPLocalFeed ()
 @property (nonatomic, strong) NSMutableDictionary *cache;
-@property (nonatomic, assign) BOOL refreshing;
+@property (nonatomic, strong) NSMutableDictionary *failedAt;
+@property (nonatomic, strong) NSMutableDictionary *failStreak;
+@property (nonatomic, assign) BOOL dirty;
+@property (nonatomic, assign) NSTimeInterval refreshStartedAt;
+@property (atomic, assign) NSUInteger refreshGeneration;
+@property (atomic, assign) BOOL refreshing;
 @property (nonatomic, assign) BOOL settingsRerun;
 @property (nonatomic, copy) NSString *fetchError;
 @property (nonatomic, copy) NSString *fetchNote;
@@ -1238,6 +1344,8 @@ static NSString * const RPDwellOverrideDefaultsKey = @"RemotePanel.dwellOverride
     self = [super init];
     if (self) {
         _cache = [NSMutableDictionary dictionary];
+        _failedAt = [NSMutableDictionary dictionary];
+        _failStreak = [NSMutableDictionary dictionary];
         _logLines = [NSMutableArray array];
         [self migrateHelloDefaults];
         [self loadDisk];
@@ -1253,14 +1361,29 @@ static NSString * const RPDwellOverrideDefaultsKey = @"RemotePanel.dwellOverride
 }
 
 - (void)loadDisk {
+    // A plist file cannot hold NSNull, so whatever loads from disk is already clean.
+    // Every value added later goes through store: → RPPlistSafe, so the state the
+    // pages receive never contains NSNull and -boolValue/-doubleValue cannot throw.
     NSDictionary *saved = [NSDictionary dictionaryWithContentsOfFile:[self diskPath]];
     if ([saved isKindOfClass:[NSDictionary class]]) [self.cache addEntriesFromDictionary:saved];
 }
 
+- (void)markDirty {
+    @synchronized (self) { self.dirty = YES; }
+}
+
 - (void)saveDisk {
     NSDictionary *snapshot;
-    @synchronized (self) { snapshot = [self.cache copy]; }
-    [snapshot writeToFile:[self diskPath] atomically:YES];
+    @synchronized (self) {
+        if (!self.dirty) return;
+        snapshot = [self.cache copy];
+        self.dirty = NO;
+    }
+    // writeToFile: silently returns NO for any non-plist value; say so instead
+    // of losing the cache on every restart.
+    if (![snapshot writeToFile:[self diskPath] atomically:YES]) {
+        [self appendLog:@"缓存" status:@"fail" detail:@"写入磁盘失败，重启后要重新拉取"];
+    }
 }
 
 - (BOOL)pageEnabled:(NSString *)pid {
@@ -1294,7 +1417,10 @@ static NSString * const RPDwellOverrideDefaultsKey = @"RemotePanel.dwellOverride
     if (!world) return;
     [ud setObject:@"https://getdaytrends.com/united-states/" forKey:key];
     [ud setObject:@"us" forKey:@"RemotePanel.x.region"];
-    @synchronized (self) { [self.cache removeObjectForKey:@"x"]; }
+    @synchronized (self) {
+        [self.cache removeObjectForKey:@"x"];
+        self.dirty = YES;
+    }
     [self saveDisk];
 }
 
@@ -1320,18 +1446,32 @@ static NSString * const RPDwellOverrideDefaultsKey = @"RemotePanel.dwellOverride
         NSDictionary *box = self.cache[key];
         if (![box isKindOfClass:[NSDictionary class]] || !box[@"payload"]) return NO;
         id payload = box[@"payload"];
+        BOOL young = [[NSDate date] timeIntervalSince1970] - [box[@"at"] doubleValue] < ttl;
+        // Fetched by this build within the TTL: trust it. The shape checks below exist
+        // to throw away caches written by older builds. Applied to fresh data they
+        // could never pass for some sources (X via RSS, a 0-second bilibili clip, an
+        // empty ticker), and those refetched on every 30 s poll forever.
+        // (The greeting still goes through its slot check: a morning line must not last into the evening.)
+        BOOL oldXhs = [key isEqualToString:@"xhs"] && [payload isKindOfClass:[NSArray class]] && [(NSArray *)payload count] &&
+            [[(NSArray *)payload firstObject] isKindOfClass:[NSDictionary class]] &&
+            [[(NSArray *)payload firstObject][@"cover"] integerValue] < 4;
+        if (young && [box[@"v"] integerValue] >= 2 && ![key isEqualToString:@"hello"] && !oldXhs) return YES;
         if ([payload isKindOfClass:[NSArray class]] && [(NSArray *)payload count] == 0) return NO;
         if ([key isEqualToString:@"hello"]) {
             if ([box[@"at"] doubleValue] <= 0) return NO;
             if (![payload isKindOfClass:[NSDictionary class]]) return NO;
             NSString *text = payload[@"text"];
             NSString *slot = payload[@"slot"];
-            return [text isKindOfClass:[NSString class]] && text.length > 0 && [slot isEqualToString:RPHelloSlot(NULL)];
+            NSString *source = payload[@"source"];
+            // Greetings cached before this build have no source tag; keep them for their slot.
+            BOOL sameSource = ![source isKindOfClass:[NSString class]] || [source isEqualToString:[self helloSourceTag]];
+            return [text isKindOfClass:[NSString class]] && text.length > 0 && [slot isEqualToString:RPHelloSlot(NULL)] && sameSource;
         }
         if (([key isEqualToString:@"x"] || [key isEqualToString:@"xhs"] || [key isEqualToString:@"github"]) && [payload isKindOfClass:[NSArray class]] && [(NSArray *)payload count]) {
             id first = [(NSArray *)payload firstObject];
             if (![first isKindOfClass:[NSDictionary class]] || ![(NSDictionary *)first objectForKey:@"image_url"] || (([key isEqualToString:@"x"] || [key isEqualToString:@"xhs"]) && ![first[@"rich"] boolValue])) return NO;
-            if ([key isEqualToString:@"xhs"] && [first[@"cover"] integerValue] < 3) return NO;
+            // cover 4 = the build-7.1 list (16 items, heat values, 7 photos); older caches refetch once.
+            if ([key isEqualToString:@"xhs"] && [first[@"cover"] integerValue] < 4) return NO;
             if ([key isEqualToString:@"x"] && ![first[@"blurb"] isKindOfClass:[NSString class]]) return NO;
         }
         if ([key isEqualToString:@"bili"] && [payload isKindOfClass:[NSArray class]] && [(NSArray *)payload count]) {
@@ -1353,9 +1493,33 @@ static NSString * const RPDwellOverrideDefaultsKey = @"RemotePanel.dwellOverride
 }
 
 - (void)store:(NSString *)key payload:(id)payload {
-    if (!payload) return;
+    id clean = RPPlistSafe(payload);
+    if (!clean) return;
     @synchronized (self) {
-        self.cache[key] = @{ @"at": @([[NSDate date] timeIntervalSince1970]), @"payload": payload };
+        self.cache[key] = @{ @"at": @([[NSDate date] timeIntervalSince1970]), @"payload": clean, @"v": @2 };
+        [self.failedAt removeObjectForKey:key];
+        self.dirty = YES;
+    }
+}
+
+/** Remember a failed fetch so the key is not retried on every 30 s poll. */
+- (void)noteFailure:(NSString *)key {
+    if (key.length == 0) return;
+    @synchronized (self) {
+        NSInteger streak = [self.failStreak[key] integerValue] + 1;
+        self.failStreak[key] = @(streak);
+        self.failedAt[key] = @([[NSDate date] timeIntervalSince1970]);
+    }
+}
+
+/** 5, 10, 20, 40 then 60 min after consecutive failures, never longer than the TTL. */
+- (BOOL)backingOff:(NSString *)key ttl:(NSTimeInterval)ttl {
+    @synchronized (self) {
+        NSNumber *at = self.failedAt[key];
+        if (!at) return NO;
+        NSInteger streak = MAX(1, [self.failStreak[key] integerValue]);
+        NSTimeInterval wait = MIN(MIN(5 * 60 * pow(2, streak - 1), 3600), MAX(60, ttl));
+        return [[NSDate date] timeIntervalSince1970] - at.doubleValue < wait;
     }
 }
 
@@ -1413,12 +1577,16 @@ static NSString * const RPDwellOverrideDefaultsKey = @"RemotePanel.dwellOverride
 - (void)markCacheStale {
     @synchronized (self) {
         for (NSString *key in [self.cache allKeys]) {
+            // The greeting is generated per day-period by a paid API and does not
+            // depend on any setting except its own key/model; leave it alone.
+            if ([key isEqualToString:@"hello"]) continue;
             NSDictionary *box = self.cache[key];
             if (![box isKindOfClass:[NSDictionary class]]) continue;
             NSMutableDictionary *next = [box mutableCopy];
             next[@"at"] = @0;
             self.cache[key] = next;
         }
+        self.dirty = YES;
     }
 }
 
@@ -1610,8 +1778,7 @@ static NSString * const RPDwellOverrideDefaultsKey = @"RemotePanel.dwellOverride
         RPWebPagesSave(webPages);
     }
     [ud synchronize];
-    [self markCacheStale];
-    if (self.refreshing) self.settingsRerun = YES;
+    [self invalidateForSettingsChange];
     [self appendLog:@"设置" status:@"ok" detail:@"已从浏览器保存"];
     dispatch_async(dispatch_get_main_queue(), ^{
         [[NSNotificationCenter defaultCenter] postNotificationName:@"RPRemoteSettingsChanged" object:nil];
@@ -1621,10 +1788,17 @@ static NSString * const RPDwellOverrideDefaultsKey = @"RemotePanel.dwellOverride
 
 - (BOOL)readClient:(int)client first:(NSString **)firstOut body:(NSData **)bodyOut {
     NSMutableData *buf = [NSMutableData data];
-    char tmp[4096];
+    char tmp[16384];
     NSUInteger headerEnd = NSNotFound;
     NSInteger contentLength = 0;
-    for (int i = 0; i < 30; i++) {
+    // Read until the whole body has arrived. The old 30-recv cap cut 100 KB video
+    // chunks short (recv often returns one ~1.4 KB segment). SO_RCVTIMEO (8 s) and
+    // the 260 KB cap below still bound the loop.
+    // The server is single-threaded: cap the whole read at 30 s so a client
+    // trickling a byte every few seconds cannot hold it indefinitely.
+    NSTimeInterval giveUpAt = [NSDate timeIntervalSinceReferenceDate] + 30;
+    for (;;) {
+        if ([NSDate timeIntervalSinceReferenceDate] > giveUpAt) break;
         ssize_t n = recv(client, tmp, sizeof(tmp), 0);
         if (n < 0) break;
         if (n == 0) break;
@@ -1638,7 +1812,9 @@ static NSString * const RPDwellOverrideDefaultsKey = @"RemotePanel.dwellOverride
                     NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:@"Content-Length:\\s*(\\d+)" options:NSRegularExpressionCaseInsensitive error:nil];
                     NSTextCheckingResult *m = [re firstMatchInString:headers options:0 range:NSMakeRange(0, headers.length)];
                     contentLength = (m.numberOfRanges > 1) ? [[headers substringWithRange:[m rangeAtIndex:1]] integerValue] : 0;
-                    if (contentLength > 200000) contentLength = 200000;
+                    // Refuse rather than clamp: a clamped length would let an oversized
+                    // body through the short-body check below, cut at 200 KB.
+                    if (contentLength > 200000 || contentLength < 0) return NO;
                     break;
                 }
             }
@@ -1655,6 +1831,9 @@ static NSString * const RPDwellOverrideDefaultsKey = @"RemotePanel.dwellOverride
         NSUInteger len = MIN((NSUInteger)contentLength, buf.length - headerEnd);
         body = [buf subdataWithRange:NSMakeRange(headerEnd, len)];
     }
+    // A short body means the client stalled or hung up; refuse it rather than
+    // writing a truncated chunk into a video file.
+    if ((NSInteger)body.length < contentLength) return NO;
     if (firstOut) *firstOut = first;
     if (bodyOut) *bodyOut = body;
     return first.length > 0;
@@ -1790,11 +1969,23 @@ static NSString * const RPDwellOverrideDefaultsKey = @"RemotePanel.dwellOverride
     for (;;) {
         int client = accept(fd, NULL, NULL);
         if (client < 0) continue;
-        setsockopt(client, SOL_SOCKET, SO_NOSIGPIPE, &yes, sizeof(yes));
-        struct timeval tv;
-        tv.tv_sec = 8;
-        tv.tv_usec = 0;
-        setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        // This thread never returns to a run loop, so without a pool every request's
+        // strings, JSON and /shot PNGs (several MB) stayed alive for the app's lifetime.
+        @autoreleasepool {
+            [self serveClient:client];
+        }
+    }
+}
+
+- (void)serveClient:(int)client {
+    int yes = 1;
+    setsockopt(client, SOL_SOCKET, SO_NOSIGPIPE, &yes, sizeof(yes));
+    struct timeval tv;
+    tv.tv_sec = 8;
+    tv.tv_usec = 0;
+    setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(client, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    for (int once = 0; once < 1; once++) {
         NSString *first = nil;
         NSData *reqBody = nil;
         if (![self readClient:client first:&first body:&reqBody]) {
@@ -1861,8 +2052,8 @@ static NSString * const RPDwellOverrideDefaultsKey = @"RemotePanel.dwellOverride
             NSData *bytes = [reply dataUsingEncoding:NSUTF8StringEncoding];
             NSString *head = [NSString stringWithFormat:@"HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\nContent-Length: %lu\r\n\r\n", (unsigned long)bytes.length];
             NSData *hb = [head dataUsingEncoding:NSUTF8StringEncoding];
-            send(client, hb.bytes, hb.length, 0);
-            send(client, bytes.bytes, bytes.length, 0);
+            [self sendAll:client data:hb];
+            [self sendAll:client data:bytes];
             close(client);
             continue;
         }
@@ -1883,14 +2074,14 @@ static NSString * const RPDwellOverrideDefaultsKey = @"RemotePanel.dwellOverride
             if (png.length) {
                 NSString *head = [NSString stringWithFormat:@"HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nConnection: close\r\nContent-Length: %lu\r\n\r\n", (unsigned long)png.length];
                 NSData *hb = [head dataUsingEncoding:NSUTF8StringEncoding];
-                send(client, hb.bytes, hb.length, 0);
-                send(client, png.bytes, png.length, 0);
+                [self sendAll:client data:hb];
+                [self sendAll:client data:png];
             } else {
                 NSData *bytes = [text dataUsingEncoding:NSUTF8StringEncoding] ?: [NSData data];
                 NSString *head = [NSString stringWithFormat:@"HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\nContent-Length: %lu\r\n\r\n", (unsigned long)bytes.length];
                 NSData *hb = [head dataUsingEncoding:NSUTF8StringEncoding];
-                send(client, hb.bytes, hb.length, 0);
-                if (bytes.length) send(client, bytes.bytes, bytes.length, 0);
+                [self sendAll:client data:hb];
+                if (bytes.length) [self sendAll:client data:bytes];
             }
             close(client);
             continue;
@@ -1901,8 +2092,8 @@ static NSString * const RPDwellOverrideDefaultsKey = @"RemotePanel.dwellOverride
         NSData *bytes = [body dataUsingEncoding:NSUTF8StringEncoding] ?: [NSData data];
         NSString *head = [NSString stringWithFormat:@"HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\nContent-Length: %lu\r\n\r\n", (unsigned long)bytes.length];
         NSData *hb = [head dataUsingEncoding:NSUTF8StringEncoding];
-        send(client, hb.bytes, hb.length, 0);
-        if (bytes.length) send(client, bytes.bytes, bytes.length, 0);
+        [self sendAll:client data:hb];
+        if (bytes.length) [self sendAll:client data:bytes];
         close(client);
     }
 }
@@ -1916,8 +2107,14 @@ static NSString * const RPDwellOverrideDefaultsKey = @"RemotePanel.dwellOverride
 }
 
 - (void)appendLog:(NSString *)name status:(NSString *)status detail:(NSString *)detail {
-    NSDateFormatter *fmt = [[NSDateFormatter alloc] init];
-    fmt.dateFormat = @"HH:mm:ss";
+    static NSDateFormatter *fmt;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        fmt = [[NSDateFormatter alloc] init];
+        fmt.dateFormat = @"HH:mm:ss";
+    });
+    // appendLog runs on several threads; NSDateFormatter is thread-safe on iOS 7+.
+    fmt.timeZone = [NSTimeZone localTimeZone];
     NSString *mark = @"成功";
     if ([status isEqualToString:@"fail"]) mark = @"失败";
     else if ([status isEqualToString:@"skip"]) mark = @"跳过";
@@ -1938,13 +2135,33 @@ static NSString * const RPDwellOverrideDefaultsKey = @"RemotePanel.dwellOverride
 }
 
 - (void)refreshWithCompletion:(void (^)(NSDictionary *, NSError *))completion {
-    if (self.refreshing) return;
-    self.refreshing = YES;
+    @synchronized (self) {
+        if (self.refreshing) {
+            // A pass should finish in a few minutes now that reads time out. If one
+            // has been running for over 10 minutes, assume it is stuck and start fresh;
+            // otherwise the panel would never update again.
+            NSTimeInterval age = [NSDate timeIntervalSinceReferenceDate] - self.refreshStartedAt;
+            if (age < 600) return;
+            [self appendLog:@"刷新" status:@"fail" detail:[NSString stringWithFormat:@"上一轮卡了 %.0f 分钟，重新开始", age / 60.0]];
+        }
+        self.refreshing = YES;
+        self.refreshStartedAt = [NSDate timeIntervalSinceReferenceDate];
+        self.refreshGeneration += 1;
+    }
+    NSUInteger generation = self.refreshGeneration;
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        [self runRefreshPass:completion generation:generation];
+    });
+}
+
+/** One full pass. Runs on a background queue with `refreshing` already set. */
+- (void)runRefreshPass:(void (^)(NSDictionary *, NSError *))completion generation:(NSUInteger)generation {
+    for (;;) {
         NSMutableArray *jobs = [NSMutableArray array];
         void (^add)(NSString *, NSString *, NSTimeInterval, BOOL (^)(void)) = ^(NSString *name, NSString *key, NSTimeInterval ttl, BOOL (^work)(void)) {
             if ([self fresh:key ttl:ttl]) return;
-            [jobs addObject:@{ @"name": name, @"work": [work copy] }];
+            if ([self backingOff:key ttl:ttl]) return;
+            [jobs addObject:@{ @"name": name, @"key": key, @"work": [work copy] }];
         };
         if ([self pageEnabled:@"weather"]) {
             add(@"天气", @"weather", RPLocalTTL(@"weather"), ^{ return [self fetchWeather]; });
@@ -1977,30 +2194,61 @@ static NSString * const RPDwellOverrideDefaultsKey = @"RemotePanel.dwellOverride
         if (tickerURL.length) add(@"走马灯", @"ticker", RPLocalTTL(@"ticker"), ^{ return [self fetchTicker]; });
 
         for (NSDictionary *job in jobs) {
-            NSString *name = job[@"name"];
-            BOOL (^work)(void) = job[@"work"];
-            self.fetchError = nil;
-            self.fetchNote = nil;
-            [self emitName:name status:@"start" detail:@"" includeState:NO];
-            BOOL ok = work ? work() : NO;
-            NSString *status = ok ? (self.fetchNote.length ? @"skip" : @"ok") : @"fail";
-            NSString *detail = ok ? (self.fetchNote.length ? self.fetchNote : @"完成") : (self.fetchError.length ? self.fetchError : @"失败");
-            [self appendLog:name status:status detail:detail];
-            [self emitName:name status:status detail:detail includeState:(ok && self.fetchNote.length == 0)];
+            @autoreleasepool {
+                NSString *name = job[@"name"];
+                NSString *key = job[@"key"];
+                BOOL (^work)(void) = job[@"work"];
+                self.fetchError = nil;
+                self.fetchNote = nil;
+                [self emitName:name status:@"start" detail:@"" includeState:NO];
+                BOOL ok = work ? work() : NO;
+                if (!ok) {
+                    [self noteFailure:key];
+                } else {
+                    @synchronized (self) { [self.failStreak removeObjectForKey:key]; }
+                }
+                NSString *status = ok ? (self.fetchNote.length ? @"skip" : @"ok") : @"fail";
+                NSString *detail = ok ? (self.fetchNote.length ? self.fetchNote : @"完成") : (self.fetchError.length ? self.fetchError : @"失败");
+                [self appendLog:name status:status detail:detail];
+                [self emitName:name status:status detail:detail includeState:(ok && self.fetchNote.length == 0)];
+            }
         }
+        // saveDisk is a no-op unless store: ran, so idle 30 s polls no longer rewrite the plist.
         [self saveDisk];
-        if (self.settingsRerun) {
-            self.settingsRerun = NO;
-            self.refreshing = NO;
-            [self refreshWithCompletion:completion];
-            return;
+        BOOL rerun = NO;
+        BOOL superseded = NO;
+        @synchronized (self) {
+            // The watchdog may have started a newer pass while this one was stuck.
+            // Only the current generation may rerun or clear `refreshing`.
+            superseded = generation != self.refreshGeneration;
+            if (!superseded) {
+                // Settings changed mid-pass: go again without dropping `refreshing`,
+                // so a main-thread poll cannot start a second loop alongside this one.
+                // Checked and cleared under one lock so a change cannot slip between.
+                rerun = self.settingsRerun;
+                self.settingsRerun = NO;
+                if (rerun) self.refreshStartedAt = [NSDate timeIntervalSinceReferenceDate];
+                else self.refreshing = NO;
+            }
         }
+        if (superseded) return;
+        if (rerun) continue;
         NSDictionary *state = [self assemble];
-        self.refreshing = NO;
         dispatch_async(dispatch_get_main_queue(), ^{
             if (completion) completion(state, nil);
         });
-    });
+        return;
+    }
+}
+
+/** Called after the user saves settings on the iPad itself. */
+- (void)invalidateForSettingsChange {
+    [self markCacheStale];
+    @synchronized (self) {
+        [self.failedAt removeAllObjects];
+        [self.failStreak removeAllObjects];
+        if (self.refreshing) self.settingsRerun = YES;
+    }
 }
 
 - (BOOL)fetchWeather {
@@ -2149,8 +2397,20 @@ static NSString * const RPDwellOverrideDefaultsKey = @"RemotePanel.dwellOverride
         if (self.fetchError.length == 0) self.fetchError = @"没有读到问候";
         return NO;
     }
-    [self store:@"hello" payload:@{ @"text": text, @"slot": slot, @"period": label ?: @"" }];
+    [self store:@"hello" payload:@{ @"text": text, @"slot": slot, @"period": label ?: @"", @"source": [self helloSourceTag] }];
     return YES;
+}
+
+/** Which endpoint/key/model wrote the greeting. A change in settings makes the cached line stale. */
+- (NSString *)helloSourceTag {
+    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+    NSString *key = RPString([ud stringForKey:RPHelloKeyKey]);
+    if (key.length == 0) key = RPLocalDefaultHelloKey();
+    NSString *model = RPString([ud stringForKey:RPHelloModelKey]);
+    if (model.length == 0) model = RPLocalDefaultHelloModel();
+    // Only the key's length and tail, so the secret itself is not copied into the cache file.
+    NSString *keyTag = key.length > 4 ? [NSString stringWithFormat:@"%lu:%@", (unsigned long)key.length, [key substringFromIndex:key.length - 4]] : key;
+    return [NSString stringWithFormat:@"%@|%@|%@", [self sourceURL:@"hello"], model, keyTag];
 }
 
 - (BOOL)fetchDaily {
@@ -2284,12 +2544,13 @@ static NSString * const RPDwellOverrideDefaultsKey = @"RemotePanel.dwellOverride
         if (name.length == 0) continue;
         [items addObject:@{
             @"full_name": name,
-            @"name": repo[@"name"] ?: name,
-            @"description": repo[@"description"] ?: @"",
-            @"stars": repo[@"stargazers_count"] ?: @0,
-            @"forks": repo[@"forks_count"] ?: @0,
-            @"language": repo[@"language"] ?: @"--",
-            @"url": repo[@"html_url"] ?: @"",
+            @"name": RPString(repo[@"name"]).length ? RPString(repo[@"name"]) : name,
+            // GitHub sends JSON null for missing description/language; ?: does not catch NSNull.
+            @"description": RPString(repo[@"description"]),
+            @"stars": [repo[@"stargazers_count"] isKindOfClass:[NSNumber class]] ? repo[@"stargazers_count"] : @0,
+            @"forks": [repo[@"forks_count"] isKindOfClass:[NSNumber class]] ? repo[@"forks_count"] : @0,
+            @"language": RPString(repo[@"language"]).length ? RPString(repo[@"language"]) : @"--",
+            @"url": RPString(repo[@"html_url"]),
             @"topics": [repo[@"topics"] isKindOfClass:[NSArray class]] ? repo[@"topics"] : @[],
             @"image_url": [repo[@"owner"] isKindOfClass:[NSDictionary class]] ? RPString(repo[@"owner"][@"avatar_url"]) : @"",
         }];
@@ -2448,37 +2709,47 @@ static NSString * const RPDwellOverrideDefaultsKey = @"RemotePanel.dwellOverride
     if (url.length == 0) url = RPLocalSourceDefaults()[@"xiaohongshu-hot"];
     NSString *proxy = [self proxyFor:@"xiaohongshu-hot"];
     if (proxy.length == 0) proxy = RPLocalDefaultProxy();
-    NSString *fetchURL = url;
-    if ([url rangeOfString:@"tophub.today"].location != NSNotFound) {
-        fetchURL = [@"https://r.jina.ai/" stringByAppendingString:url];
+    // tophub serves the list as plain HTML (rank-item-container cards), so read it
+    // directly first; r.jina.ai is only a fallback (it timed out often and returns
+    // at most ~10 rows).
+    NSData *data = [self syncGET:url proxy:proxy headers:@{ @"User-Agent": @"Mozilla/5.0 (iPad; CPU OS 9_3_5 like Mac OS X) AppleWebKit/601.1.46 (KHTML, like Gecko) Version/9.0 Mobile/13G36 Safari/601.1" }];
+    NSArray *items = RPParseTophubCards(data, 20);
+    if (!items.count) items = RPParseXiaohongshu(data, 20);
+    if (!items.count && [url rangeOfString:@"tophub.today"].location != NSNotFound) {
+        data = [self syncGET:[@"https://r.jina.ai/" stringByAppendingString:url] proxy:proxy headers:nil];
+        items = RPParseXiaohongshuText(data, 20);
     }
-    NSData *data = [self syncGET:fetchURL proxy:proxy headers:nil];
-    NSArray *items = RPParseXiaohongshu(data, 10);
-    if (!items.count) items = RPParseXiaohongshuText(data, 10);
     if (!items.count) {
         if (self.fetchError.length == 0) self.fetchError = @"没有解析到热门";
         return NO;
     }
     NSMutableArray *rich = [NSMutableArray array];
+    NSMutableSet *usedImages = [NSMutableSet set];
     NSInteger tries = 0;
     for (NSDictionary *item in items) {
         if (![item isKindOfClass:[NSDictionary class]]) continue;
         NSMutableDictionary *row = [item mutableCopy];
-        if (tries < 4 && RPString(row[@"image_url"]).length == 0) {
+        // The page shows a lead photo plus a photo grid: find pictures for the
+        // first 7 topics (was 4), and never reuse one picture for two topics.
+        if (tries < 7 && RPString(row[@"image_url"]).length == 0) {
             tries++;
             NSString *q = [RPString(row[@"title"]) stringByAddingPercentEscapesUsingEncoding:NSUTF8StringEncoding];
             if (q.length) {
                 NSString *imgURL = [NSString stringWithFormat:@"https://image.so.com/j?q=%@&src=srp&sn=0&pn=12", q];
                 NSData *imgData = [self syncGET:imgURL proxy:nil headers:@{ @"User-Agent": @"Mozilla/5.0 (iPad) AppleWebKit/601.1", @"Referer": @"https://image.so.com/" }];
                 NSString *thumb = RPBestTopicImage(imgData, RPString(row[@"title"]));
-                if (thumb.length) row[@"image_url"] = thumb;
+                if (thumb.length && ![usedImages containsObject:thumb]) {
+                    row[@"image_url"] = thumb;
+                    [usedImages addObject:thumb];
+                }
             }
         }
         row[@"rich"] = @YES;
-        row[@"cover"] = @3;
+        row[@"cover"] = @4;
+        row[@"rank"] = @(rich.count + 1);
         if (!row[@"image_url"]) row[@"image_url"] = @"";
         [rich addObject:row];
-        if (rich.count >= 8) break;
+        if (rich.count >= 16) break;
     }
     [self store:@"xhs" payload:rich];
     return YES;

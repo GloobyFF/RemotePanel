@@ -1,11 +1,17 @@
 #!/bin/bash
 set -euo pipefail
 ROOT="/Users/fangzhiling/Developer/RemotePanel"
-PROFILE_UUID="82daac59-68ad-46f5-bacd-b8033bc9dc0b"
+# 341d1c58 (expires 2027-10-30) supersedes 82daac59 and also covers 6f302a68….
+PROFILE_UUID="${RP_PROFILE_UUID:-341d1c58-4789-4dd7-b5a1-d4f71e876b25}"
 PROFILE="$HOME/Library/MobileDevice/Provisioning Profiles/${PROFILE_UUID}.mobileprovision"
-IDENTITY="iPhone Developer: ZhiLing Fang (GE75FA37EU)"
+# The keychain holds two certificates both named "iPhone Developer: ZhiLing Fang
+# (GE75FA37EU)"; only 1DF5C614… is in the RemotePanel Dev profiles. Signing by
+# name lets Xcode pick the other one ("profile doesn't include signing
+# certificate"), so pin it by SHA-1. Override with RP_IDENTITY=<sha1 or name>.
+IDENTITY="${RP_IDENTITY:-1DF5C6144994B3B6C7932553B9C5D50FF5A72E0A}"
 TEAM="FLFYQXCCZM"
-UDID="1b9b4d6959e9d533837d946d94105049dfd794a8"
+# Target device. Override with RP_UDID=<udid> ./build_install.sh
+UDID="${RP_UDID:-1b9b4d6959e9d533837d946d94105049dfd794a8}"
 IOS_DEPLOY="$HOME/Library/Developer/Xcode/DerivedData/ios-deploy-caqdlqektaptvpavtvifdgxwbhad/Build/Products/Release/ios-deploy"
 KC="$HOME/Library/Keychains/login.keychain"
 if [ ! -f "$KC" ]; then KC="$HOME/Library/Keychains/login.keychain-db"; fi

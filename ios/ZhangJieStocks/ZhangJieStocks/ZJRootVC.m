@@ -104,9 +104,13 @@
 }
 
 - (void)onTick {
-    NSDateFormatter *fmt = [[NSDateFormatter alloc] init];
-    fmt.timeZone = [NSTimeZone timeZoneWithName:@"Asia/Shanghai"];
-    fmt.dateFormat = @"HH:mm";
+    static NSDateFormatter *fmt;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        fmt = [[NSDateFormatter alloc] init];
+        fmt.timeZone = [NSTimeZone timeZoneWithName:@"Asia/Shanghai"];
+        fmt.dateFormat = @"HH:mm";
+    });
     self.clockLabel.text = [fmt stringFromDate:[NSDate date]];
     self.statusLabel.text = [ZJStore marketIsOpen] ? @"交易中" : @"未开盘";
     self.statusLabel.textColor = [ZJStore marketIsOpen] ? ZJUp() : ZJDim();
@@ -117,7 +121,14 @@
         if (self.dwellLeft <= 0) [self turn:1];
     }
     NSTimeInterval now = [NSDate date].timeIntervalSince1970;
-    if ([ZJStore marketIsOpen] && now - self.lastFetchAt >= 60) [self refreshQuotes];
+    NSTimeInterval since = now - self.lastFetchAt;
+    if ([ZJStore shouldFetch] && since >= 60) {
+        [self refreshQuotes];
+    } else if (self.lastError.length && since >= 300) {
+        // Outside trading hours a failed fetch used to stay failed until the view
+        // reappeared; retry every 5 minutes so the last close eventually shows.
+        [self refreshQuotes];
+    }
 }
 
 - (void)refreshQuotes {
@@ -216,9 +227,13 @@
 - (NSString *)stamp:(NSDictionary *)quote {
     NSTimeInterval at = [quote[@"at"] doubleValue];
     if (at <= 0) return @"";
-    NSDateFormatter *fmt = [[NSDateFormatter alloc] init];
-    fmt.timeZone = [NSTimeZone timeZoneWithName:@"Asia/Shanghai"];
-    fmt.dateFormat = @"MM-dd HH:mm";
+    static NSDateFormatter *fmt;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        fmt = [[NSDateFormatter alloc] init];
+        fmt.timeZone = [NSTimeZone timeZoneWithName:@"Asia/Shanghai"];
+        fmt.dateFormat = @"MM-dd HH:mm";
+    });
     return [NSString stringWithFormat:@"更新 %@", [fmt stringFromDate:[NSDate dateWithTimeIntervalSince1970:at]]];
 }
 

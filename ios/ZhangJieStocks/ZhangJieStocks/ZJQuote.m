@@ -83,9 +83,16 @@
         if (done) done(NO, @"行情地址无效");
         return;
     }
-    NSURLSessionConfiguration *cfg = [NSURLSessionConfiguration defaultSessionConfiguration];
-    cfg.timeoutIntervalForRequest = 20;
-    NSURLSession *session = [NSURLSession sessionWithConfiguration:cfg];
+    // One shared session. A new session per refresh (every minute in market hours)
+    // was never invalidated, so each one leaked along with its connection pool.
+    static NSURLSession *session;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        NSURLSessionConfiguration *cfg = [NSURLSessionConfiguration defaultSessionConfiguration];
+        cfg.timeoutIntervalForRequest = 20;
+        cfg.requestCachePolicy = NSURLRequestReloadIgnoringLocalCacheData;
+        session = [NSURLSession sessionWithConfiguration:cfg];
+    });
     NSURLSessionDataTask *task = [session dataTaskWithURL:url completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
         dispatch_async(dispatch_get_main_queue(), ^{
             if (error || data.length == 0) {
