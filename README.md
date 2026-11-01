@@ -1,15 +1,18 @@
-# RemotePanel handoff package (2026-10-30)
+# RemotePanel
 
-详细交接说明请读：**[README-FOR-AI.md](./README-FOR-AI.md)**（给后续 AI / 工程师的完整上下文）。
+家庭资讯屏：iPad 3（iOS 9.3.5）和 Android 上的全屏轮播看板，外加一个 A 股持仓小应用。
+
+完整交接说明见 **[README-FOR-AI.md](./README-FOR-AI.md)**。
 
 ## Layout
 
 | Path | Contents |
 |------|----------|
-| `ios/` | Native ObjC Xcode project (canonical build tree from `.179`) |
-| `android/` | Kotlin kiosk app (P0：问候/天气/新闻/相册/Web×N)，见 `android/README.md` |
-| `server/` | Slim copy of `RemotePanelih5Standalone` (port 9121 API) |
-| `extras/` | Optional appicon tarball, project map, small screenshots |
-| `RemotePanel-handoff-20261030.zip` | Archive of this whole folder (created after packaging) |
+| `ios/RemotePanel/` | iPad 资讯屏主程序（ObjC，iOS 9.3 / armv7）。数据由设备直接拉取，不依赖服务端 |
+| `ios/ZhangJieStocks/` | 「张洁股票」A 股持仓轮播（ObjC，iOS 9.3） |
+| `ios/build_install.sh` | 在 Build Mac `.179` 上编译并安装 RemotePanel |
+| `android/` | Android 资讯屏（Kotlin），见 [android/README.md](./android/README.md) |
+| `server/` | 旧 `:9121` H5/API 服务的瘦身副本，仅作参考 |
+| `extras/` | 图标包、项目对照表、改版前截图 |
 
-**Do not** put passwords in edits to the README. Build-Mac SSH / keychain unlock: ask the operator.
+**Do not** put passwords, tokens, or API keys in this repo. Build-Mac SSH / keychain unlock: ask the operator.
