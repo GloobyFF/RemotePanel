@@ -33,7 +33,7 @@
 | 设备 | Easton iPad 3，iOS **9.3.5**，armv7 |
 | UDID | `1b9b4d6959e9d533837d946d94105049dfd794a8` |
 | Team ID | `FLFYQXCCZM` |
-| RemotePanel | `com.glooby.RemotePanel`，版本 `2.0`，build **`9`** |
+| RemotePanel | `com.glooby.RemotePanel`，版本 `2.0`，build **`11`** |
 | ZhangJieStocks | `com.glooby.ZhangJieStocks`，显示名「张洁股票」，版本 `1.0`，build `3` |
 | Android | `com.glooby.remotepanel`，versionName `2.0.0`，versionCode `2` |
 
@@ -96,7 +96,8 @@ SSH 到 Build Mac 的凭证找 operator。
 | `person-photo-local-2` | 本地相册 B | 60 | 设备相册 | 无 | 无 |
 | `gamer520-switch-latest` | Switch 上新 | 60 | gamer520 `/gameswitch` | `switch` / 24h | 是 |
 | `ps5-games-latest` | PS5 上新 | 60 | 2468c.com `/ps5game` | `ps5` / 24h | 是 |
-| `local-video` | 视频（**默认关闭**） | 12 | 相册视频、`Documents/Videos` 下的文件或 HTTP 地址 | 无 | 无 |
+| `local-video` | 相册视频（**默认关闭**） | 12 | 相册里的视频，或用浏览器上传到 `Documents/Videos` 的文件 | 无 | 无 |
+| `net-video` | 网络视频（**默认关闭**） | 12 | HTTP 目录列表或 WebDAV，可带用户名密码；不支持 SMB | 无 | 无 |
 
 另外有一个不占页面的走马灯（ticker）：设置里填了 ticker 地址就每 10 分钟拉一次，也可以通过 `GET /tell` 直接推送（第 6 节）。
 
@@ -122,12 +123,17 @@ SSH 到 Build Mac 的凭证找 operator。
 | `RemotePanel.source.url.<pageId>` | 覆盖默认数据源（地址、城市、股票代码、币种等） |
 | `RemotePanel.source.proxy.<pageId>` | 这个源是否走代理 |
 | `RemotePanel.httpProxy` | 代理地址，空的时候用 `socks5h://192.168.28.77:1080` |
+| `RemotePanel.proxy.user` / `RemotePanel.proxy.pass` | 代理登录（可选）。所有代理请求经 `RPConfiguredProxy()` 拼成 `scheme://user:pass@host:port`；SOCKS5 走 RFC 1929，HTTP 走 `Proxy-Authorization: Basic` |
 | `RemotePanel.refresh.<缓存键>` | 刷新间隔（秒，至少 60） |
 | `RemotePanel.vpsURL` / `RemotePanel.vpsToken` / `RemotePanel.vps.useProxy` | VPS 用量接口 |
 | `RemotePanel.hello.key` / `RemotePanel.hello.model` | 问候页的 AI key 和模型 |
 | `RemotePanel.tickerURL` / `RemotePanel.ticker.useProxy` | 走马灯 |
 | `RemotePanel.webPages` | 自定义网页数组，每项含 `id`/`title`/`url`/`enabled`/`dwell` |
-| `RemotePanel.albumLocalId`、`RemotePanel.video.*` | 相册和视频来源 |
+| `RemotePanel.albumLocalId` | 照片页（本地相册 A / B）用的相册 |
+| `RemotePanel.photo.cycle.<slot>` | 照片随机播放的进度（种子 + 上一张的哈希） |
+| `RemotePanel.video.source` / `.albumId` / `.maxMinutes` | 相册视频：`album` 或 `files`（上传的文件）、相册 ID、最长播放分钟 |
+| `RemotePanel.video.http` / `.httpUser` / `.httpPass` | 网络视频：目录地址和可选的 Basic 登录 |
+| `RemotePanel.video.muted` | 视频是否静音，默认 YES |
 | `RemotePanel.baseURL` | 旧 `:9121` 地址，已不再使用 |
 
 ### 8090 局域网服务
@@ -242,8 +248,10 @@ python3 ipad/ipad_server.py --host 0.0.0.0 --port 9121
 - 8090 服务没有鉴权，同一局域网里的任何设备都能改设置、上传视频、截屏。
 - `RPAPIClient`、`RemotePanel.baseURL` 和 `kDefaultBaseURL` 已经没用了，可以删掉。
 - `RPPageFactory` 里还有 `system`、`vps`、`weather-weekly` 的实现。如果确定不再启用，可以删掉这部分死代码。
-- 设置页 HTML 要手动生成再粘贴，容易漏。`gen_setup.py` 的路径也是写死的。
-- `ios/build_install.sh` 的 `ROOT` 和 `ios-deploy` 路径写死；ZhangJieStocks 还没有编译脚本。
+- 设置页的源文件是 `ios/RemotePanel/setup_page.html`，改完要重新生成 `RPLocalFeed.m` 里的 `RPSetupHTML()`。`gen_setup.py` 的路径是写死的。改完建议把 `<script>` 里的内容抽出来用 `node --check` 检查一遍语法（build 11 之前这里有一个语法错误，整个页面打不开）。
+- `ios/build_install.sh` 的 `ROOT` 写死成 `.179` 的路径；`ios-deploy` 路径同样写死在 DerivedData 里。
+- 网络视频不支持 SMB：iOS 9 的播放器只能读 http/https 和本地文件。要支持得在 App 里实现 SMB2 协议并做本地转发。
+- 排查闪退：iPad 用数据线接在 `.179` 上，在 Mac 上运行 `/usr/bin/python ios/fetch_crash.py <UDID>`（系统自带的 Python 2.7）。它通过 MobileDevice 私有框架把最近的 `RemotePanel-*.ips` 和 `JetsamEvent-*.ips` 拷到 `~/rp-crash/`。再用 `atos -arch armv7 -o DerivedData/Build/Products/Debug-iphoneos/RemotePanel.app/RemotePanel -l <加载地址> <崩溃地址>` 对应到源码行；加载地址在报告 Binary Images 一节的 RemotePanel 那一行，必须和报告里的 UUID 对得上（`dwarfdump --uuid` 查看）。
 - 仓库里跟踪了 `server/**/__pycache__/*.pyc`，还有两个备份文件 `server/ipad/ipad_server.py.bak_rp_135831` 和 `ios/RemotePanel/RPKioskRootVC.m.pre_capture_bak`。
 - `extras/*.png` 是改版前的截图，只能作视觉参考。
 
@@ -310,6 +318,8 @@ python3 ipad/ipad_server.py --host 0.0.0.0 --port 9121
 | 7 | 网络读写超时和刷新看门狗；NSNull 清理（磁盘缓存终于能保存）；失败退避；修复自定义网页空白、视频上传截断、内存泄漏、日历排序和 UTC 时间；相册枚举移到后台。2026-11-01 已在 `.179` 编译并装机 |
 | 8 | 翻页动画快一倍（飞入 1.15 秒、飞出 1.05 秒）；相册改用 HighQualityFormat，按屏幕像素（最大 2048）请求，不再是模糊缩略图；小红书直接读 tophub，16 条，大图 + 宫格 + 带热度条的排行榜；Steam、PC、Switch、PS5、电影封面按原始比例排版（`RPAspectGrid`），不再裁切；封面按卡片像素解码 |
 | 9 | 相册随机播放：读整个相册（上限 5000），按"种子 + 照片 ID 的哈希"排序，一轮放完才重复；进度存在 `RemotePanel.photo.cycle.<slot>`，翻页和重启后接着放；A 页全部竖拍、B 页全部横拍 |
+| 10 | 视频拆成「相册视频」「网络视频」两个板块，默认静音，iPad 设置里可选相册、填 HTTP/WebDAV 目录和登录；B 站改成和小红书一样的大图 + 宫格 + 排行榜（16 条）；代理支持用户名密码；封面页改用 `RPFillGrid`（只用排满整行的布局），抓取数量加到电影 12、Steam 10、游戏 15；公告消息：`RPChime` 自生成提示音（静音键打开也响）、10 分钟未读提醒、22:00–7:00 不响、列表保留 20 条、设置里有"发一条测试提醒" |
+| 11 | 修复封面下载超时后的闪退（`RPNet.m` 读取循环在 `@autoreleasepool` 里写 `NSError **`，错误对象被提前释放，`EXC_BAD_ACCESS`，build 7 起就有）；修复浏览器设置页脚本语法错误；视频切到有声立即生效；代理登录名里的中文和 `%` |
 
 ---
 

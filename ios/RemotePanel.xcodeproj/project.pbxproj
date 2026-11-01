@@ -13,6 +13,7 @@
 		B103BF0000000000000000000 /* RPTheme.m in Sources */ = {isa = PBXBuildFile; fileRef = B103000000000000000000000 /* RPTheme.m */; };
 		B104BF0000000000000000000 /* RPAPIClient.m in Sources */ = {isa = PBXBuildFile; fileRef = B104000000000000000000000 /* RPAPIClient.m */; };
 		B105BF0000000000000000000 /* RPPhotoSource.m in Sources */ = {isa = PBXBuildFile; fileRef = B105000000000000000000000 /* RPPhotoSource.m */; };
+		B10CBF0000000000000000000 /* RPChime.m in Sources */ = {isa = PBXBuildFile; fileRef = B10C000000000000000000000 /* RPChime.m */; };
 		B106BF0000000000000000000 /* RPKioskRootVC.m in Sources */ = {isa = PBXBuildFile; fileRef = B106000000000000000000000 /* RPKioskRootVC.m */; };
 		B107BF0000000000000000000 /* RPPages.m in Sources */ = {isa = PBXBuildFile; fileRef = B107000000000000000000000 /* RPPages.m */; };
 		B108BF0000000000000000000 /* RPNet.m in Sources */ = {isa = PBXBuildFile; fileRef = B108000000000000000000000 /* RPNet.m */; };
@@ -46,6 +47,7 @@
 		B103000000000000000000000 /* RPTheme.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = RPTheme.m; sourceTree = "<group>"; };
 		B104000000000000000000000 /* RPAPIClient.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = RPAPIClient.m; sourceTree = "<group>"; };
 		B105000000000000000000000 /* RPPhotoSource.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = RPPhotoSource.m; sourceTree = "<group>"; };
+		B10C000000000000000000000 /* RPChime.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = RPChime.m; sourceTree = "<group>"; };
 		B106000000000000000000000 /* RPKioskRootVC.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = RPKioskRootVC.m; sourceTree = "<group>"; };
 		B107000000000000000000000 /* RPPages.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = RPPages.m; sourceTree = "<group>"; };
 		B108000000000000000000000 /* RPNet.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = RPNet.m; sourceTree = "<group>"; };
@@ -56,6 +58,7 @@
 		B113000000000000000000000 /* RPTheme.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = RPTheme.h; sourceTree = "<group>"; };
 		B114000000000000000000000 /* RPAPIClient.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = RPAPIClient.h; sourceTree = "<group>"; };
 		B115000000000000000000000 /* RPPhotoSource.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = RPPhotoSource.h; sourceTree = "<group>"; };
+		B11C000000000000000000000 /* RPChime.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = RPChime.h; sourceTree = "<group>"; };
 		B116000000000000000000000 /* RPKioskRootVC.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = RPKioskRootVC.h; sourceTree = "<group>"; };
 		B117000000000000000000000 /* RPPages.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = RPPages.h; sourceTree = "<group>"; };
 		B120000000000000000000000 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
@@ -154,6 +157,7 @@
 				B103000000000000000000000 /* RPTheme.m */,
 				B104000000000000000000000 /* RPAPIClient.m */,
 				B105000000000000000000000 /* RPPhotoSource.m */,
+				B10C000000000000000000000 /* RPChime.m */,
 				B106000000000000000000000 /* RPKioskRootVC.m */,
 				B107000000000000000000000 /* RPPages.m */,
 				B108000000000000000000000 /* RPNet.m */,
@@ -162,6 +166,7 @@
 				B113000000000000000000000 /* RPTheme.h */,
 				B114000000000000000000000 /* RPAPIClient.h */,
 				B115000000000000000000000 /* RPPhotoSource.h */,
+				B11C000000000000000000000 /* RPChime.h */,
 				B116000000000000000000000 /* RPKioskRootVC.h */,
 				B117000000000000000000000 /* RPPages.h */,
 				B118000000000000000000000 /* RPNet.h */,
@@ -266,6 +271,7 @@
 				B103BF0000000000000000000 /* RPTheme.m in Sources */,
 				B104BF0000000000000000000 /* RPAPIClient.m in Sources */,
 				B105BF0000000000000000000 /* RPPhotoSource.m in Sources */,
+				B10CBF0000000000000000000 /* RPChime.m in Sources */,
 				B106BF0000000000000000000 /* RPKioskRootVC.m in Sources */,
 				B107BF0000000000000000000 /* RPPages.m in Sources */,
 				B108BF0000000000000000000 /* RPNet.m in Sources */,

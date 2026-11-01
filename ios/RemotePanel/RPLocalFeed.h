@@ -16,6 +16,13 @@ extern NSString * const RPFeedProgressNotification;
 
 NSDictionary *RPLocalSourceDefaults(void);
 NSString *RPLocalDefaultProxy(void);
+/** Optional proxy login, stored separately from the proxy address. */
+extern NSString * const RPProxyUserKey;
+extern NSString * const RPProxyPassKey;
+/** The proxy to use: saved address (or the default), with the saved username and
+    password added as "scheme://user:pass@host:port" when set. Use this everywhere
+    instead of reading RPProxyDefaultsKey directly. */
+NSString *RPConfiguredProxy(void);
 NSString *RPLocalDefaultVPSURL(void);
 NSString *RPLocalDefaultVPSToken(void);
 NSString *RPLocalDefaultHelloKey(void);
@@ -34,6 +41,11 @@ NSString *RPVideoDirectory(void);
 NSArray *RPVideoLocalFiles(void);
 /** source / album / http / max / photo_album */
 NSDictionary *RPVideoSettings(void);
+void RPVideoSetMuted(BOOL muted);
+/** 网络视频: directory URL plus optional Basic-auth login. Pass nil pass to keep the saved one. */
+void RPVideoSaveNetwork(NSString *url, NSString *user, NSString *pass);
+void RPVideoSaveAlbum(NSString *albumId);
+void RPVideoSaveMaxMinutes(NSInteger mins);
 
 /** Custom fullscreen WebView pages (max 8). Each: id/title/url/enabled/dwell. */
 extern NSString * const RPWebPagesDefaultsKey;
@@ -53,4 +65,6 @@ NSMutableDictionary *RPWebPageNormalize(NSDictionary *raw, NSInteger indexHint);
 /** Expire every feed (except the greeting) and clear failure backoff, then let the
     next poll refetch. Call after settings change. */
 - (void)invalidateForSettingsChange;
+/** Add one message to the 公告 list the same way GET /tell does (newest first, up to 20). */
+- (void)postTestNotice:(NSString *)text;
 @end

@@ -77,8 +77,11 @@ void RPPurgeImageCache(void);
 /** Fullscreen user-configured webpage (pageId prefix web-). */
 @interface RPWebPageVC : RPBasePageVC
 @end
-/** One random local/album/http video, then advance. No fly-in. Off until enabled. */
+/** One random video, muted by default, then advance. No fly-in. Off until enabled.
+    network NO = 相册视频 (album, or files uploaded to the iPad); YES = 网络视频
+    (HTTP directory listing or WebDAV, optional Basic auth). */
 @interface RPVideoPageVC : RPBasePageVC
+@property (nonatomic, assign) BOOL network;
 @end
 
 @interface RPPageFactory : NSObject

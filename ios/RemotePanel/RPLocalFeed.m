@@ -26,6 +26,34 @@ NSString * const RPFeedProgressNotification = @"RPFeedProgress";
 NSString * const RPWebPagesDefaultsKey = @"RemotePanel.webPages";
 
 NSString *RPLocalDefaultProxy(void) { return @"socks5h://192.168.28.77:1080"; }
+
+NSString * const RPProxyUserKey = @"RemotePanel.proxy.user";
+NSString * const RPProxyPassKey = @"RemotePanel.proxy.pass";
+
+/** Percent-encode a userinfo part so ':' '@' '/' in a password don't break the URL. */
+static NSString *RPEscapeUserinfo(NSString *s) {
+    // ASCII unreserved only. alphanumericCharacterSet includes Unicode letters, which
+    // left Chinese characters unescaped and made NSURL reject the whole proxy URL.
+    NSCharacterSet *ok = [NSCharacterSet characterSetWithCharactersInString:@"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"];
+    return [s stringByAddingPercentEncodingWithAllowedCharacters:ok] ?: @"";
+}
+
+NSString *RPConfiguredProxy(void) {
+    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+    NSString *proxy = [[ud stringForKey:RPProxyDefaultsKey] ?: @"" stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (proxy.length == 0) proxy = RPLocalDefaultProxy();
+    NSString *user = [[ud stringForKey:RPProxyUserKey] ?: @"" stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    NSString *pass = [ud stringForKey:RPProxyPassKey] ?: @"";
+    if (user.length == 0) return proxy;
+    NSRange scheme = [proxy rangeOfString:@"://"];
+    if (scheme.location == NSNotFound) return proxy;
+    NSString *rest = [proxy substringFromIndex:NSMaxRange(scheme)];
+    // Credentials typed into the URL itself win over the separate fields.
+    NSRange slash = [rest rangeOfString:@"/"];
+    NSString *authority = slash.location == NSNotFound ? rest : [rest substringToIndex:slash.location];
+    if ([authority rangeOfString:@"@"].location != NSNotFound) return proxy;
+    return [NSString stringWithFormat:@"%@%@:%@@%@", [proxy substringToIndex:NSMaxRange(scheme)], RPEscapeUserinfo(user), RPEscapeUserinfo(pass), rest];
+}
 NSString *RPLocalDefaultVPSURL(void) { return @"https://igobeat.com/api/traffic"; }
 NSString *RPLocalDefaultVPSToken(void) { return @""; }
 NSString *RPLocalDefaultHelloKey(void) { return @""; }
@@ -46,7 +74,7 @@ NSDictionary *RPLocalSourceDefaults(void) {
         @"ps5-games-latest": @"https://2468c.com/ps5game",
         @"x-news": @"https://getdaytrends.com/united-states/",
         @"xiaohongshu-hot": @"https://tophub.today/n/L4MdA5ldxD",
-        @"bilibili-hot": @"https://api.bilibili.com/x/web-interface/popular?ps=10&pn=1",
+        @"bilibili-hot": @"https://api.bilibili.com/x/web-interface/popular?ps=20&pn=1",
         @"stocks-cn": @"600519,300750,600036,601318,002594",
         @"crypto": @"btc,eth,sol,bnb,xrp",
         @"schedule": @"",
@@ -157,7 +185,9 @@ NSArray *RPLocalPageCatalog(void) {
         @{@"id": @"person-photo-local-2", @"title": @"本地相册 B", @"dwell": @60},
         @{@"id": @"gamer520-switch-latest", @"title": @"Switch 上新", @"dwell": @60, @"hint": @"Switch 游戏页面"},
         @{@"id": @"ps5-games-latest", @"title": @"PS5 上新", @"dwell": @60, @"hint": @"PS5 游戏页面"},
-        @{@"id": @"local-video", @"title": @"视频", @"dwell": @12, @"hint": @"无片可播时的停留。播放中会播完再翻页。", @"default_off": @YES},
+        // Two video boards. Both play one random clip muted, then turn the page.
+        @{@"id": @"local-video", @"title": @"相册视频", @"dwell": @12, @"hint": @"播放相册里的视频（或用浏览器上传到 iPad 的视频）。播完再翻页；这里的秒数只在没有视频时使用。", @"default_off": @YES},
+        @{@"id": @"net-video", @"title": @"网络视频", @"dwell": @12, @"hint": @"播放 HTTP / WebDAV 目录里的视频（mp4、mov、m4v）。播完再翻页。", @"default_off": @YES},
     ];
 }
 
@@ -207,6 +237,10 @@ static NSString *RPString(id value) {
     return [(NSString *)value stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
 }
 
+NSString * const RPVideoMutedKey = @"RemotePanel.video.muted";
+NSString * const RPVideoHTTPUserKey = @"RemotePanel.video.httpUser";
+NSString * const RPVideoHTTPPassKey = @"RemotePanel.video.httpPass";
+
 NSDictionary *RPVideoSettings(void) {
     NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
     NSString *src = RPString([ud stringForKey:RPVideoSourceKey]);
@@ -214,13 +248,41 @@ NSDictionary *RPVideoSettings(void) {
     NSInteger mins = [ud integerForKey:RPVideoMaxKey];
     if (mins < 0) mins = 0;
     if (mins > 180) mins = 180;
+    id muted = [ud objectForKey:RPVideoMutedKey];
     return @{
+        // "source" is kept for the old single 视频 page / browser settings; the
+        // 相册视频 page plays album (or uploaded files), 网络视频 plays "http".
         @"source": src,
         @"album": RPString([ud stringForKey:RPVideoAlbumKey]),
         @"http": RPString([ud stringForKey:RPVideoHTTPKey]),
+        @"http_user": RPString([ud stringForKey:RPVideoHTTPUserKey]),
+        @"http_pass": [ud stringForKey:RPVideoHTTPPassKey] ?: @"",
         @"max": @(mins),
+        // Muted unless the owner turned sound on.
+        @"muted": @(muted ? [muted boolValue] : YES),
         @"photo_album": RPString([ud stringForKey:@"RemotePanel.albumLocalId"]),
     };
+}
+
+void RPVideoSetMuted(BOOL muted) {
+    [[NSUserDefaults standardUserDefaults] setBool:muted forKey:RPVideoMutedKey];
+}
+
+void RPVideoSaveNetwork(NSString *url, NSString *user, NSString *pass) {
+    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+    [ud setObject:url ?: @"" forKey:RPVideoHTTPKey];
+    [ud setObject:user ?: @"" forKey:RPVideoHTTPUserKey];
+    if (pass) [ud setObject:pass forKey:RPVideoHTTPPassKey];
+}
+
+void RPVideoSaveAlbum(NSString *albumId) {
+    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+    if (albumId.length) [ud setObject:albumId forKey:RPVideoAlbumKey];
+    else [ud removeObjectForKey:RPVideoAlbumKey];
+}
+
+void RPVideoSaveMaxMinutes(NSInteger mins) {
+    [[NSUserDefaults standardUserDefaults] setInteger:MAX(0, MIN(180, mins)) forKey:RPVideoMaxKey];
 }
 
 NSUInteger RPWebPagesMaxCount(void) { return 8; }
@@ -851,11 +913,24 @@ static NSArray *RPParseBilibili(NSData *data, NSInteger limit) {
         }
         NSString *pic = RPString(row[@"pic"]);
         if ([pic hasPrefix:@"http://"]) pic = [@"https://" stringByAppendingString:[pic substringFromIndex:7]];
+        double viewN = [stat[@"view"] doubleValue];
+        NSDictionary *reason = [row[@"rcmd_reason"] isKindOfClass:[NSDictionary class]] ? row[@"rcmd_reason"] : @{};
         [items addObject:@{
             @"title": title,
             @"summary": [bits componentsJoinedByString:@" · "],
             @"link": link ?: @"",
             @"image_url": pic ?: @"",
+            // Separate fields for the board layout (lead card, grid, ranked list).
+            @"author": RPString(owner[@"name"]),
+            @"tname": RPString(row[@"tname"]),
+            @"duration": dur > 0 ? (dur >= 3600 ? [NSString stringWithFormat:@"%ld:%02ld:%02ld", (long)(dur / 3600), (long)(dur % 3600 / 60), (long)(dur % 60)] : [NSString stringWithFormat:@"%ld:%02ld", (long)(dur / 60), (long)(dur % 60)]) : @"",
+            @"views": views ?: @"",
+            @"view_value": @(viewN),
+            @"likes": RPCountText(stat[@"like"]),
+            @"danmaku": RPCountText(stat[@"danmaku"]),
+            @"coins": RPCountText(stat[@"coin"]),
+            @"reason": RPString(reason[@"content"]),
+            @"desc": desc ?: @"",
         }];
         if ((NSInteger)items.count >= limit) break;
     }
@@ -1176,6 +1251,9 @@ static NSString *RPSetupHTML(void) {
         "function render(){\n"
         "  var ch=state.refresh_choices, ti=state.refresh_titles, h=\"\";\n"
         "  h+=\"<div class=\\\"card\\\"><h2>连接</h2><label>HTTP / SOCKS 代理</label><input id=\\\"proxy\\\" type=\\\"text\\\" value=\\\"\"+esc(state.proxy)+\"\\\">\";\n"
+        "  h+=\"<label>代理用户名（代理不需要登录就留空）</label><input id=\\\"proxyUser\\\" type=\\\"text\\\" autocomplete=\\\"off\\\" value=\\\"\"+esc(state.proxy_user||\"\")+\"\\\">\";\n"
+        "  h+=\"<label>代理密码\"+(state.proxy_pass_set?\"（已保存，留空则不改）\":\"\")+\"</label><input id=\\\"proxyPass\\\" type=\\\"password\\\" autocomplete=\\\"new-password\\\" value=\\\"\\\">\";\n"
+        "  if(state.proxy_pass_set) h+=\"<label class=\\\"check\\\"><input id=\\\"proxyPassClear\\\" type=\\\"checkbox\\\"> 清除已保存的代理密码</label>\";\n"
         "  h+=\"<label>全局停留秒（0 表示用每一页自己的秒数）</label><input id=\\\"dwell\\\" class=\\\"narrow\\\" type=\\\"number\\\" value=\\\"\"+esc(state.dwell_override)+\"\\\"></div>\";\n"
         "  h+=\"<div class=\\\"card\\\"><h2>消息</h2><label>走马灯地址（JSON、纯文本或 RSS，留空则不显示）</label><input id=\\\"ticker\\\" type=\\\"text\\\" value=\\\"\"+esc(state.ticker_url)+\"\\\">\";\n"
         "  h+=\"<label class=\\\"check\\\"><input id=\\\"tickerProxy\\\" type=\\\"checkbox\\\"\"+(state.ticker_proxy?\" checked\":\"\")+\"> 使用代理</label>\";\n"
@@ -1191,18 +1269,20 @@ static NSString *RPSetupHTML(void) {
         "  if(!(state.albums||[]).length) h+=\"</select><p>还没有读到相册列表。iPad 需要先允许访问照片。</p></div>\";\n"
         "  else h+=\"</select></div>\";\n"
         "  h+=\"<div class=\\\"card\\\"><h2>视频</h2>\";\n"
-        "  h+=\"<p>和自定义网页一样，默认不加入轮播。到下面的页面列表里勾选「视频」的「显示」才会出现。每次随机播一条，播完再翻页，这一页没有飞入动画。只支持 H.264 的 mp4、mov、m4v，建议 1080p 以内。</p>\";\n"
-        "  h+=\"<label>来源</label><select id=\\\"vsource\\\">\";\n"
-        "  h+=\"<option value=\\\"album\\\"\"+(state.video_source===\\\"album\\\"?\" selected\":\"\")+\">相册里的视频</option>\";\n"
-        "  h+=\"<option value=\\\"files\\\"\"+(state.video_source===\\\"files\\\"?\" selected\":\"\")+\">上传到这台 iPad</option>\";\n"
-        "  h+=\"<option value=\\\"http\\\"\"+(state.video_source===\\\"http\\\"?\" selected\":\"\")+\">网络目录（http）</option></select>\";\n"
+        "  h+=\"<p>有两个视频页：「相册视频」和「网络视频」，默认都不显示，到下面的页面列表里勾选「显示」。每次随机播一段，默认静音，播完再翻页。只支持 H.264 的 mp4、mov、m4v，建议 1080p 以内。</p>\";\n"
+        "  h+=\"<label class=\\\"check\\\"><input id=\\\"vmuted\\\" type=\\\"checkbox\\\"\"+(state.video_muted!==false?\" checked\":\"\")+\"> 播放时静音</label>\";\n"
+        "  h+=\"<h3>相册视频</h3><label>放哪里的视频</label><select id=\\\"vsource\\\">\";\n"
+        "  h+=\"<option value=\\\"album\\\"\"+(state.video_source!==\"files\"?\" selected\":\"\")+\">相册里的视频</option>\";\n"
+        "  h+=\"<option value=\\\"files\\\"\"+(state.video_source===\"files\"?\" selected\":\"\")+\">上传到这台 iPad 的视频</option></select>\";\n"
         "  h+=\"<label>相册（留空则用上面选的相册；那个相册没有视频时，再用全部视频）</label><select id=\\\"valbum\\\"><option value=\\\"\\\">跟随上面的相册</option>\";\n"
         "  (state.albums||[]).forEach(function(a){\n"
         "    h+=\"<option value=\\\"\"+esc(a.id)+\"\\\"\"+(a.id===state.video_album?\" selected\":\"\")+\">\"+esc(a.title)+\"</option>\";\n"
         "  });\n"
         "  h+=\"</select>\";\n"
-        "  h+=\"<label>网络目录</label><input id=\\\"vhttp\\\" type=\\\"text\\\" value=\\\"\"+esc(state.video_http)+\"\\\" placeholder=\\\"http://192.168.28.30/videos/\\\">\";\n"
-        "  h+=\"<p>填 iPad 能直接打开的 http 地址。不能填 \\\\\\\\电脑\\\\共享。页面里要有 mp4 / mov / m4v 的链接，或者这个地址本身就是一个视频文件。</p>\";\n"
+        "  h+=\"<h3>网络视频</h3><label>视频目录（HTTP 目录列表或 WebDAV）</label><input id=\\\"vhttp\\\" type=\\\"text\\\" value=\\\"\"+esc(state.video_http)+\"\\\" placeholder=\\\"http://192.168.28.30/videos/\\\">\";\n"
+        "  h+=\"<label>目录用户名（不需要登录就留空）</label><input id=\\\"vhttpUser\\\" type=\\\"text\\\" autocomplete=\\\"off\\\" value=\\\"\"+esc(state.video_http_user||\"\")+\"\\\">\";\n"
+        "  h+=\"<label>目录密码\"+(state.video_http_pass_set?\"（已保存，留空则不改）\":\"\")+\"</label><input id=\\\"vhttpPass\\\" type=\\\"password\\\" autocomplete=\\\"new-password\\\" value=\\\"\\\">\";\n"
+        "  h+=\"<p>群晖、威联通等 NAS 打开 WebDAV 后填它的地址即可。iPad 读不了 SMB（\\\\\\\\电脑\\\\共享），请改用 HTTP 或 WebDAV。</p>\";\n"
         "  h+=\"<label>最长播放（分钟，0 表示播完再翻页）</label><input id=\\\"vmax\\\" class=\\\"narrow\\\" type=\\\"number\\\" value=\\\"\"+esc(state.video_max)+\"\\\">\";\n"
         "  h+=\"<label>已经上传的视频</label>\";\n"
         "  if(!(state.video_files||[]).length) h+=\"<p>还没有上传。</p>\";\n"
@@ -1216,7 +1296,7 @@ static NSString *RPSetupHTML(void) {
         "    h+=\"<div class=\\\"page\\\" data-i=\\\"\"+i+\"\\\"><div class=\\\"row\\\"><strong>\"+esc(pg.title)+\"</strong>\";\n"
         "    h+=\"<label class=\\\"check\\\"><input type=\\\"checkbox\\\" class=\\\"en\\\"\"+(pg.enabled?\" checked\":\"\")+\"> 显示</label>\";\n"
         "    h+=\"<label class=\\\"check\\\">停留 <input class=\\\"dw narrow\\\" type=\\\"number\\\" value=\\\"\"+esc(pg.dwell)+\"\\\"> 秒</label></div>\";\n"
-        "    if(pg.id===\"local-video\") h+=\"<p>这里的秒数只在没有片子可播时使用。正在播放时会播完，或到达上面的最长播放，再翻页。</p>\";\n"
+        "    if(pg.id===\"local-video\"||pg.id===\"net-video\") h+=\"<p>这里的秒数只在没有视频可播时使用。正在播放时会播完，或到达上面的最长播放，再翻页。</p>\";\n"
         "    if(pg.has_source){\n"
         "      h+=\"<label>\"+esc(pg.hint||\"接口\")+\"</label><input class=\\\"url\\\" type=\\\"text\\\" value=\\\"\"+esc(pg.url)+\"\\\">\";\n"
         "      if(pg.api_key!=null){\n"
@@ -1238,6 +1318,9 @@ static NSString *RPSetupHTML(void) {
         "function collect(){\n"
         "  var body=JSON.parse(JSON.stringify(state));\n"
         "  body.proxy=document.getElementById(\"proxy\").value;\n"
+        "  body.proxy_user=document.getElementById(\"proxyUser\").value;\n"
+        "  body.proxy_pass=document.getElementById(\"proxyPass\").value;\n"
+        "  var ppc=document.getElementById(\"proxyPassClear\"); body.proxy_pass_clear=!!(ppc&&ppc.checked);\n"
         "  body.dwell_override=Number(document.getElementById(\"dwell\").value)||0;\n"
         "  body.ticker_url=document.getElementById(\"ticker\").value;\n"
         "  body.ticker_proxy=document.getElementById(\"tickerProxy\").checked;\n"
@@ -1250,6 +1333,9 @@ static NSString *RPSetupHTML(void) {
         "  body.video_source=document.getElementById(\"vsource\").value;\n"
         "  body.video_album=document.getElementById(\"valbum\").value;\n"
         "  body.video_http=document.getElementById(\"vhttp\").value;\n"
+        "  body.video_http_user=document.getElementById(\"vhttpUser\").value;\n"
+        "  body.video_http_pass=document.getElementById(\"vhttpPass\").value;\n"
+        "  body.video_muted=document.getElementById(\"vmuted\").checked;\n"
         "  body.video_max=Number(document.getElementById(\"vmax\").value)||0;\n"
         "  body.video_remove=[];\n"
         "  var dels=document.querySelectorAll(\".vdel\");\n"
@@ -1281,7 +1367,6 @@ static NSString *RPSetupHTML(void) {
         "</script>\n"
         "</body>\n"
         "</html>\n"
-        "\n"
     ];
 }
 
@@ -1436,8 +1521,7 @@ static id RPPlistSafe(id value) {
     NSString *key = [RPSourceProxyPrefix stringByAppendingString:pid];
     BOOL on = [ud objectForKey:key] == nil ? RPLocalDefaultUseProxy(pid) : [ud boolForKey:key];
     if (!on) return nil;
-    NSString *proxy = RPString([ud stringForKey:RPProxyDefaultsKey]);
-    if (proxy.length == 0) proxy = RPLocalDefaultProxy();
+    NSString *proxy = RPConfiguredProxy();
     return proxy;
 }
 
@@ -1455,6 +1539,10 @@ static id RPPlistSafe(id value) {
         BOOL oldXhs = [key isEqualToString:@"xhs"] && [payload isKindOfClass:[NSArray class]] && [(NSArray *)payload count] &&
             [[(NSArray *)payload firstObject] isKindOfClass:[NSDictionary class]] &&
             [[(NSArray *)payload firstObject][@"cover"] integerValue] < 4;
+        // v3 (build 10): cover feeds keep 10–15 items so pages fill whole rows. A v2
+        // cover cache (6–8 items) is refetched once instead of waiting out its 24 h TTL.
+        BOOL coverFeed = [@[@"movies", @"steam", @"pc", @"switch", @"ps5", @"bili"] containsObject:key];
+        if (coverFeed && [box[@"v"] integerValue] < 3) return NO;
         if (young && [box[@"v"] integerValue] >= 2 && ![key isEqualToString:@"hello"] && !oldXhs) return YES;
         if ([payload isKindOfClass:[NSArray class]] && [(NSArray *)payload count] == 0) return NO;
         if ([key isEqualToString:@"hello"]) {
@@ -1496,7 +1584,7 @@ static id RPPlistSafe(id value) {
     id clean = RPPlistSafe(payload);
     if (!clean) return;
     @synchronized (self) {
-        self.cache[key] = @{ @"at": @([[NSDate date] timeIntervalSince1970]), @"payload": clean, @"v": @2 };
+        self.cache[key] = @{ @"at": @([[NSDate date] timeIntervalSince1970]), @"payload": clean, @"v": @3 };
         [self.failedAt removeObjectForKey:key];
         self.dirty = YES;
     }
@@ -1638,6 +1726,7 @@ static id RPPlistSafe(id value) {
             [[NSNotificationCenter defaultCenter] postNotificationName:@"RPCollectAlbums" object:albums];
         });
     }
+    // Address only; the username and password go out as their own fields.
     NSString *proxy = RPString([ud stringForKey:RPProxyDefaultsKey]);
     if (proxy.length == 0) proxy = RPLocalDefaultProxy();
     NSString *vpsURL = RPString([ud stringForKey:RPVpsURLKey]);
@@ -1647,6 +1736,10 @@ static id RPPlistSafe(id value) {
     BOOL vpsProxy = [ud objectForKey:RPVpsProxyKey] ? [ud boolForKey:RPVpsProxyKey] : NO;
     return @{
         @"proxy": proxy ?: @"",
+        @"proxy_user": RPString([ud stringForKey:RPProxyUserKey]),
+        // Never echo the saved password back to the browser; the page shows
+        // "已保存" and sends a new one only if the user types it.
+        @"proxy_pass_set": @(RPString([ud stringForKey:RPProxyPassKey]).length > 0),
         @"dwell_override": @([ud integerForKey:RPDwellOverrideDefaultsKey]),
         @"ticker_url": RPString([ud stringForKey:RPTickerURLKey]),
         @"ticker_proxy": @([ud boolForKey:RPTickerProxyKey]),
@@ -1663,6 +1756,9 @@ static id RPPlistSafe(id value) {
         }),
         @"video_album": RPString([ud stringForKey:RPVideoAlbumKey]),
         @"video_http": RPString([ud stringForKey:RPVideoHTTPKey]),
+        @"video_http_user": RPString([ud stringForKey:RPVideoHTTPUserKey]),
+        @"video_http_pass_set": @([[ud stringForKey:RPVideoHTTPPassKey] length] > 0),
+        @"video_muted": RPVideoSettings()[@"muted"],
         @"video_max": @([ud integerForKey:RPVideoMaxKey]),
         @"video_files": ({
             NSMutableArray *rows = [NSMutableArray array];
@@ -1688,6 +1784,10 @@ static id RPPlistSafe(id value) {
     }
     NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
     if ([doc[@"proxy"] isKindOfClass:[NSString class]]) [ud setObject:doc[@"proxy"] forKey:RPProxyDefaultsKey];
+    if ([doc[@"proxy_user"] isKindOfClass:[NSString class]]) [ud setObject:RPString(doc[@"proxy_user"]) forKey:RPProxyUserKey];
+    // Only replace the password when one was typed; "proxy_pass_clear" removes it.
+    if ([doc[@"proxy_pass"] isKindOfClass:[NSString class]] && [doc[@"proxy_pass"] length]) [ud setObject:doc[@"proxy_pass"] forKey:RPProxyPassKey];
+    if ([doc[@"proxy_pass_clear"] boolValue]) [ud removeObjectForKey:RPProxyPassKey];
     if ([doc[@"dwell_override"] respondsToSelector:@selector(integerValue)]) {
         NSInteger n = [doc[@"dwell_override"] integerValue];
         if (n < 0) n = 0;
@@ -1716,6 +1816,9 @@ static id RPPlistSafe(id value) {
         else [ud removeObjectForKey:RPVideoAlbumKey];
     }
     if ([doc[@"video_http"] isKindOfClass:[NSString class]]) [ud setObject:RPString(doc[@"video_http"]) forKey:RPVideoHTTPKey];
+    if ([doc[@"video_http_user"] isKindOfClass:[NSString class]]) [ud setObject:RPString(doc[@"video_http_user"]) forKey:RPVideoHTTPUserKey];
+    if ([doc[@"video_http_pass"] isKindOfClass:[NSString class]] && [doc[@"video_http_pass"] length]) [ud setObject:doc[@"video_http_pass"] forKey:RPVideoHTTPPassKey];
+    if ([doc[@"video_muted"] respondsToSelector:@selector(boolValue)]) RPVideoSetMuted([doc[@"video_muted"] boolValue]);
     if ([doc[@"video_max"] respondsToSelector:@selector(integerValue)]) {
         NSInteger mins = [doc[@"video_max"] integerValue];
         if (mins < 0) mins = 0;
@@ -2043,8 +2146,7 @@ static id RPPlistSafe(id value) {
             if (text.length > 120) text = [[text substringToIndex:120] stringByAppendingString:@"…"];
             NSString *reply = @"empty";
             if (text.length) {
-                [self store:@"ticker" payload:@[ @{ @"title": text, @"body": text } ]];
-                [self saveDisk];
+                [self addNotice:text];
                 [self appendLog:@"走马灯" status:@"ok" detail:@"收到一条提醒"];
                 [self emitName:@"走马灯" status:@"ok" detail:@"收到一条提醒" includeState:NO];
                 reply = @"ok";
@@ -2241,6 +2343,28 @@ static id RPPlistSafe(id value) {
     }
 }
 
+/** Prepend a pushed message to the 公告 list. /tell used to replace the whole list,
+    so a second push erased the first and the ✉ list never held more than one. The
+    time goes into the body so two identical texts still count as two messages. */
+- (void)addNotice:(NSString *)text {
+    static NSDateFormatter *fmt;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        fmt = [[NSDateFormatter alloc] init];
+        fmt.dateFormat = @"M月d日 HH:mm:ss";
+    });
+    NSMutableArray *list = [[self tickerMessages] mutableCopy] ?: [NSMutableArray array];
+    [list insertObject:@{ @"title": text, @"body": [NSString stringWithFormat:@"%@\n%@", [fmt stringFromDate:[NSDate date]], text] } atIndex:0];
+    while (list.count > 20) [list removeLastObject];
+    [self store:@"ticker" payload:list];
+    [self saveDisk];
+}
+
+- (void)postTestNotice:(NSString *)text {
+    [self addNotice:text.length ? text : @"测试提醒"];
+    [self appendLog:@"走马灯" status:@"ok" detail:@"设置里发送了一条测试提醒"];
+}
+
 /** Called after the user saves settings on the iPad itself. */
 - (void)invalidateForSettingsChange {
     [self markCacheStale];
@@ -2314,8 +2438,7 @@ static id RPPlistSafe(id value) {
     BOOL useProxy = [ud objectForKey:RPVpsProxyKey] ? [ud boolForKey:RPVpsProxyKey] : NO;
     NSString *proxy = nil;
     if (useProxy) {
-        proxy = RPString([ud stringForKey:RPProxyDefaultsKey]);
-        if (proxy.length == 0) proxy = RPLocalDefaultProxy();
+        proxy = RPConfiguredProxy();
     }
     NSData *data = [self syncGET:url proxy:proxy headers:@{ @"Authorization": [NSString stringWithFormat:@"Bearer %@", token] }];
     NSDictionary *json = [NSJSONSerialization JSONObjectWithData:data ?: [NSData data] options:0 error:nil];
@@ -2427,7 +2550,7 @@ static id RPPlistSafe(id value) {
     NSString *url = [self sourceURL:@"x-news"];
     if (url.length == 0) url = RPLocalSourceDefaults()[@"x-news"];
     NSString *proxy = [self proxyFor:@"x-news"];
-    if (proxy.length == 0) proxy = RPLocalDefaultProxy();
+    if (proxy.length == 0) proxy = RPConfiguredProxy();
     NSDictionary *browser = @{ @"User-Agent": @"Mozilla/5.0 (iPad; CPU OS 9_3_6 like Mac OS X) AppleWebKit/601.1.46 (KHTML, like Gecko) Version/9.0 Mobile/13G37 Safari/601.1" };
     BOOL trends = [url rangeOfString:@"getdaytrends.com"].location != NSNotFound;
     NSData *data = [self syncGET:url proxy:proxy headers:browser];
@@ -2594,7 +2717,8 @@ static id RPPlistSafe(id value) {
     }
     BOOL maoyan = [url rangeOfString:@"maoyan.com"].location != NSNotFound;
     NSData *data = [self syncGET:url proxy:(maoyan ? nil : [self proxyFor:@"movie-now-showing"]) headers:nil];
-    NSArray *items = maoyan ? RPMoviesFromMaoyan(data, 8) : RPParseMovies(data, 8);
+    // 12 so the page can show whole rows (4×3 portrait, 5×2 landscape); 8 left gaps.
+    NSArray *items = maoyan ? RPMoviesFromMaoyan(data, 12) : RPParseMovies(data, 12);
     if (!items.count) {
         if (self.fetchError.length == 0) self.fetchError = @"没有解析到电影";
         return NO;
@@ -2637,13 +2761,15 @@ static id RPPlistSafe(id value) {
     }
     NSArray *fresh = [json[@"new_releases"][@"items"] isKindOfClass:[NSArray class]] ? json[@"new_releases"][@"items"] : @[];
     NSArray *hot = [json[@"top_sellers"][@"items"] isKindOfClass:[NSArray class]] ? json[@"top_sellers"][@"items"] : @[];
-    [self store:@"steam" payload:@{ @"new_releases": [self steamItems:fresh limit:6], @"top_sellers": [self steamItems:hot limit:6] }];
+    // 10 each (Steam returns 30 new / 10 top): enough for 2×4 portrait or 3×3 landscape.
+    [self store:@"steam" payload:@{ @"new_releases": [self steamItems:fresh limit:10], @"top_sellers": [self steamItems:hot limit:10] }];
     return YES;
 }
 
 - (BOOL)fetchGames:(NSString *)pid key:(NSString *)key {
     NSString *url = [self sourceURL:pid];
-    NSArray *items = RPParseListing([self syncGET:url proxy:[self proxyFor:pid] headers:nil], url, 8);
+    // Listings carry 20–25 games; keep 15 so a page can fill 3×4 / 4×3 / 5×3.
+    NSArray *items = RPParseListing([self syncGET:url proxy:[self proxyFor:pid] headers:nil], url, 15);
     if (!items.count) {
         if (self.fetchError.length == 0) self.fetchError = @"没有解析到游戏";
         return NO;
@@ -2708,7 +2834,7 @@ static id RPPlistSafe(id value) {
     NSString *url = [self sourceURL:@"xiaohongshu-hot"];
     if (url.length == 0) url = RPLocalSourceDefaults()[@"xiaohongshu-hot"];
     NSString *proxy = [self proxyFor:@"xiaohongshu-hot"];
-    if (proxy.length == 0) proxy = RPLocalDefaultProxy();
+    if (proxy.length == 0) proxy = RPConfiguredProxy();
     // tophub serves the list as plain HTML (rank-item-container cards), so read it
     // directly first; r.jina.ai is only a fallback (it timed out often and returns
     // at most ~10 rows).
@@ -2758,8 +2884,10 @@ static id RPPlistSafe(id value) {
 - (BOOL)fetchBilibili {
     NSString *url = [self sourceURL:@"bilibili-hot"];
     if (url.length == 0) url = RPLocalSourceDefaults()[@"bilibili-hot"];
+    // The old default asked for 10; the board shows up to 16. Upgrade only that exact value.
+    if ([url isEqualToString:@"https://api.bilibili.com/x/web-interface/popular?ps=10&pn=1"]) url = RPLocalSourceDefaults()[@"bilibili-hot"];
     NSData *data = [self syncGET:url proxy:[self proxyFor:@"bilibili-hot"] headers:@{ @"Referer": @"https://www.bilibili.com" }];
-    NSArray *items = RPParseBilibili(data, 10);
+    NSArray *items = RPParseBilibili(data, 20);
     if (!items.count) {
         if (self.fetchError.length == 0) self.fetchError = @"没有解析到热门";
         return NO;
@@ -2818,7 +2946,7 @@ static id RPPlistSafe(id value) {
         return NO;
     }
     NSString *proxy = [self proxyFor:@"crypto"];
-    if (proxy.length == 0) proxy = RPLocalDefaultProxy();
+    if (proxy.length == 0) proxy = RPConfiguredProxy();
     NSData *data = [self syncGET:@"https://www.okx.com/api/v5/market/tickers?instType=SPOT" proxy:proxy headers:nil];
     NSArray *items = RPParseOKX(data, wanted);
     if (!items.count) {
@@ -2835,8 +2963,7 @@ static id RPPlistSafe(id value) {
     NSString *proxy = nil;
     NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
     if ([ud boolForKey:RPTickerProxyKey]) {
-        proxy = RPString([ud stringForKey:RPProxyDefaultsKey]);
-        if (proxy.length == 0) proxy = RPLocalDefaultProxy();
+        proxy = RPConfiguredProxy();
     }
     NSData *data = [self syncGET:url proxy:proxy headers:nil];
     if (!data) return NO;

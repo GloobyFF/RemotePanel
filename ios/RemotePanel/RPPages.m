@@ -158,8 +158,7 @@ void RPPrefetchImagesForPage(NSString *pageId, NSDictionary *state, NSString *ba
             NSError *error = nil;
             NSString *proxy = nil;
             if ([key rangeOfString:@"github"].location != NSNotFound) {
-                proxy = [[NSUserDefaults standardUserDefaults] stringForKey:RPProxyDefaultsKey];
-                if (proxy.length == 0) proxy = RPLocalDefaultProxy();
+                proxy = RPConfiguredProxy();
             }
             NSData *data = [RPNet syncGET:key proxy:proxy headers:nil timeout:16 error:&error];
             // Match the size the cover pages now draw at, so the prefetched copy is used as-is.
@@ -606,8 +605,7 @@ static void RPPurgeImages(UIView *root) {
         NSError *error = nil;
         NSString *proxy = nil;
         if ([key rangeOfString:@"github"].location != NSNotFound) {
-            proxy = [[NSUserDefaults standardUserDefaults] stringForKey:RPProxyDefaultsKey];
-            if (proxy.length == 0) proxy = RPLocalDefaultProxy();
+            proxy = RPConfiguredProxy();
         }
         NSData *data = [RPNet syncGET:key proxy:proxy headers:nil timeout:18 error:&error];
         UIImage *img = RPImageFromData(data, decodeSide);
@@ -1166,7 +1164,7 @@ static NSString *RPShortNumber(id value) {
         return;
     }
     if ([kind isEqualToString:@"bili"]) {
-        [self layoutCoverGrid:items bounds:b base:baseURL];
+        [self layoutBiliBoard:items bounds:b base:baseURL];
         return;
     }
 
@@ -1561,6 +1559,216 @@ static NSString *RPShortNumber(id value) {
     }
 }
 
+/** B站 video thumbnail (16:10) with duration pill bottom-right and rank badge. */
+- (UIView *)rpBiliTile:(NSDictionary *)it rank:(NSInteger)rank frame:(CGRect)f base:(NSString *)baseURL titleSize:(CGFloat)ts lines:(NSInteger)lines {
+    UIView *tile = [[UIView alloc] initWithFrame:f];
+    tile.layer.cornerRadius = 14;
+    tile.clipsToBounds = YES;
+    tile.backgroundColor = [UIColor colorWithWhite:0 alpha:0.32];
+    // Bilibili covers are 16:10; keep that shape and put text under it.
+    CGFloat imgH = floor(f.size.width * 10.0 / 16.0);
+    CGFloat textH = f.size.height - imgH;
+    if (textH < ts * 2.6) { imgH = f.size.height - ts * 2.6; textH = f.size.height - imgH; }
+    UIImageView *iv = [[UIImageView alloc] initWithFrame:CGRectMake(0, 0, f.size.width, imgH)];
+    iv.contentMode = UIViewContentModeScaleAspectFill;
+    iv.clipsToBounds = YES;
+    iv.backgroundColor = [RPTheme cardTint:rank + [self rpPageColorBias]];
+    [tile addSubview:iv];
+    NSString *img = RPStringish(it[@"image_url"]);
+    if (img.length) [self loadImageURL:[self absURL:img base:baseURL] into:iv];
+    NSString *dur = RPStringish(it[@"duration"]);
+    if (dur.length) {
+        UILabel *dl = [self makeLabel:[RPTheme mono:MAX(16, ts * 0.72)] color:[UIColor whiteColor]];
+        dl.text = [NSString stringWithFormat:@" %@ ", dur];
+        dl.numberOfLines = 1;
+        dl.backgroundColor = [UIColor colorWithWhite:0 alpha:0.68];
+        dl.layer.cornerRadius = 6;
+        dl.clipsToBounds = YES;
+        [dl sizeToFit];
+        dl.frame = CGRectMake(f.size.width - dl.bounds.size.width - 10, imgH - dl.bounds.size.height - 8, dl.bounds.size.width, dl.bounds.size.height + 2);
+        [tile addSubview:dl];
+    }
+    NSString *reason = RPStringish(it[@"reason"]);
+    if (reason.length) {
+        UILabel *rl = [self makeLabel:[RPTheme small:MAX(15, ts * 0.66)] color:[UIColor whiteColor]];
+        rl.text = [NSString stringWithFormat:@" %@ ", reason];
+        rl.numberOfLines = 1;
+        rl.backgroundColor = [UIColor colorWithRed:0.98 green:0.45 blue:0.6 alpha:0.92];  // bilibili pink
+        rl.layer.cornerRadius = 6;
+        rl.clipsToBounds = YES;
+        [rl sizeToFit];
+        rl.frame = CGRectMake(f.size.width - rl.bounds.size.width - 10, 10, rl.bounds.size.width, rl.bounds.size.height + 2);
+        [tile addSubview:rl];
+    }
+    UILabel *badge = [self rpRankBadge:rank side:MAX(32, floor(ts * 1.45))];
+    badge.frame = CGRectOffset(badge.frame, 10, 10);
+    [tile addSubview:badge];
+    UILabel *tl = [self makeLabel:[RPTheme readable:ts] color:[RPTheme text]];
+    tl.text = RPStringish(it[@"title"]);
+    tl.numberOfLines = lines;
+    // Leave room for the stats line under it (small landscape tiles overlapped by ~5 pt).
+    CGFloat statsH = ceil([RPTheme small:MAX(15, ts * 0.74)].lineHeight);
+    CGFloat tlH = MIN(f.size.height - imgH - statsH - 14, ceil(tl.font.lineHeight * (lines + 0.1)));
+    tl.frame = CGRectMake(12, imgH + 6, f.size.width - 24, MAX(0, tlH));
+    [tile addSubview:tl];
+    NSMutableArray *bits = [NSMutableArray array];
+    if (RPStringish(it[@"views"]).length) [bits addObject:[@"▶ " stringByAppendingString:RPStringish(it[@"views"])]];
+    if (RPStringish(it[@"likes"]).length) [bits addObject:[@"👍 " stringByAppendingString:RPStringish(it[@"likes"])]];
+    if (lines > 1 && RPStringish(it[@"danmaku"]).length) [bits addObject:[@"弹 " stringByAppendingString:RPStringish(it[@"danmaku"])]];
+    NSString *author = RPStringish(it[@"author"]);
+    UILabel *ml = [self makeLabel:[RPTheme small:MAX(15, ts * 0.74)] color:[RPTheme textDim]];
+    ml.text = [bits componentsJoinedByString:@"  "];
+    if (author.length && lines > 1) ml.text = [NSString stringWithFormat:@"UP %@   %@", author, ml.text];
+    ml.numberOfLines = 1;
+    ml.lineBreakMode = NSLineBreakByTruncatingTail;
+    ml.frame = CGRectMake(12, f.size.height - ceil(ml.font.lineHeight) - 8, f.size.width - 24, ceil(ml.font.lineHeight));
+    [tile addSubview:ml];
+    tile.userInteractionEnabled = YES;
+    UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(rpNewsTap:)];
+    [tile addGestureRecognizer:tap];
+    objc_setAssociatedObject(tile, &kRPImageURLKey, @{ @"item": it ?: @{}, @"base": baseURL ?: @"", @"github": @NO }, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    return tile;
+}
+
+/** Ranked text row: badge, title, play-count bar against #1, plays. */
+- (UIView *)rpBiliRow:(NSDictionary *)it rank:(NSInteger)rank frame:(CGRect)f maxViews:(double)maxViews {
+    UIView *row = [[UIView alloc] initWithFrame:f];
+    row.backgroundColor = [UIColor colorWithWhite:0 alpha:0.28];
+    row.layer.cornerRadius = 10;
+    row.clipsToBounds = YES;
+    CGFloat side = MIN(f.size.height - 12, 40);
+    UILabel *badge = [self rpRankBadge:rank side:side];
+    badge.frame = CGRectMake(10, (f.size.height - side) / 2.0, side, side);
+    [row addSubview:badge];
+    CGFloat textX = CGRectGetMaxX(badge.frame) + 12;
+    CGFloat numW = 120;
+    UILabel *tl = [self makeLabel:[RPTheme readable:21] color:[RPTheme text]];
+    NSString *author = RPStringish(it[@"author"]);
+    tl.text = author.length ? [NSString stringWithFormat:@"%@  ·  %@", RPStringish(it[@"title"]), author] : RPStringish(it[@"title"]);
+    tl.numberOfLines = 1;
+    tl.lineBreakMode = NSLineBreakByTruncatingTail;
+    tl.frame = CGRectMake(textX, 6, f.size.width - textX - numW - 14, f.size.height - 20);
+    [row addSubview:tl];
+    CGFloat barW = f.size.width - textX - numW - 14;
+    UIView *track = [[UIView alloc] initWithFrame:CGRectMake(textX, f.size.height - 12, barW, 5)];
+    track.backgroundColor = [UIColor colorWithWhite:1 alpha:0.12];
+    track.layer.cornerRadius = 2.5;
+    [row addSubview:track];
+    double v = [it[@"view_value"] doubleValue];
+    if (maxViews > 0 && v > 0) {
+        UIView *fill = [[UIView alloc] initWithFrame:CGRectMake(0, 0, MAX(6, barW * MIN(1.0, v / maxViews)), 5)];
+        fill.backgroundColor = [UIColor colorWithRed:0.0 green:0.68 blue:0.93 alpha:1];  // bilibili blue
+        fill.layer.cornerRadius = 2.5;
+        [track addSubview:fill];
+    }
+    UILabel *nl = [self makeLabel:[RPTheme mono:19] color:[RPTheme textDim]];
+    nl.text = RPStringish(it[@"views"]).length ? [@"▶ " stringByAppendingString:RPStringish(it[@"views"])] : @"";
+    nl.textAlignment = NSTextAlignmentRight;
+    nl.numberOfLines = 1;
+    nl.frame = CGRectMake(f.size.width - numW - 12, 0, numW, f.size.height);
+    [row addSubview:nl];
+    return row;
+}
+
+/* 哔哩哔哩: same three bands as 小红书.
+   Portrait: lead video (16:10 + title/UP/stats) | 3×2 video grid | ranked list.
+   Landscape: lead + 2×2 grid on the left, ranked list on the right. */
+- (void)layoutBiliBoard:(NSArray *)items bounds:(CGRect)b base:(NSString *)baseURL {
+    CGFloat m = [self mInset];
+    NSMutableArray *list = [NSMutableArray array];
+    for (id it in items) if ([it isKindOfClass:[NSDictionary class]] && RPStringish(it[@"title"]).length) [list addObject:it];
+    if (list.count == 0) {
+        UILabel *empty = [self makeLabel:[RPTheme body:24] color:[UIColor whiteColor]];
+        empty.text = @"正在读取哔哩哔哩热门。";
+        empty.frame = CGRectMake(m, 12, b.size.width - 2 * m, 80);
+        [self.contentView addSubview:empty];
+        return;
+    }
+    double maxViews = 0;
+    for (NSDictionary *it in list) maxViews = MAX(maxViews, [it[@"view_value"] doubleValue]);
+    CGFloat gap = 10, top = 6;
+    CGFloat W = b.size.width - 2 * m;
+    CGFloat H = b.size.height - top - m;
+    BOOL land = b.size.width > b.size.height;
+    NSInteger next = 0;
+    if (land) {
+        CGFloat leftW = floor(W * 0.6);
+        CGFloat leadH = floor(H * 0.52);
+        [self.contentView addSubview:[self rpBiliTile:list[0] rank:1 frame:CGRectMake(m, top, leftW, leadH) base:baseURL titleSize:26 lines:2]];
+        next = 1;
+        CGFloat gridTop = top + leadH + gap;
+        CGFloat cellW = floor((leftW - gap) / 2.0);
+        CGFloat cellH = floor((H - leadH - gap * 2) / 2.0);
+        for (NSInteger i = 0; i < 4 && next < (NSInteger)list.count; i++, next++) {
+            CGRect f = CGRectMake(m + (i % 2) * (cellW + gap), gridTop + (i / 2) * (cellH + gap), cellW, cellH);
+            [self.contentView addSubview:[self rpBiliTile:list[next] rank:next + 1 frame:f base:baseURL titleSize:19 lines:1]];
+        }
+        CGFloat listX = m + leftW + gap * 1.5;
+        CGFloat listW = W - leftW - gap * 1.5;
+        NSInteger rows = MIN(11, (NSInteger)list.count - next);
+        CGFloat rowH = rows > 0 ? floor((H - gap * 0.6 * (rows - 1)) / MAX(rows, 9)) : 0;
+        for (NSInteger r = 0; r < rows; r++, next++) {
+            [self.contentView addSubview:[self rpBiliRow:list[next] rank:next + 1 frame:CGRectMake(listX, top + r * (rowH + gap * 0.6), listW, rowH) maxViews:maxViews]];
+        }
+        return;
+    }
+    CGFloat leadH = floor(H * 0.40);
+    // Lead: wide 16:10 thumbnail would be 450 pt tall; use a side-by-side card instead.
+    UIView *lead = [[UIView alloc] initWithFrame:CGRectMake(m, top, W, leadH)];
+    lead.layer.cornerRadius = 14;
+    lead.clipsToBounds = YES;
+    lead.backgroundColor = [UIColor colorWithWhite:0 alpha:0.32];
+    [self.contentView addSubview:lead];
+    [lead addSubview:[self rpBiliTile:list[0] rank:1 frame:CGRectMake(0, 0, floor(W * 0.58), leadH) base:baseURL titleSize:24 lines:2]];
+    NSDictionary *l0 = list[0];
+    CGFloat sx = floor(W * 0.58) + 18, sw = W - sx - 16;
+    NSArray *lines = @[
+        @[@"UP 主", RPStringish(l0[@"author"])],
+        @[@"分区", RPStringish(l0[@"tname"])],
+        @[@"播放", RPStringish(l0[@"views"])],
+        @[@"点赞", RPStringish(l0[@"likes"])],
+        @[@"弹幕", RPStringish(l0[@"danmaku"])],
+        @[@"投币", RPStringish(l0[@"coins"])],
+    ];
+    CGFloat ly = 16, lh = floor((leadH - 32) / 6.0);
+    for (NSArray *pair in lines) {
+        if ([pair[1] length] == 0) continue;
+        UILabel *k = [self makeLabel:[RPTheme small:18] color:[RPTheme textDim]];
+        k.text = pair[0];
+        k.frame = CGRectMake(sx, ly, 64, lh);
+        [lead addSubview:k];
+        UILabel *v = [self makeLabel:[RPTheme title:22] color:[RPTheme text]];
+        v.text = pair[1];
+        v.numberOfLines = 1;
+        v.lineBreakMode = NSLineBreakByTruncatingTail;
+        v.frame = CGRectMake(sx + 68, ly, sw - 68, lh);
+        [lead addSubview:v];
+        ly += lh;
+    }
+    next = 1;
+    CGFloat gridTop = top + leadH + gap;
+    CGFloat cellW = floor((W - gap * 2) / 3.0);
+    CGFloat cellH = floor(cellW * 10.0 / 16.0) + 64;
+    for (NSInteger i = 0; i < 6 && next < (NSInteger)list.count; i++, next++) {
+        CGRect f = CGRectMake(m + (i % 3) * (cellW + gap), gridTop + (i / 3) * (cellH + gap), cellW, cellH);
+        [self.contentView addSubview:[self rpBiliTile:list[next] rank:next + 1 frame:f base:baseURL titleSize:18 lines:1]];
+    }
+    NSInteger gridRows = MIN(2, (NSInteger)ceil(MIN(6, (NSInteger)list.count - 1) / 3.0));
+    CGFloat listTop = gridTop + gridRows * (cellH + gap);
+    CGFloat listH = top + H - listTop;
+    NSInteger rows = MIN(9, (NSInteger)list.count - next);
+    if (rows <= 0 || listH < 40) return;
+    CGFloat rowGap = 6;
+    CGFloat rowH = MIN(56, floor((listH - rowGap * (rows - 1)) / rows));
+    if (rowH < 38) {
+        rows = MAX(1, (NSInteger)floor((listH + rowGap) / (38 + rowGap)));
+        rowH = floor((listH - rowGap * (rows - 1)) / rows);
+    }
+    for (NSInteger r = 0; r < rows && next < (NSInteger)list.count; r++, next++) {
+        [self.contentView addSubview:[self rpBiliRow:list[next] rank:next + 1 frame:CGRectMake(m, listTop + r * (rowH + rowGap), W, rowH) maxViews:maxViews]];
+    }
+}
+
 - (void)layoutCoverGrid:(NSArray *)items bounds:(CGRect)b base:(NSString *)baseURL {
     CGFloat m = [self mInset];
     CGFloat top = 8;
@@ -1917,51 +2125,62 @@ static NSString *RPShortNumber(id value) {
 
 #pragma mark - Media walls
 
-/* Cover grids sized to the artwork's real shape, so nothing is cropped.
-   Measured source ratios (w/h): Steam header 460×215 = 2.14, gamer520 PC/Switch
-   capsules 616×353 = 1.75, 2468c PS5 covers 280×360 = 0.78, Maoyan posters ≈ 0.72.
-   Picks the column count (from `cols`) whose cards are largest while all `n` cards fit
-   in `avail`, then centres the grid. Returns the card frames; `imgH` is the art height. */
-static NSArray *RPAspectGrid(CGRect avail, NSInteger n, NSArray *colChoices, CGFloat ratio, CGFloat captionH, CGFloat gap, CGFloat *imgHOut) {
-    if (n <= 0) return @[];
+/* Cover art shapes measured from each source (w/h): Steam header 460×215 = 2.14,
+   gamer520 PC/Switch capsules 616×353 = 1.75, 2468c PS5 covers 280×360 = 0.78,
+   Maoyan posters ≈ 0.72. Cards use these ratios so art is never cropped. */
+
+/* Whole-row cover grid. Tries every cols×rows from 1×1 to 7×7 with
+   minN ≤ cols·rows ≤ min(available, maxN), sizes each card by the art's ratio so
+   it fits both width and height, and keeps the layout that covers the most of the
+   page (within 6%, prefer more cards). Every row is full, so no "6 on top, 3
+   below". Simulated on iPad 3: 85–92% of the page in both orientations, against
+   45–90% for the fixed-column grid it replaces. `nOut` gets the card count. */
+static NSArray *RPFillGrid(CGRect avail, NSInteger available, NSInteger minN, NSInteger maxN, CGFloat ratio, CGFloat captionH, CGFloat gap, CGFloat *imgHOut, NSInteger *nOut) {
+    if (available <= 0) { if (nOut) *nOut = 0; return @[]; }
+    NSInteger cap = MIN(available, maxN);
+    NSInteger floorN = MIN(minN, cap);
+    NSInteger bestCols = 1, bestRows = 1, bestScore = -1, bestN = 0;
     CGFloat bestW = 0;
-    NSInteger bestCols = 1;
-    for (NSNumber *c in colChoices) {
-        NSInteger cols = MAX(1, c.integerValue);
-        NSInteger rows = (n + cols - 1) / cols;
-        CGFloat w = floor((avail.size.width - gap * (cols - 1)) / cols);
-        CGFloat h = w / ratio + captionH;
-        CGFloat needH = rows * h + gap * (rows - 1);
-        if (needH > avail.size.height) {
-            // Shrink width until the rows fit the height.
-            CGFloat hFit = (avail.size.height - gap * (rows - 1)) / rows;
-            w = floor((hFit - captionH) * ratio);
+    for (NSInteger c = 1; c <= 7; c++) {
+        for (NSInteger r = 1; r <= 7; r++) {
+            NSInteger n = c * r;
+            if (n < floorN || n > cap) continue;
+            CGFloat cw = (avail.size.width - gap * (c - 1)) / c;
+            CGFloat rh = (avail.size.height - gap * (r - 1)) / r;
+            CGFloat w = floor(MIN(cw, (rh - captionH) * ratio));
+            if (w < 110) continue;
+            CGFloat cardH = floor(w / ratio) + captionH;
+            CGFloat fill = n * w * cardH / (avail.size.width * avail.size.height);
+            NSInteger score = (NSInteger)floor(fill / 0.06);
+            if (score > bestScore || (score == bestScore && n > bestN)) {
+                bestScore = score; bestCols = c; bestRows = r; bestW = w; bestN = n;
+            }
         }
-        if (w > bestW) { bestW = w; bestCols = cols; }
     }
-    NSInteger cols = bestCols;
-    NSInteger rows = (n + cols - 1) / cols;
-    CGFloat cw = bestW;
-    CGFloat imgH = floor(cw / ratio);
+    if (bestN == 0) {
+        // Nothing fit the minimum (very few items): one row of what there is.
+        bestCols = cap; bestRows = 1; bestN = cap;
+        bestW = floor(MIN((avail.size.width - gap * (cap - 1)) / cap, (avail.size.height - captionH) * ratio));
+    }
+    CGFloat imgH = floor(bestW / ratio);
     CGFloat ch = imgH + captionH;
-    CGFloat gridW = cols * cw + gap * (cols - 1);
-    CGFloat gridH = rows * ch + gap * (rows - 1);
-    // Spread spare height between rows (up to 3× gap) before centring what is left.
-    CGFloat spareH = avail.size.height - gridH;
-    CGFloat rowGap = gap;
-    if (rows > 1 && spareH > 0) rowGap = MIN(gap * 3, gap + spareH / (rows - 1));
-    gridH = rows * ch + rowGap * (rows - 1);
+    CGFloat gridW = bestCols * bestW + gap * (bestCols - 1);
+    // Spread spare space between cards (up to 3× gap), then centre.
+    CGFloat colGap = gap, rowGap = gap;
+    if (bestCols > 1) colGap = MIN(gap * 3, gap + (avail.size.width - gridW) / (bestCols - 1));
+    gridW = bestCols * bestW + colGap * (bestCols - 1);
+    CGFloat gridH = bestRows * ch + gap * (bestRows - 1);
+    if (bestRows > 1) rowGap = MIN(gap * 3, gap + (avail.size.height - gridH) / (bestRows - 1));
+    gridH = bestRows * ch + rowGap * (bestRows - 1);
     CGFloat x0 = avail.origin.x + floor((avail.size.width - gridW) / 2.0);
     CGFloat y0 = avail.origin.y + floor(MAX(0, avail.size.height - gridH) / 2.0);
     NSMutableArray *frames = [NSMutableArray array];
-    for (NSInteger i = 0; i < n; i++) {
-        NSInteger r = i / cols, c = i % cols;
-        // Centre a short last row.
-        NSInteger inRow = (r == rows - 1) ? (n - r * cols) : cols;
-        CGFloat rowX = x0 + floor((gridW - (inRow * cw + gap * (inRow - 1))) / 2.0);
-        [frames addObject:[NSValue valueWithCGRect:CGRectMake(rowX + c * (cw + gap), y0 + r * (ch + rowGap), cw, ch)]];
+    for (NSInteger i = 0; i < bestN; i++) {
+        NSInteger r = i / bestCols, c = i % bestCols;
+        [frames addObject:[NSValue valueWithCGRect:CGRectMake(x0 + c * (bestW + colGap), y0 + r * (ch + rowGap), bestW, ch)]];
     }
     if (imgHOut) *imgHOut = imgH;
+    if (nOut) *nOut = bestN;
     return frames;
 }
 
@@ -1974,12 +2193,14 @@ static NSArray *RPAspectGrid(CGRect avail, NSInteger n, NSArray *colChoices, CGF
     [self clearContent];
     CGFloat m = [self mInset];
     BOOL landscape = [self isLandscape];
-    NSInteger n = MIN(landscape ? 8 : 9, (NSInteger)movies.count);
+    (void)landscape;
     // Maoyan posters are ≈0.72 (w/h). Full poster, title + date under it.
+    // Whole rows only: 4×3 portrait, 5×2 landscape with 12 films.
     CGFloat captionH = 64;
     CGFloat imgH = 0;
+    NSInteger n = 0;
     CGRect avail = CGRectMake(m, 8, b.size.width - 2 * m, b.size.height - 8 - m);
-    NSArray *frames = RPAspectGrid(avail, n, landscape ? @[@4, @5] : @[@3, @4], 0.72, captionH, 12, &imgH);
+    NSArray *frames = RPFillGrid(avail, (NSInteger)movies.count, 6, 12, 0.72, captionH, 12, &imgH, &n);
     for (NSUInteger i = 0; i < frames.count; i++) {
         NSDictionary *mov = movies[i];
         CGRect f = [frames[i] CGRectValue];
@@ -2034,12 +2255,13 @@ static NSArray *RPAspectGrid(CGRect avail, NSInteger n, NSArray *colChoices, CGF
         if (RPStringish(item[@"title"]).length || RPStringish(item[@"header_url"]).length) [vis addObject:item];
     }
     items = vis;
-    NSInteger n = MIN(landscape ? 9 : 10, (NSInteger)items.count);
-    // Steam header art is 460×215 (2.14). Show it whole, at that shape.
+    (void)landscape;
+    // Steam header art is 460×215 (2.14). Whole rows: 2×4 portrait, 3×3 landscape.
     CGFloat captionH = 66;
     CGFloat imgH = 0;
+    NSInteger n = 0;
     CGRect avail = CGRectMake(m, 8, b.size.width - 2 * m, b.size.height - 8 - m);
-    NSArray *frames = RPAspectGrid(avail, n, landscape ? @[@3] : @[@2], 460.0 / 215.0, captionH, 12, &imgH);
+    NSArray *frames = RPFillGrid(avail, (NSInteger)items.count, 6, 10, 460.0 / 215.0, captionH, 12, &imgH, &n);
     for (NSUInteger i = 0; i < frames.count; i++) {
         NSDictionary *item = items[i];
         CGRect f = [frames[i] CGRectValue];
@@ -2130,12 +2352,13 @@ static NSArray *RPAspectGrid(CGRect avail, NSInteger n, NSArray *colChoices, CGF
     // 16:9 eShop art); 2468c PS5 box covers 280×360 (0.78, portrait).
     BOOL ps5 = [self.kind isEqualToString:@"ps5"];
     CGFloat ratio = ps5 ? (280.0 / 360.0) : (616.0 / 353.0);
-    NSInteger n = MIN(ps5 ? (landscape ? 10 : 9) : (landscape ? 9 : 10), (NSInteger)items.count);
-    NSArray *colChoices = ps5 ? (landscape ? @[@5] : @[@3]) : (landscape ? @[@3] : @[@2]);
+    (void)landscape;
+    // Whole rows: PC/Switch 3×4 portrait, 4×3 landscape; PS5 4×3 / 5×2.
     CGFloat captionH = ps5 ? 66 : 72;
     CGFloat imgH = 0;
+    NSInteger n = 0;
     CGRect avail = CGRectMake(m, 8, b.size.width - 2 * m, b.size.height - 8 - m);
-    NSArray *frames = RPAspectGrid(avail, n, colChoices, ratio, captionH, 12, &imgH);
+    NSArray *frames = RPFillGrid(avail, (NSInteger)items.count, ps5 ? 8 : 6, ps5 ? 15 : 12, ratio, captionH, 12, &imgH, &n);
     for (NSUInteger i = 0; i < frames.count; i++) {
         NSDictionary *item = items[i];
         CGRect f = [frames[i] CGRectValue];
@@ -3333,6 +3556,7 @@ static NSArray *RPVideoLinksInPage(NSData *data, NSString *pageURL) {
 @property (nonatomic, assign) NSInteger playToken;
 @property (nonatomic, assign) PHImageRequestID videoRequest;
 @property (nonatomic, assign) BOOL advancing;
+@property (nonatomic, strong) UIButton *muteButton;
 @end
 
 @implementation RPVideoPageVC
@@ -3354,6 +3578,7 @@ static NSArray *RPVideoLinksInPage(NSData *data, NSString *pageURL) {
     [super viewDidLayoutSubviews];
     self.playerLayer.frame = self.contentView.bounds;
     self.statusLabel.frame = UIEdgeInsetsInsetRect(self.contentView.bounds, UIEdgeInsetsMake(48, 36, 48, 36));
+    if (self.muteButton) self.muteButton.frame = CGRectMake(self.contentView.bounds.size.width - 160, 16, 144, 48);
 }
 - (void)parkMotionOffscreen {}
 - (void)playPageIntro {}
@@ -3368,26 +3593,149 @@ static NSArray *RPVideoLinksInPage(NSData *data, NSString *pageURL) {
     [self showStatus:@"正在准备视频…"];
     NSInteger token = self.playToken;
     NSDictionary *cfg = RPVideoSettings();
-    NSString *source = cfg[@"source"] ?: @"album";
-    if ([source isEqualToString:@"files"]) {
-        [self playPickedFile:token];
-    } else if ([source isEqualToString:@"http"]) {
-        NSString *page = cfg[@"http"] ?: @"";
+    [self updateMuteButton];
+    if (self.network) {
+        NSString *dir = cfg[@"http"] ?: @"";
+        NSString *user = cfg[@"http_user"] ?: @"";
+        NSString *pass = cfg[@"http_pass"] ?: @"";
+        if (dir.length == 0) {
+            [self showStatus:@"还没有填写视频目录。\n打开设置 → 网络视频，填 HTTP 或 WebDAV 地址。"];
+            return;
+        }
+        [self showStatus:@"正在读取视频目录…"];
         dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-            NSString *picked = [self pickHTTPVideo:page];
+            NSString *why = nil;
+            NSString *picked = [self pickNetworkVideo:dir user:user pass:pass why:&why];
             dispatch_async(dispatch_get_main_queue(), ^{
                 if (token != self.playToken) return;
                 if (picked.length == 0) {
-                    [self showStatus:page.length ? @"这个地址里没有 mp4、mov 或 m4v。" : @"还没有填写网络目录。\n用浏览器打开设置页填写 http 地址。"];
+                    [self showStatus:why.length ? why : @"这个目录里没有 mp4、mov 或 m4v。"];
                     return;
                 }
                 RPLastVideoKey = picked;
-                [self startPlayer:[AVPlayerItem playerItemWithURL:[NSURL URLWithString:picked]] name:picked];
+                [self startPlayer:[self networkItem:picked user:user pass:pass] name:picked];
             });
         });
+        return;
+    }
+    // 相册视频. Uploaded files are part of this board too (browser "上传到这台 iPad").
+    NSArray *uploaded = RPVideoLocalFiles();
+    BOOL useUploads = [cfg[@"source"] isEqualToString:@"files"] && uploaded.count > 0;
+    if (useUploads) {
+        [self playPickedFile:token];
     } else {
         [self playPickedAlbum:token album:cfg[@"album"] ?: @"" fallback:cfg[@"photo_album"] ?: @""];
     }
+}
+
+#pragma mark Network directory (HTTP listing / WebDAV)
+
+static NSString *RPBasicAuthHeader(NSString *user, NSString *pass) {
+    if (user.length == 0) return nil;
+    NSData *raw = [[NSString stringWithFormat:@"%@:%@", user, pass ?: @""] dataUsingEncoding:NSUTF8StringEncoding];
+    return [@"Basic " stringByAppendingString:[raw base64EncodedStringWithOptions:0]];
+}
+
+/** Video URLs found in a WebDAV PROPFIND (Depth: 1) multistatus body. */
+static NSArray *RPVideoLinksInDAV(NSData *data, NSURL *base) {
+    NSString *xml = [[NSString alloc] initWithData:data ?: [NSData data] encoding:NSUTF8StringEncoding];
+    if (xml.length == 0) return @[];
+    NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:@"<(?:[A-Za-z0-9]+:)?href>\\s*([^<]+?)\\s*</(?:[A-Za-z0-9]+:)?href>" options:NSRegularExpressionCaseInsensitive error:nil];
+    NSMutableArray *out = [NSMutableArray array];
+    NSMutableSet *seen = [NSMutableSet set];
+    for (NSTextCheckingResult *m in [re matchesInString:xml options:0 range:NSMakeRange(0, xml.length)]) {
+        NSString *href = [[xml substringWithRange:[m rangeAtIndex:1]] stringByReplacingOccurrencesOfString:@"&amp;" withString:@"&"];
+        NSURL *u = [NSURL URLWithString:href relativeToURL:base];
+        if (!u || !RPVideoExtensionOK([u.path pathExtension])) continue;
+        NSString *abs = u.absoluteString;
+        if (abs.length == 0 || [seen containsObject:abs]) continue;
+        [seen addObject:abs];
+        [out addObject:abs];
+        if (out.count >= 200) break;
+    }
+    return out;
+}
+
+/** Pick one video from the directory. Tries WebDAV PROPFIND first, then a plain
+    GET of the directory page (nginx/Apache/python http.server index). Runs off main. */
+- (NSString *)pickNetworkVideo:(NSString *)dir user:(NSString *)user pass:(NSString *)pass why:(NSString **)why {
+    NSString *raw = [dir stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if ([raw hasPrefix:@"\\\\"] || [raw.lowercaseString hasPrefix:@"smb://"]) {
+        if (why) *why = @"iPad 读不了 SMB 共享（\\\\电脑\\共享）。\n请把视频放在 HTTP 或 WebDAV 共享里，再填 http:// 开头的地址。";
+        return @"";
+    }
+    if (![raw hasPrefix:@"http://"] && ![raw hasPrefix:@"https://"]) raw = [@"http://" stringByAppendingString:raw];
+    NSURL *url = [NSURL URLWithString:raw];
+    if (!url) { if (why) *why = @"视频目录地址不对。"; return @""; }
+    if (RPVideoExtensionOK(url.pathExtension)) return url.absoluteString;  // a single file
+    if (![raw hasSuffix:@"/"]) url = [NSURL URLWithString:[raw stringByAppendingString:@"/"]];
+    NSString *auth = RPBasicAuthHeader(user, pass);
+    NSMutableDictionary *headers = [NSMutableDictionary dictionary];
+    if (auth) headers[@"Authorization"] = auth;
+    NSError *err = nil;
+    NSArray *links = @[];
+    // WebDAV
+    NSMutableDictionary *dav = [headers mutableCopy];
+    dav[@"Depth"] = @"1";
+    dav[@"Content-Type"] = @"application/xml";
+    NSData *propfind = [@"<?xml version=\"1.0\"?><d:propfind xmlns:d=\"DAV:\"><d:prop><d:resourcetype/></d:prop></d:propfind>" dataUsingEncoding:NSUTF8StringEncoding];
+    NSData *davData = [RPNet syncRequest:url.absoluteString method:@"PROPFIND" body:propfind proxy:nil headers:dav timeout:15 error:&err];
+    links = RPVideoLinksInDAV(davData, url);
+    if (links.count == 0) {
+        err = nil;
+        NSData *page = [RPNet syncGET:url.absoluteString proxy:nil headers:headers timeout:15 error:&err];
+        links = RPVideoLinksInPage(page, url.absoluteString);
+        if (!page && why) {
+            NSString *msg = err.localizedDescription ?: @"连不上";
+            *why = [msg hasPrefix:@"HTTP 401"] || [msg hasPrefix:@"HTTP 403"]
+                ? @"视频目录需要登录。\n在设置 → 网络视频里填用户名和密码。"
+                : [NSString stringWithFormat:@"读不到视频目录：%@", msg];
+        }
+    }
+    return RPVideoPick(links, RPLastVideoKey) ?: @"";
+}
+
+/** AVPlayerItem for a network URL. Basic auth goes in as a request header; iOS 9's
+    AVURLAsset accepts it through the (long-standing, undocumented) header option. */
+- (AVPlayerItem *)networkItem:(NSString *)link user:(NSString *)user pass:(NSString *)pass {
+    NSURL *url = [NSURL URLWithString:link];
+    if (!url) return nil;
+    NSString *auth = RPBasicAuthHeader(user, pass);
+    if (!auth) return [AVPlayerItem playerItemWithURL:url];
+    AVURLAsset *asset = [AVURLAsset URLAssetWithURL:url options:@{ @"AVURLAssetHTTPHeaderFieldsKey": @{ @"Authorization": auth } }];
+    return [AVPlayerItem playerItemWithAsset:asset];
+}
+
+#pragma mark Mute
+
+- (void)updateMuteButton {
+    if (!self.muteButton) {
+        UIButton *b = [UIButton buttonWithType:UIButtonTypeCustom];
+        b.titleLabel.font = [RPTheme title:22];
+        b.backgroundColor = [UIColor colorWithWhite:0 alpha:0.5];
+        b.layer.cornerRadius = 10;
+        b.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleBottomMargin;
+        [b addTarget:self action:@selector(toggleMute) forControlEvents:UIControlEventTouchUpInside];
+        [self.contentView addSubview:b];
+        self.muteButton = b;
+    }
+    BOOL muted = [RPVideoSettings()[@"muted"] boolValue];
+    [self.muteButton setTitle:muted ? @"🔇 已静音" : @"🔊 有声" forState:UIControlStateNormal];
+    self.muteButton.frame = CGRectMake(self.contentView.bounds.size.width - 160, 16, 144, 48);
+    [self.contentView bringSubviewToFront:self.muteButton];
+    self.player.muted = muted;
+}
+
+- (void)toggleMute {
+    BOOL muted = ![RPVideoSettings()[@"muted"] boolValue];
+    RPVideoSetMuted(muted);
+    // The clip started under Ambient (muted), which the side mute switch silences.
+    // Switch the session too, or "有声" stays silent until the next clip.
+    NSError *err = nil;
+    [[AVAudioSession sharedInstance] setCategory:muted ? AVAudioSessionCategoryAmbient : AVAudioSessionCategoryPlayback error:&err];
+    [[AVAudioSession sharedInstance] setActive:YES error:&err];
+    (void)err;
+    [self updateMuteButton];
 }
 - (void)pageDidDisappear {
     self.playToken += 1;
@@ -3422,11 +3770,12 @@ static NSArray *RPVideoLinksInPage(NSData *data, NSString *pageURL) {
             return;
         }
         NSString *look = album.length ? album : fallback;
-        NSArray *assets = [self.photos videoAssetsInAlbumId:(look.length ? look : nil) limit:80];
-        if (assets.count == 0 && album.length == 0) assets = [self.photos videoAssetsInAlbumId:nil limit:80];
+        // Whole album (was the newest 80), so the random pick reaches old clips too.
+        NSArray *assets = [self.photos videoAssetsInAlbumId:(look.length ? look : nil) limit:2000];
+        if (assets.count == 0 && album.length == 0) assets = [self.photos videoAssetsInAlbumId:nil limit:2000];
         PHAsset *asset = RPVideoPick(assets, RPLastVideoKey);
         if (!asset) {
-            [self showStatus:@"这个相册里没有视频。"];
+            [self showStatus:album.length ? @"这个相册里没有视频。\n在设置 → 相册视频里换一个相册。" : @"相册里没有视频。"];
             return;
         }
         RPLastVideoKey = asset.localIdentifier;
@@ -3466,11 +3815,15 @@ static NSArray *RPVideoLinksInPage(NSData *data, NSString *pageURL) {
         return;
     }
     [self stopPlayback];
+    BOOL muted = [RPVideoSettings()[@"muted"] boolValue];
     NSError *audioErr = nil;
-    [[AVAudioSession sharedInstance] setCategory:AVAudioSessionCategoryPlayback error:&audioErr];
+    // Muted playback must not stop other audio (the alert chime, music); Ambient also
+    // respects the silent switch. With sound on, Playback so it is heard.
+    [[AVAudioSession sharedInstance] setCategory:muted ? AVAudioSessionCategoryAmbient : AVAudioSessionCategoryPlayback error:&audioErr];
     [[AVAudioSession sharedInstance] setActive:YES error:&audioErr];
     (void)audioErr;
     self.player = [AVPlayer playerWithPlayerItem:item];
+    self.player.muted = muted;
     self.player.actionAtItemEnd = AVPlayerActionAtItemEndPause;
     self.playerLayer = [AVPlayerLayer playerLayerWithPlayer:self.player];
     self.playerLayer.videoGravity = AVLayerVideoGravityResizeAspect;
@@ -3538,7 +3891,8 @@ static NSArray *RPVideoLinksInPage(NSData *data, NSString *pageURL) {
     self.player = nil;
     [self.playerLayer removeFromSuperlayer];
     self.playerLayer = nil;
-    [[AVAudioSession sharedInstance] setActive:NO withOptions:AVAudioSessionSetActiveOptionNotifyOthersOnDeactivation error:nil];
+    // Don't deactivate the audio session here: that cut off a notice chime that was
+    // still ringing when the video page left. Nothing else needs the session freed.
 }
 @end
 
@@ -3574,7 +3928,8 @@ static NSArray *RPVideoLinksInPage(NSData *data, NSString *pageURL) {
     else if ([pid isEqualToString:@"gamer520-pc-latest"]) { RPGameListPageVC *g=[[RPGameListPageVC alloc] init]; g.kind=@"pc"; vc=g; }
     else if ([pid isEqualToString:@"gamer520-switch-latest"]) { RPGameListPageVC *g=[[RPGameListPageVC alloc] init]; g.kind=@"switch"; vc=g; }
     else if ([pid isEqualToString:@"ps5-games-latest"]) { RPGameListPageVC *g=[[RPGameListPageVC alloc] init]; g.kind=@"ps5"; vc=g; }
-    else if ([pid isEqualToString:@"local-video"]) vc = [[RPVideoPageVC alloc] init];
+    else if ([pid isEqualToString:@"local-video"]) { RPVideoPageVC *v = [[RPVideoPageVC alloc] init]; v.network = NO; vc = v; }
+    else if ([pid isEqualToString:@"net-video"]) { RPVideoPageVC *v = [[RPVideoPageVC alloc] init]; v.network = YES; vc = v; }
     else if ([pid hasPrefix:@"person-photo-local"] || [pid rangeOfString:@"person-photo"].location != NSNotFound) {
         RPPhotoPageVC *p=[[RPPhotoPageVC alloc] init];
         p.slot = ([pid rangeOfString:@"landscape"].location != NSNotFound) || [pid hasSuffix:@"-2"] ? 1 : 0;

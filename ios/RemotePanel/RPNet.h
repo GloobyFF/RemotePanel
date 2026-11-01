@@ -12,6 +12,14 @@
              headers:(NSDictionary *)headers
              timeout:(NSTimeInterval)timeout
                error:(NSError **)error;
+/** Any method (e.g. WebDAV PROPFIND). Same error and redirect rules as GET. */
++ (NSData *)syncRequest:(NSString *)urlString
+                 method:(NSString *)method
+                   body:(NSData *)body
+                  proxy:(NSString *)proxy
+                headers:(NSDictionary *)headers
+                timeout:(NSTimeInterval)timeout
+                  error:(NSError **)error;
 + (void)GET:(NSString *)urlString
       proxy:(NSString *)proxy
     headers:(NSDictionary *)headers

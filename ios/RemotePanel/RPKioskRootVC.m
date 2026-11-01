@@ -4,6 +4,7 @@
 #import "RPPhotoSource.h"
 #import "RPPages.h"
 #import "RPLocalFeed.h"
+#import "RPChime.h"
 #import <AudioToolbox/AudioToolbox.h>
 #import <Photos/Photos.h>
 #import <math.h>
@@ -54,6 +55,8 @@ static BOOL RPDefaultUseProxy(NSString *pid) { return RPLocalDefaultUseProxy(pid
 @property (nonatomic, assign) NSInteger unreadCount;
 @property (nonatomic, assign) NSInteger activityEpoch;
 @property (nonatomic, assign) BOOL tickerSoundReady;
+@property (nonatomic, strong) NSTimer *unreadTimer;
+@property (nonatomic, copy) NSString *latestUnreadTitle;
 @property (nonatomic, strong) NSMutableSet *seenTickerKeys;
 @property (nonatomic, assign) BOOL pageTransitioning;
 @property (nonatomic, assign) NSInteger transitionToken;
@@ -81,6 +84,15 @@ static BOOL RPDefaultUseProxy(NSString *pid) { return RPLocalDefaultUseProxy(pid
 @property (nonatomic, strong) UIScrollView *settingsScroll;
 @property (nonatomic, strong) UITextField *baseField;
 @property (nonatomic, strong) UITextField *proxyField;
+@property (nonatomic, strong) UITextField *proxyUserField;
+@property (nonatomic, strong) UITextField *proxyPassField;
+@property (nonatomic, strong) UILabel *videoAlbumLabel;
+@property (nonatomic, copy) NSString *videoAlbumId;
+@property (nonatomic, strong) UITextField *videoDirField;
+@property (nonatomic, strong) UITextField *videoUserField;
+@property (nonatomic, strong) UITextField *videoPassField;
+@property (nonatomic, strong) UISwitch *videoMuteSwitch;
+@property (nonatomic, strong) UITextField *videoMaxField;
 @property (nonatomic, strong) UITextField *tickerField;
 @property (nonatomic, strong) UISwitch *tickerProxySwitch;
 @property (nonatomic, strong) UISegmentedControl *tickerRefreshControl;
@@ -561,10 +573,48 @@ static NSString *RPStringish(id value) {
     BOOL announce = self.tickerSoundReady && freshCount > 0;
     self.tickerSoundReady = YES;
     if (!announce) return;
-    AudioServicesPlaySystemSound(1007);
+    // System sound 1007 is silent with the mute switch on, which a wall iPad usually is.
+    if (![RPChime isQuietHours]) [RPChime arrival];
     self.unreadCount += freshCount;
+    self.latestUnreadTitle = freshTitle;
     [self refreshBell];
     [self showToast:freshTitle];
+    [self armUnreadReminder];
+}
+
+/** While messages stay unread, every 10 minutes: a short beep and the banner again.
+    Opening the ✉ list (showTickerDetail) clears unread and stops it. */
+- (void)armUnreadReminder {
+    [self.unreadTimer invalidate];
+    self.unreadTimer = [NSTimer scheduledTimerWithTimeInterval:10 * 60 target:self selector:@selector(unreadReminderFired) userInfo:nil repeats:YES];
+}
+
+- (void)unreadReminderFired {
+    if (self.unreadCount <= 0) {
+        [self.unreadTimer invalidate];
+        self.unreadTimer = nil;
+        return;
+    }
+    if (![RPChime isQuietHours]) [RPChime nudge];
+    NSString *t = self.latestUnreadTitle.length ? self.latestUnreadTitle : @"有未读消息";
+    [self showToast:[NSString stringWithFormat:@"%@（%ld 条未读，点右上角 ✉ 查看）", t, (long)self.unreadCount]];
+}
+
+/** Settings → 测试提醒: same path as a real message (sound, banner, badge, reminder). */
+- (void)testNotice {
+    [self hideSettings];
+    [[RPLocalFeed sharedFeed] postTestNotice:[NSString stringWithFormat:@"测试提醒 %@", [self clockText]]];
+    [self applyTickerMessages:[[RPLocalFeed sharedFeed] tickerMessages]];
+}
+
+- (NSString *)clockText {
+    static NSDateFormatter *f;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        f = [[NSDateFormatter alloc] init];
+        f.dateFormat = @"HH:mm:ss";
+    });
+    return [f stringFromDate:[NSDate date]];
 }
 
 - (void)showUpdateLog {
@@ -577,6 +627,8 @@ static NSString *RPStringish(id value) {
 - (void)showTickerDetail {
     if (self.overlayDim) return;
     self.unreadCount = 0;
+    [self.unreadTimer invalidate];
+    self.unreadTimer = nil;
     [self refreshBell];
     self.toastToken += 1;
     self.toast.hidden = YES;
@@ -750,7 +802,7 @@ static NSString *RPStringish(id value) {
     self.videoHold = NO;
     if (self.index < 0 || self.index >= (NSInteger)self.pages.count) return;
     RPPageDef *def = self.pages[self.index];
-    if (![def.pid isEqualToString:@"local-video"]) return;
+    if (![def.pid isEqualToString:@"local-video"] && ![def.pid isEqualToString:@"net-video"]) return;
     [self nextPage];
 }
 - (void)dwellTick {
@@ -980,6 +1032,72 @@ static NSString *RPStringish(id value) {
     [self.settingsScroll addSubview:self.proxyField];
     y += 52;
 
+    // Optional proxy login (SOCKS5 username/password, or HTTP Proxy-Authorization).
+    CGFloat halfW = floor((contentW - 12) / 2.0);
+    UILabel *pul = [[UILabel alloc] initWithFrame:CGRectMake(20, y, contentW, 22)];
+    pul.font = [RPTheme small:14]; pul.textColor = [RPTheme textDim];
+    pul.text = @"代理用户名 / 密码（代理不需要登录就留空）";
+    [self.settingsScroll addSubview:pul];
+    y += 26;
+    NSUserDefaults *pud = [NSUserDefaults standardUserDefaults];
+    self.proxyUserField = [self settingsField:[pud stringForKey:RPProxyUserKey] ?: @"" placeholder:@"用户名" frame:CGRectMake(20, y, halfW, 40) secure:NO];
+    BOOL hasPass = [[pud stringForKey:RPProxyPassKey] length] > 0;
+    self.proxyPassField = [self settingsField:@"" placeholder:hasPass ? @"已保存，留空不改" : @"密码" frame:CGRectMake(20 + halfW + 12, y, halfW, 40) secure:YES];
+    y += 52;
+
+    // ---- Video boards ----
+    UILabel *vsec = [[UILabel alloc] initWithFrame:CGRectMake(20, y, contentW, 28)];
+    vsec.font = [RPTheme title:18]; vsec.textColor = [RPTheme accent];
+    vsec.text = @"视频 · 相册视频 / 网络视频";
+    [self.settingsScroll addSubview:vsec];
+    y += 32;
+    UILabel *vnote = [[UILabel alloc] initWithFrame:CGRectMake(20, y, contentW, 40)];
+    vnote.font = [RPTheme small:14]; vnote.textColor = [RPTheme textDim]; vnote.numberOfLines = 2;
+    vnote.text = @"两个视频页默认不显示，到下面的页面列表里打开。每次随机播一段，播完再翻页。只支持 H.264 的 mp4 / mov / m4v。";
+    [self.settingsScroll addSubview:vnote];
+    y += 46;
+    NSDictionary *vcfg = RPVideoSettings();
+    self.videoAlbumLabel = [[UILabel alloc] initWithFrame:CGRectMake(20, y, contentW - 160, 40)];
+    self.videoAlbumLabel.font = [RPTheme body:15]; self.videoAlbumLabel.textColor = [RPTheme text];
+    self.videoAlbumId = vcfg[@"album"];
+    self.videoAlbumLabel.text = [vcfg[@"album"] length] ? @"相册视频: 已选相册" : @"相册视频: 跟随上面的相册，没有视频时用全部视频";
+    [self.settingsScroll addSubview:self.videoAlbumLabel];
+    UIButton *vpick = [UIButton buttonWithType:UIButtonTypeSystem];
+    vpick.frame = CGRectMake(sheetW - 160, y, 140, 40);
+    [vpick setTitle:@"选择相册" forState:UIControlStateNormal];
+    vpick.titleLabel.font = [RPTheme title:16];
+    [vpick setTitleColor:[RPTheme accent] forState:UIControlStateNormal];
+    [vpick addTarget:self action:@selector(pickVideoAlbum) forControlEvents:UIControlEventTouchUpInside];
+    [self.settingsScroll addSubview:vpick];
+    y += 50;
+    UILabel *vdl = [[UILabel alloc] initWithFrame:CGRectMake(20, y, contentW, 22)];
+    vdl.font = [RPTheme small:14]; vdl.textColor = [RPTheme textDim];
+    vdl.text = @"网络视频目录（HTTP 目录或 WebDAV，例如 http://192.168.28.30/videos/）";
+    [self.settingsScroll addSubview:vdl];
+    y += 26;
+    self.videoDirField = [self settingsField:vcfg[@"http"] ?: @"" placeholder:@"http://NAS地址:端口/视频目录/" frame:CGRectMake(20, y, contentW, 40) secure:NO];
+    self.videoDirField.keyboardType = UIKeyboardTypeURL;
+    y += 48;
+    BOOL hasVPass = [vcfg[@"http_pass"] length] > 0;
+    self.videoUserField = [self settingsField:vcfg[@"http_user"] ?: @"" placeholder:@"目录用户名（可选）" frame:CGRectMake(20, y, halfW, 40) secure:NO];
+    self.videoPassField = [self settingsField:@"" placeholder:hasVPass ? @"已保存，留空不改" : @"目录密码（可选）" frame:CGRectMake(20 + halfW + 12, y, halfW, 40) secure:YES];
+    y += 50;
+    UILabel *vml = [[UILabel alloc] initWithFrame:CGRectMake(20, y, 220, 36)];
+    vml.font = [RPTheme body:15]; vml.textColor = [RPTheme text];
+    vml.text = @"播放时静音（默认）";
+    [self.settingsScroll addSubview:vml];
+    self.videoMuteSwitch = [[UISwitch alloc] initWithFrame:CGRectMake(240, y + 2, 51, 31)];
+    self.videoMuteSwitch.on = [vcfg[@"muted"] boolValue];
+    self.videoMuteSwitch.onTintColor = [RPTheme accent];
+    [self.settingsScroll addSubview:self.videoMuteSwitch];
+    UILabel *vmax = [[UILabel alloc] initWithFrame:CGRectMake(320, y, 200, 36)];
+    vmax.font = [RPTheme body:15]; vmax.textColor = [RPTheme text];
+    vmax.text = @"最长播放（分，0=播完）";
+    [self.settingsScroll addSubview:vmax];
+    self.videoMaxField = [self settingsField:[NSString stringWithFormat:@"%ld", (long)[vcfg[@"max"] integerValue]] placeholder:@"0" frame:CGRectMake(520, y, 80, 36) secure:NO];
+    self.videoMaxField.keyboardType = UIKeyboardTypeNumberPad;
+    y += 52;
+
     UILabel *tl = [[UILabel alloc] initWithFrame:CGRectMake(20, y, contentW, 22)];
     tl.font = [RPTheme small:14]; tl.textColor = [RPTheme textDim];
     tl.text = @"走马灯消息地址（JSON、纯文本或 RSS。留空则不显示）";
@@ -1013,6 +1131,23 @@ static NSString *RPStringish(id value) {
     self.tickerRefreshControl.tintColor = [RPTheme accent];
     [self.settingsScroll addSubview:self.tickerRefreshControl];
     y += 46;
+
+    // Test the whole notice path: chime, banner, ✉ badge, then the 10-minute reminder.
+    UIButton *testNote = [UIButton buttonWithType:UIButtonTypeSystem];
+    testNote.frame = CGRectMake(20, y, 200, 40);
+    [testNote setTitle:@"发一条测试提醒" forState:UIControlStateNormal];
+    testNote.titleLabel.font = [RPTheme title:16];
+    [testNote setTitleColor:[RPTheme accent] forState:UIControlStateNormal];
+    testNote.layer.borderColor = [RPTheme accent].CGColor;
+    testNote.layer.borderWidth = 1.5;
+    testNote.layer.cornerRadius = 8;
+    [testNote addTarget:self action:@selector(testNotice) forControlEvents:UIControlEventTouchUpInside];
+    [self.settingsScroll addSubview:testNote];
+    UILabel *testHint = [[UILabel alloc] initWithFrame:CGRectMake(232, y - 2, contentW - 212, 44)];
+    testHint.font = [RPTheme small:13]; testHint.textColor = [RPTheme textDim]; testHint.numberOfLines = 2;
+    testHint.text = @"关闭设置并模拟收到一条消息：响一声、弹悬浮条、✉ 角标 +1。不点 ✉ 的话，10 分钟后会再短响一次。22:00–7:00 不响。";
+    [self.settingsScroll addSubview:testHint];
+    y += 52;
 
     NSUserDefaults *prefs = [NSUserDefaults standardUserDefaults];
     UILabel *vl = [[UILabel alloc] initWithFrame:CGRectMake(20, y, contentW, 22)];
@@ -1459,6 +1594,14 @@ static NSString *RPStringish(id value) {
     self.vpsRefreshControl = nil;
     self.settingsDefs = nil;
     self.proxyField = nil;
+    self.proxyUserField = nil;
+    self.proxyPassField = nil;
+    self.videoAlbumLabel = nil;
+    self.videoDirField = nil;
+    self.videoUserField = nil;
+    self.videoPassField = nil;
+    self.videoMuteSwitch = nil;
+    self.videoMaxField = nil;
     self.tickerField = nil;
     self.tickerProxySwitch = nil;
     self.tickerRefreshControl = nil;
@@ -1481,6 +1624,21 @@ static NSString *RPStringish(id value) {
     self.dwellOverride = [self.dwellField.text integerValue];
     NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
     [ud setObject:self.proxyField.text ?: @"" forKey:kProxyKey];
+    if (self.proxyUserField) {
+        NSString *pu = [self.proxyUserField.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]] ?: @"";
+        [ud setObject:pu forKey:RPProxyUserKey];
+        // Empty password box keeps the saved one; clearing the username also forgets the password.
+        if (self.proxyPassField.text.length) [ud setObject:self.proxyPassField.text forKey:RPProxyPassKey];
+        if (pu.length == 0) [ud removeObjectForKey:RPProxyPassKey];
+    }
+    if (self.videoDirField) {
+        NSString *vu = [self.videoUserField.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]] ?: @"";
+        NSString *vp = self.videoPassField.text.length ? self.videoPassField.text : (vu.length ? nil : @"");
+        RPVideoSaveNetwork([self.videoDirField.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]], vu, vp);
+        RPVideoSaveAlbum(self.videoAlbumId);
+        RPVideoSetMuted(self.videoMuteSwitch.on);
+        RPVideoSaveMaxMinutes([self.videoMaxField.text integerValue]);
+    }
     [ud setObject:self.tickerField.text ?: @"" forKey:RPTickerURLKey];
     [ud setBool:self.tickerProxySwitch.on forKey:RPTickerProxyKey];
     if (self.tickerRefreshControl) {
@@ -1552,6 +1710,51 @@ static NSString *RPStringish(id value) {
     // that feed's TTL ran out (up to 6 h for weather). The browser path already did this.
     [[RPLocalFeed sharedFeed] invalidateForSettingsChange];
     [self pollNow];
+}
+
+- (UITextField *)settingsField:(NSString *)text placeholder:(NSString *)placeholder frame:(CGRect)frame secure:(BOOL)secure {
+    UITextField *f = [[UITextField alloc] initWithFrame:frame];
+    f.backgroundColor = [RPTheme bg];
+    f.textColor = [RPTheme text];
+    f.font = [RPTheme mono:15];
+    f.text = text;
+    f.placeholder = placeholder;
+    f.secureTextEntry = secure;
+    f.autocapitalizationType = UITextAutocapitalizationTypeNone;
+    f.autocorrectionType = UITextAutocorrectionTypeNo;
+    f.delegate = self;
+    f.layer.cornerRadius = 6;
+    f.leftView = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 8, frame.size.height)];
+    f.leftViewMode = UITextFieldViewModeAlways;
+    [self.settingsScroll addSubview:f];
+    return f;
+}
+
+- (void)pickVideoAlbum {
+    __weak typeof(self) weakSelf = self;
+    [self.photos ensureAuthorization:^(BOOL granted) {
+        if (!granted) {
+            weakSelf.videoAlbumLabel.text = @"无相册权限，请到系统设置开启";
+            return;
+        }
+        UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"相册视频用哪个相册" message:nil preferredStyle:UIAlertControllerStyleActionSheet];
+        [ac addAction:[UIAlertAction actionWithTitle:@"跟随照片相册（没有视频时用全部视频）" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+            weakSelf.videoAlbumId = @"";
+            weakSelf.videoAlbumLabel.text = @"相册视频: 跟随上面的相册，没有视频时用全部视频";
+        }]];
+        for (PHAssetCollection *c in [weakSelf.photos allAlbums]) {
+            NSString *t = [weakSelf.photos titleForCollection:c] ?: @"相册";
+            NSString *lid = c.localIdentifier;
+            [ac addAction:[UIAlertAction actionWithTitle:t style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+                weakSelf.videoAlbumId = lid;
+                weakSelf.videoAlbumLabel.text = [NSString stringWithFormat:@"相册视频: %@", t];
+            }]];
+        }
+        [ac addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+        ac.popoverPresentationController.sourceView = weakSelf.videoAlbumLabel;
+        ac.popoverPresentationController.sourceRect = weakSelf.videoAlbumLabel.bounds;
+        [weakSelf presentViewController:ac animated:YES completion:nil];
+    }];
 }
 
 - (void)pickAlbum {

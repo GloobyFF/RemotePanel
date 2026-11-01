@@ -176,11 +176,31 @@ static BOOL RPReadFull(int fd, void *buf, size_t len) {
     return YES;
 }
 
-static BOOL RPSOCKS5(int fd, NSString *host, NSInteger port) {
-    uint8_t greet[3] = {0x05, 0x01, 0x00};
-    if (!RPWriteRaw(fd, greet, sizeof(greet))) return NO;
+static BOOL RPSOCKS5(int fd, NSString *host, NSInteger port, NSString *user, NSString *pass) {
+    BOOL auth = user.length > 0;
+    // Offer "no auth" and, when we have a username, RFC 1929 username/password.
+    uint8_t greet[4] = {0x05, auth ? 0x02 : 0x01, 0x00, 0x02};
+    if (!RPWriteRaw(fd, greet, auth ? 4 : 3)) return NO;
     uint8_t greetr[2] = {0};
-    if (!RPReadFull(fd, greetr, sizeof(greetr)) || greetr[0] != 0x05 || greetr[1] != 0x00) return NO;
+    if (!RPReadFull(fd, greetr, sizeof(greetr)) || greetr[0] != 0x05) return NO;
+    if (greetr[1] == 0x02) {
+        if (!auth) return NO;
+        NSData *u = [user dataUsingEncoding:NSUTF8StringEncoding];
+        NSData *p = [pass ?: @"" dataUsingEncoding:NSUTF8StringEncoding];
+        if (u.length == 0 || u.length > 255 || p.length > 255) return NO;
+        NSMutableData *req = [NSMutableData data];
+        uint8_t ver = 0x01, ul = (uint8_t)u.length, pl = (uint8_t)p.length;
+        [req appendBytes:&ver length:1];
+        [req appendBytes:&ul length:1];
+        [req appendData:u];
+        [req appendBytes:&pl length:1];
+        [req appendData:p];
+        if (!RPWriteRaw(fd, req.bytes, req.length)) return NO;
+        uint8_t ar[2] = {0};
+        if (!RPReadFull(fd, ar, sizeof(ar)) || ar[1] != 0x00) return NO;
+    } else if (greetr[1] != 0x00) {
+        return NO;
+    }
     NSData *name = [host dataUsingEncoding:NSUTF8StringEncoding];
     if (name.length == 0 || name.length > 255) return NO;
     NSMutableData *req = [NSMutableData data];
@@ -211,8 +231,14 @@ static BOOL RPSOCKS5(int fd, NSString *host, NSInteger port) {
     return NO;
 }
 
-static BOOL RPHTTPConnect(int fd, NSString *host, NSInteger port) {
-    NSString *msg = [NSString stringWithFormat:@"CONNECT %@:%ld HTTP/1.1\r\nHost: %@:%ld\r\nProxy-Connection: keep-alive\r\n\r\n", host, (long)port, host, (long)port];
+static NSString *RPBasicAuth(NSString *user, NSString *pass) {
+    if (user.length == 0) return @"";
+    NSData *raw = [[NSString stringWithFormat:@"%@:%@", user, pass ?: @""] dataUsingEncoding:NSUTF8StringEncoding];
+    return [NSString stringWithFormat:@"Proxy-Authorization: Basic %@\r\n", [raw base64EncodedStringWithOptions:0]];
+}
+
+static BOOL RPHTTPConnect(int fd, NSString *host, NSInteger port, NSString *user, NSString *pass) {
+    NSString *msg = [NSString stringWithFormat:@"CONNECT %@:%ld HTTP/1.1\r\nHost: %@:%ld\r\n%@Proxy-Connection: keep-alive\r\n\r\n", host, (long)port, host, (long)port, RPBasicAuth(user, pass)];
     NSData *bytes = [msg dataUsingEncoding:NSUTF8StringEncoding];
     if (!RPWriteRaw(fd, bytes.bytes, bytes.length)) return NO;
     NSMutableData *buf = [NSMutableData data];
@@ -404,12 +430,18 @@ static NSData *RPExchange(int fd, BOOL tls, NSString *peerName, NSString *hostHe
     NSInteger code = 0;
     NSString *loc = nil;
     uint8_t tmp[8192];
+    /* Errors raised inside the @autoreleasepool below must be held by a strong
+       variable declared OUTSIDE it. Writing them straight to the caller's
+       (autoreleasing) NSError ** and returning from inside the pool let the pool
+       free the NSError before the caller read it: EXC_BAD_ACCESS in libobjc,
+       reported at -[RPBasePageVC loadImageURL:into:] whenever a cover download
+       timed out (builds 7–10). */
+    NSError *loopError = nil;
     while (raw.length < kRPMaxBody) {
         @autoreleasepool {
             if ([NSDate timeIntervalSinceReferenceDate] > deadline) {
-                if (ssl) CFRelease(ssl);
-                RPSetError(error, RPErr(14, [NSString stringWithFormat:@"读取超时，已有 %lu 字节", (unsigned long)raw.length]));
-                return nil;
+                loopError = RPErr(14, [NSString stringWithFormat:@"读取超时，已有 %lu 字节", (unsigned long)raw.length]);
+                break;
             }
             ssize_t n = -1;
             if (ssl) {
@@ -419,9 +451,8 @@ static NSData *RPExchange(int fd, BOOL tls, NSString *peerName, NSString *hostHe
                 else if (st == errSSLWouldBlock) continue;
                 else if (st == noErr || st == errSSLClosedGraceful || st == errSSLClosedNoNotify) n = 0;
                 else {
-                    if (ssl) CFRelease(ssl);
-                    RPSetError(error, RPErr(st, [NSString stringWithFormat:@"读取中断 (%d)，已有 %lu 字节", (int)st, (unsigned long)raw.length]));
-                    return nil;
+                    loopError = RPErr(st, [NSString stringWithFormat:@"读取中断 (%d)，已有 %lu 字节", (int)st, (unsigned long)raw.length]);
+                    break;
                 }
             } else {
                 if (!RPWaitSocket(fd, NO)) n = -1;
@@ -432,14 +463,17 @@ static NSData *RPExchange(int fd, BOOL tls, NSString *peerName, NSString *hostHe
             if (!RPMaybeComplete(raw, eof)) continue;
             BOOL ok = RPExtract(raw, eof, &body, &code, &loc, &done);
             if (!ok) {
-                if (ssl) CFRelease(ssl);
-                RPSetError(error, RPErr(12, @"响应无法解析"));
-                return nil;
+                loopError = RPErr(12, @"响应无法解析");
+                break;
             }
             if (done || eof) break;
         }
     }
     if (ssl) CFRelease(ssl);
+    if (loopError) {
+        RPSetError(error, loopError);
+        return nil;
+    }
     *status = code;
     if (location) *location = loc;
     if (!done) {
@@ -479,10 +513,17 @@ static NSData *RPFetch(NSString *urlString, NSString *method, NSData *bodyData, 
             RPSetError(error, RPErr(3, @"代理连不上"));
             return nil;
         }
-        BOOL tunneled = [pscheme hasPrefix:@"socks"] ? RPSOCKS5(fd, host, port) : RPHTTPConnect(fd, host, port);
+        // Credentials: "socks5://user:pass@host:port" in the URL, or the separate
+        // username/password settings (see RPProxyWithCredentials in RPLocalFeed).
+        // NSURL.user is already unescaped but .password is not; read both raw from
+        // NSURLComponents and unescape each exactly once ("a%25b" must stay "a%b").
+        NSURLComponents *pc = [NSURLComponents componentsWithURL:proxyURL resolvingAgainstBaseURL:NO];
+        NSString *puser = [pc.percentEncodedUser stringByRemovingPercentEncoding] ?: (pc.percentEncodedUser ?: @"");
+        NSString *ppass = [pc.percentEncodedPassword stringByRemovingPercentEncoding] ?: (pc.percentEncodedPassword ?: @"");
+        BOOL tunneled = [pscheme hasPrefix:@"socks"] ? RPSOCKS5(fd, host, port, puser, ppass) : RPHTTPConnect(fd, host, port, puser, ppass);
         if (!tunneled) {
             close(fd);
-            RPSetError(error, RPErr(4, @"代理隧道失败"));
+            RPSetError(error, RPErr(4, puser.length ? @"代理隧道失败（检查代理用户名和密码）" : @"代理隧道失败"));
             return nil;
         }
     } else {
@@ -533,6 +574,17 @@ static NSData *RPFetch(NSString *urlString, NSString *method, NSData *bodyData, 
                error:(NSError **)error {
     NSTimeInterval limit = timeout > 0 ? timeout : 40;
     return RPFetch(urlString, @"POST", body ?: [NSData data], proxy, headers, limit, 0, error);
+}
+
++ (NSData *)syncRequest:(NSString *)urlString
+                 method:(NSString *)method
+                   body:(NSData *)body
+                  proxy:(NSString *)proxy
+                headers:(NSDictionary *)headers
+                timeout:(NSTimeInterval)timeout
+                  error:(NSError **)error {
+    NSTimeInterval limit = timeout > 0 ? timeout : 20;
+    return RPFetch(urlString, method.length ? method : @"GET", body, proxy, headers, limit, 0, error);
 }
 
 + (void)GET:(NSString *)urlString
