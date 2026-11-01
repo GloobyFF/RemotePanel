@@ -34,7 +34,7 @@
 | UDID | `1b9b4d6959e9d533837d946d94105049dfd794a8` |
 | Team ID | `FLFYQXCCZM` |
 | RemotePanel | `com.glooby.RemotePanel`，版本 `2.0`，build **`9`** |
-| ZhangJieStocks | `com.glooby.ZhangJieStocks`，显示名「张洁股票」，版本 `1.0`，build `2`（未编译验证） |
+| ZhangJieStocks | `com.glooby.ZhangJieStocks`，显示名「张洁股票」，版本 `1.0`，build `3` |
 | Android | `com.glooby.remotepanel`，versionName `2.0.0`，versionCode `2` |
 
 签名摘要见 `ios/PROVISIONING-NOTES.txt`（不含密码）。
@@ -170,10 +170,19 @@ SSH 到 Build Mac 的凭证找 operator。
 独立的 Xcode 工程，位于 `ios/ZhangJieStocks/`，约束和 RemotePanel 相同（iOS 9.3、armv7、iPad、ObjC）。
 
 - 第一页是持仓汇总，之后每只股票一页，自动轮播。两种页面的停留时间分别存在 `ZJ.dwellSummary` 和 `ZJ.dwellStock`。
-- 行情来自东方财富 `push2.eastmoney.com/api/qt/ulist.np/get`。只在 A 股交易时段（工作日 9:30–11:30、13:00–15:00，北京时间）每 60 秒拉一次。
-- 持仓（代码、名称、买入价、股数）存在 NSUserDefaults 的 `ZJ.holdings`，最后一次行情存在 `ZJ.quotes`。第一次启动时会预置 5 只示例股票。
-- 设置：点底部「设置」按钮或长按，进入 `ZJSettingsVC`。
-- 仓库里**没有**它的编译安装脚本。可以照 `ios/build_install.sh` 改一份：改工程名、scheme、bundle ID，并给 `com.glooby.ZhangJieStocks` 配一个 provisioning profile。
+- **行情源**：先请求东方财富 `push2.eastmoney.com/api/qt/ulist.np/get`（超时 12 秒）。连不上、HTTP 出错，或者返回内容解析不出行情时，改用腾讯 `qt.gtimg.cn`（GBK 编码，按 `~` 分隔字段：1 名称、2 代码、3 现价、31 涨跌额、32 涨跌幅）。最近一次用的是哪个源存在 `ZJ.lastSource`，会显示在顶栏和个股页底部。
+- **拉取时段**：工作日 9:15–11:35、12:55–15:05（北京时间，`+shouldFetch`），每 60 秒一次，能拿到开盘和收盘集合竞价的价格。收盘后如果拉取失败，每 5 分钟重试一次。
+- **价格提醒**：
+  - 每只股票可以设"涨到 X"和"跌到 Y"两个价格，存在 `ZJ.holdings` 每一项的 `above` / `below` 里，0 表示不提醒。
+  - 每次拉到新行情后调用 `+[ZJStore checkAlerts]`。价格碰到界限就触发，同一方向每个交易日最多响一次；价格回到界限内 0.5% 以后才会重新生效。超过 30 分钟的旧行情不会触发提醒。
+  - 触发后：在屏幕上方显示红色横幅并闪烁，跳到这只股票的页面，`ZJChime` 响 3 遍"叮咚"。提示音是程序里现成生成的 WAV，不需要额外的声音文件。音频分类是 `AVAudioSessionCategoryPlayback`，侧边静音键打开时也会响。点一下横幅就关闭。
+  - 每天各方向是否已经响过，存在 `ZJ.alertState`。设置里的响铃总开关存在 `ZJ.alertSound`，默认开。
+- 持仓（代码、名称、买入价、股数、提醒价）存在 NSUserDefaults 的 `ZJ.holdings`，最后一次行情存在 `ZJ.quotes`。第一次启动时会预置 5 只示例股票。
+- 设置：点右上角「设置」按钮或长按屏幕，进入 `ZJSettingsVC`。每只股票一行，依次是买入价、股数、涨到提醒（红框）、跌到提醒（绿框），旁边显示现价。竖屏时提醒的两个输入框换到第二行。另有响铃开关和"试听"按钮。
+- **编译安装**：在 `.179` 上运行 `ios/ZhangJieStocks/build_install.sh`，需要设置 `SSHPASS`。
+  - 用的是团队通配描述文件 `b0f2eb7f…`（2027-10-31 到期），证书同样按指纹 `1DF5C614…` 指定。
+  - 这个描述文件由 Xcode 管理，xcodebuild 的手动签名不接受它。所以脚本先不签名编译，再用描述文件里的 entitlements（`application-identifier` 改成本 App 的）通过 codesign 签名。
+  - Mac 上的工程目录是 `~/Developer/ZhangJieStocks`，2026-11-01 改动前的备份在 `~/Developer/ZhangJieStocks.bak-20261101`。
 
 ---
 

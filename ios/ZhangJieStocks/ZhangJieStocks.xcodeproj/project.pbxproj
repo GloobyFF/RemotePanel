@@ -13,12 +13,14 @@
 		A1BF01000000000000000004 /* ZJQuote.m in Sources */ = {isa = PBXBuildFile; fileRef = A10100000000000000000004 /* ZJQuote.m */; };
 		A1BF01000000000000000005 /* ZJRootVC.m in Sources */ = {isa = PBXBuildFile; fileRef = A10100000000000000000005 /* ZJRootVC.m */; };
 		A1BF01000000000000000006 /* ZJSettingsVC.m in Sources */ = {isa = PBXBuildFile; fileRef = A10100000000000000000006 /* ZJSettingsVC.m */; };
+		A1BF01000000000000000007 /* ZJChime.m in Sources */ = {isa = PBXBuildFile; fileRef = A10100000000000000000007 /* ZJChime.m */; };
 		A1BF01000000000000000021 /* LaunchScreen.storyboard in Resources */ = {isa = PBXBuildFile; fileRef = A10100000000000000000021 /* LaunchScreen.storyboard */; };
 		A1BF01000000000000000040 /* Images.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = A10100000000000000000040 /* Images.xcassets */; };
 		F1BF01000000000000000001 /* UIKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = F10100000000000000000001 /* UIKit.framework */; };
 		F1BF01000000000000000002 /* Foundation.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = F10100000000000000000002 /* Foundation.framework */; };
 		F1BF01000000000000000003 /* CoreGraphics.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = F10100000000000000000003 /* CoreGraphics.framework */; };
 		F1BF01000000000000000004 /* QuartzCore.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = F10100000000000000000004 /* QuartzCore.framework */; };
+		F1BF01000000000000000005 /* AVFoundation.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = F10100000000000000000005 /* AVFoundation.framework */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -28,6 +30,8 @@
 		A10100000000000000000004 /* ZJQuote.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = ZJQuote.m; sourceTree = "<group>"; };
 		A10100000000000000000005 /* ZJRootVC.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = ZJRootVC.m; sourceTree = "<group>"; };
 		A10100000000000000000006 /* ZJSettingsVC.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = ZJSettingsVC.m; sourceTree = "<group>"; };
+		A10100000000000000000007 /* ZJChime.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = ZJChime.m; sourceTree = "<group>"; };
+		A10100000000000000000018 /* ZJChime.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = ZJChime.h; sourceTree = "<group>"; };
 		A10100000000000000000012 /* AppDelegate.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = AppDelegate.h; sourceTree = "<group>"; };
 		A10100000000000000000013 /* ZJStore.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = ZJStore.h; sourceTree = "<group>"; };
 		A10100000000000000000014 /* ZJQuote.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = ZJQuote.h; sourceTree = "<group>"; };
@@ -42,6 +46,7 @@
 		F10100000000000000000002 /* Foundation.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Foundation.framework; path = System/Library/Frameworks/Foundation.framework; sourceTree = SDKROOT; };
 		F10100000000000000000003 /* CoreGraphics.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = CoreGraphics.framework; path = System/Library/Frameworks/CoreGraphics.framework; sourceTree = SDKROOT; };
 		F10100000000000000000004 /* QuartzCore.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = QuartzCore.framework; path = System/Library/Frameworks/QuartzCore.framework; sourceTree = SDKROOT; };
+		F10100000000000000000005 /* AVFoundation.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = AVFoundation.framework; path = System/Library/Frameworks/AVFoundation.framework; sourceTree = SDKROOT; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -53,6 +58,7 @@
 				F1BF01000000000000000002 /* Foundation.framework in Frameworks */,
 				F1BF01000000000000000003 /* CoreGraphics.framework in Frameworks */,
 				F1BF01000000000000000004 /* QuartzCore.framework in Frameworks */,
+				F1BF01000000000000000005 /* AVFoundation.framework in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -74,6 +80,7 @@
 				F10100000000000000000002 /* Foundation.framework */,
 				F10100000000000000000003 /* CoreGraphics.framework */,
 				F10100000000000000000004 /* QuartzCore.framework */,
+				F10100000000000000000005 /* AVFoundation.framework */,
 			);
 			name = Frameworks;
 			sourceTree = "<group>";
@@ -93,6 +100,8 @@
 				A10100000000000000000006 /* ZJSettingsVC.m */,
 				A10100000000000000000016 /* ZJSettingsVC.h */,
 				A10100000000000000000017 /* ZJTheme.h */,
+				A10100000000000000000007 /* ZJChime.m */,
+				A10100000000000000000018 /* ZJChime.h */,
 				A10100000000000000000020 /* Info.plist */,
 				A10100000000000000000021 /* LaunchScreen.storyboard */,
 				A10100000000000000000040 /* Images.xcassets */,
@@ -186,6 +195,7 @@
 				A1BF01000000000000000004 /* ZJQuote.m in Sources */,
 				A1BF01000000000000000005 /* ZJRootVC.m in Sources */,
 				A1BF01000000000000000006 /* ZJSettingsVC.m in Sources */,
+				A1BF01000000000000000007 /* ZJChime.m in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

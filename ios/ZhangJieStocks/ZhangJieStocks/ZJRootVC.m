@@ -3,6 +3,7 @@
 #import "ZJQuote.h"
 #import "ZJStore.h"
 #import "ZJTheme.h"
+#import "ZJChime.h"
 
 @interface ZJRootVC ()
 @property (nonatomic, strong) UIView *chrome;
@@ -20,6 +21,10 @@
 @property (nonatomic, assign) NSTimeInterval lastFetchAt;
 @property (nonatomic, copy) NSString *lastError;
 @property (nonatomic, strong) NSTimer *tick;
+/** Red banner for triggered alerts; stays until tapped. */
+@property (nonatomic, strong) UIControl *alertBanner;
+@property (nonatomic, strong) UILabel *alertText;
+@property (nonatomic, strong) NSMutableArray<ZJAlert *> *pendingAlerts;
 @end
 
 @implementation ZJRootVC
@@ -57,7 +62,65 @@
     UILongPressGestureRecognizer *press = [[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(onLongPress:)];
     press.minimumPressDuration = 0.8;
     [self.view addGestureRecognizer:press];
+
+    self.pendingAlerts = [NSMutableArray array];
+    self.alertBanner = [[UIControl alloc] initWithFrame:CGRectZero];
+    self.alertBanner.backgroundColor = ZJUp();
+    self.alertBanner.layer.cornerRadius = 16;
+    self.alertBanner.layer.shadowColor = [UIColor blackColor].CGColor;
+    self.alertBanner.layer.shadowOpacity = 0.5;
+    self.alertBanner.layer.shadowRadius = 12;
+    self.alertBanner.hidden = YES;
+    [self.alertBanner addTarget:self action:@selector(dismissAlerts) forControlEvents:UIControlEventTouchUpInside];
+    self.alertText = ZJLabel(@"", 30, UIFontWeightBold, [UIColor whiteColor]);
+    self.alertText.numberOfLines = 0;
+    self.alertText.userInteractionEnabled = NO;
+    [self.alertBanner addSubview:self.alertText];
+    [self.view addSubview:self.alertBanner];
     self.dirty = YES;
+}
+
+#pragma mark - Price alerts
+
+- (void)handleAlerts:(NSArray<ZJAlert *> *)fired {
+    if (fired.count == 0) return;
+    [self.pendingAlerts addObjectsFromArray:fired];
+    while (self.pendingAlerts.count > 4) [self.pendingAlerts removeObjectAtIndex:0];
+    NSMutableArray *lines = [NSMutableArray array];
+    for (ZJAlert *a in self.pendingAlerts) {
+        [lines addObject:[NSString stringWithFormat:@"%@ %@ %@  现价 %@",
+                          a.name, a.above ? @"涨到" : @"跌到", ZJGrouped(a.limit), ZJGrouped(a.price)]];
+    }
+    [lines addObject:@"点这里关闭"];
+    self.alertText.text = [lines componentsJoinedByString:@"\n"];
+    self.alertBanner.hidden = NO;
+    [self.view bringSubviewToFront:self.alertBanner];
+    [self.view setNeedsLayout];
+    // Blink so it is noticed from across the room; stops when dismissed.
+    [self.alertBanner.layer removeAllAnimations];
+    self.alertBanner.alpha = 1;
+    [UIView animateWithDuration:0.6 delay:0 options:UIViewAnimationOptionAutoreverse | UIViewAnimationOptionRepeat | UIViewAnimationOptionAllowUserInteraction animations:^{
+        self.alertBanner.alpha = 0.55;
+    } completion:nil];
+    if ([ZJStore alertSoundOn]) [ZJChime ring:3];
+    // Jump to the first triggered stock's page.
+    ZJAlert *first = fired.firstObject;
+    for (NSInteger i = 0; i < (NSInteger)self.holdings.count; i++) {
+        if ([self.holdings[i].code isEqualToString:first.code]) {
+            self.index = i + 1;
+            [self restartDwell];
+            self.dirty = YES;
+            break;
+        }
+    }
+}
+
+- (void)dismissAlerts {
+    [ZJChime stop];
+    [self.pendingAlerts removeAllObjects];
+    [self.alertBanner.layer removeAllAnimations];
+    self.alertBanner.alpha = 1;
+    self.alertBanner.hidden = YES;
 }
 
 - (UIButton *)iconButton:(NSString *)title action:(SEL)action {
@@ -112,8 +175,11 @@
         fmt.dateFormat = @"HH:mm";
     });
     self.clockLabel.text = [fmt stringFromDate:[NSDate date]];
-    self.statusLabel.text = [ZJStore marketIsOpen] ? @"交易中" : @"未开盘";
-    self.statusLabel.textColor = [ZJStore marketIsOpen] ? ZJUp() : ZJDim();
+    NSString *src = [ZJStore lastSource];
+    NSString *session = [ZJStore marketIsOpen] ? @"交易中" : @"未开盘";
+    // Show which feed answered, so a switch to the backup is visible.
+    self.statusLabel.text = src.length ? [NSString stringWithFormat:@"%@ · %@", session, src] : session;
+    self.statusLabel.textColor = self.lastError.length ? ZJUp() : ([ZJStore marketIsOpen] ? ZJUp() : ZJDim());
     NSInteger pages = [self pageCount];
     self.indexLabel.text = [NSString stringWithFormat:@"%ld/%ld", (long)(self.index + 1), (long)pages];
     if (pages > 1) {
@@ -143,6 +209,7 @@
         self.holdings = [ZJStore holdings];
         self.lastError = ok ? nil : error;
         self.dirty = YES;
+        if (ok) [self handleAlerts:[ZJStore checkAlerts]];
         [self.view setNeedsLayout];
     }];
 }
@@ -195,6 +262,13 @@
     self.chrome.frame = CGRectMake(0, 0, b.size.width, 64);
     self.board.frame = CGRectMake(0, 64, b.size.width, b.size.height - 64);
     [self layoutChrome];
+    if (!self.alertBanner.hidden) {
+        CGFloat bw = MIN(b.size.width - 48, 820);
+        CGSize fit = [self.alertText sizeThatFits:CGSizeMake(bw - 48, CGFLOAT_MAX)];
+        CGFloat bh = MIN(b.size.height * 0.6, fit.height + 40);
+        self.alertBanner.frame = CGRectMake((b.size.width - bw) / 2.0, 80, bw, bh);
+        self.alertText.frame = CGRectMake(24, 20, bw - 48, bh - 40);
+    }
     if (self.dirty || !CGSizeEqualToSize(self.board.bounds.size, self.laidOut)) {
         self.laidOut = self.board.bounds.size;
         self.dirty = NO;
@@ -213,8 +287,9 @@
     gear.frame = CGRectMake(w - 128, 6, 64, h - 12);
     self.clockLabel.frame = CGRectMake(w - 220, 0, 84, h);
     self.indexLabel.frame = CGRectMake(w - 300, 0, 72, h);
-    self.statusLabel.frame = CGRectMake(w - 430, 0, 120, h);
-    self.titleLabel.frame = CGRectMake(68, 0, MAX(40, w - 520), h);
+    // Wider than before: "交易中 · 东方财富".
+    self.statusLabel.frame = CGRectMake(w - 490, 0, 180, h);
+    self.titleLabel.frame = CGRectMake(68, 0, MAX(40, w - 580), h);
 }
 
 - (void)render {
@@ -282,6 +357,11 @@
     UILabel *name = ZJLabel(h.name.length ? h.name : h.code, hgt * 0.16, UIFontWeightSemibold, ZJText());
     UILabel *px = ZJLabel(has ? ZJGrouped(price) : @"—", hgt * 0.26, UIFontWeightBold, has ? ZJMove(pct) : ZJDim());
     UILabel *mv = ZJLabel(has ? ZJPct(pct) : h.code, hgt * 0.16, UIFontWeightSemibold, has ? ZJMove(pct) : ZJDim());
+    if (h.alertAbove > 0 || h.alertBelow > 0) {
+        UILabel *bell = ZJLabel(@"🔔", 22, UIFontWeightRegular, ZJText());
+        bell.frame = CGRectMake(frame.size.width - 40, 8, 32, 30);
+        [card addSubview:bell];
+    }
     NSString *pnl = @"";
     UIColor *pnlColor = ZJDim();
     if (has && h.buyPrice > 0 && h.shares > 0) {
@@ -360,9 +440,18 @@
             [self.board addSubview:all];
         }
     }
+    NSMutableArray *alertBits = [NSMutableArray array];
+    if (h.alertAbove > 0) [alertBits addObject:[NSString stringWithFormat:@"涨到 %@ 提醒", ZJGrouped(h.alertAbove)]];
+    if (h.alertBelow > 0) [alertBits addObject:[NSString stringWithFormat:@"跌到 %@ 提醒", ZJGrouped(h.alertBelow)]];
+    if (alertBits.count) {
+        UILabel *al = ZJLabel([@"🔔 " stringByAppendingString:[alertBits componentsJoinedByString:@"    "]], 22, UIFontWeightSemibold, ZJText());
+        al.frame = CGRectMake(inset, H - 72, W - inset * 2, 30);
+        [self.board addSubview:al];
+    }
     NSString *stamp = [self stamp:q];
     if (stamp.length) {
-        UILabel *foot = ZJLabel(stamp, 16, UIFontWeightMedium, ZJDim());
+        NSString *src = [ZJStore lastSource];
+        UILabel *foot = ZJLabel(src.length ? [NSString stringWithFormat:@"%@ · 来源 %@", stamp, src] : stamp, 16, UIFontWeightMedium, ZJDim());
         foot.frame = CGRectMake(inset, H - 36, W - inset * 2, 24);
         [self.board addSubview:foot];
     }

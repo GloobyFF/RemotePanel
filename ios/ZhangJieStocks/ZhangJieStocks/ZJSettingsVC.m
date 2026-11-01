@@ -2,12 +2,15 @@
 #import "ZJQuote.h"
 #import "ZJStore.h"
 #import "ZJTheme.h"
+#import "ZJChime.h"
 
 @interface ZJEditRow : NSObject
 @property (nonatomic, copy) NSString *code;
 @property (nonatomic, copy) NSString *name;
 @property (nonatomic, strong) UITextField *buy;
 @property (nonatomic, strong) UITextField *shares;
+@property (nonatomic, strong) UITextField *above;
+@property (nonatomic, strong) UITextField *below;
 @end
 
 @implementation ZJEditRow
@@ -19,6 +22,7 @@
 @property (nonatomic, strong) UITextField *stockField;
 @property (nonatomic, strong) UITextField *addCode;
 @property (nonatomic, strong) NSMutableArray<ZJEditRow *> *rows;
+@property (nonatomic, strong) UISwitch *soundSwitch;
 @property (nonatomic, assign) BOOL built;
 @end
 
@@ -84,6 +88,8 @@
 }
 
 - (void)reloadForm {
+    NSMutableDictionary<NSString *, ZJEditRow *> *drafts = [NSMutableDictionary dictionary];
+    for (ZJEditRow *r in self.rows) if (r.code.length) drafts[r.code] = r;
     for (UIView *sub in [self.scroll.subviews copy]) [sub removeFromSuperview];
     [self.rows removeAllObjects];
     CGFloat W = self.view.bounds.size.width > 10 ? self.view.bounds.size.width : 1024;
@@ -122,7 +128,26 @@
     [self.scroll addSubview:add];
     y += 68;
 
-    UILabel *listCap = [self caption:@"买入价和股数。股数留空就只显示每股赚多少。"];
+    UILabel *soundCap = [self caption:@"价格提醒响铃（静音键打开时也会响）"];
+    soundCap.frame = CGRectMake(x, y, rowW, 28);
+    [self.scroll addSubview:soundCap];
+    y += 34;
+    self.soundSwitch = [[UISwitch alloc] init];
+    self.soundSwitch.on = [ZJStore alertSoundOn];
+    self.soundSwitch.frame = CGRectMake(x, y + 6, 60, 32);
+    [self.scroll addSubview:self.soundSwitch];
+    UIButton *test = [UIButton buttonWithType:UIButtonTypeSystem];
+    [test setTitle:@"试听" forState:UIControlStateNormal];
+    [test setTitleColor:ZJText() forState:UIControlStateNormal];
+    test.titleLabel.font = [UIFont systemFontOfSize:20 weight:UIFontWeightSemibold];
+    test.backgroundColor = ZJCard();
+    test.layer.cornerRadius = 8;
+    test.frame = CGRectMake(x + 80, y, 100, 44);
+    [test addTarget:self action:@selector(testChime) forControlEvents:UIControlEventTouchUpInside];
+    [self.scroll addSubview:test];
+    y += 68;
+
+    UILabel *listCap = [self caption:@"买入价、股数，和价格提醒。提醒留空就是不提醒；每天每个方向最多响一次。"];
     listCap.frame = CGRectMake(x, y, rowW, 28);
     [self.scroll addSubview:listCap];
     y += 36;
@@ -144,14 +169,39 @@
         [del addTarget:self action:@selector(deleteRow:) forControlEvents:UIControlEventTouchUpInside];
         [self.scroll addSubview:del];
         y += 36;
-        row.buy = [self field:(h.buyPrice > 0 ? ZJGrouped(h.buyPrice) : @"") placeholder:@"买入价" width:180];
-        row.shares = [self field:(h.shares > 0 ? ZJSharesText(h.shares) : @"") placeholder:@"股数" width:140];
-        row.buy.frame = CGRectMake(x, y, 200, 44);
-        row.shares.frame = CGRectMake(x + 216, y, 160, 44);
+        // Keep what was typed but not saved yet (the old reload wiped it after "添加").
+        ZJEditRow *draft = drafts[h.code];
+        row.buy = [self field:draft ? draft.buy.text : (h.buyPrice > 0 ? ZJGrouped(h.buyPrice) : @"") placeholder:@"买入价" width:180];
+        row.shares = [self field:draft ? draft.shares.text : (h.shares > 0 ? ZJSharesText(h.shares) : @"") placeholder:@"股数" width:140];
+        row.above = [self field:draft ? draft.above.text : (h.alertAbove > 0 ? ZJGrouped(h.alertAbove) : @"") placeholder:@"涨到…提醒" width:180];
+        row.below = [self field:draft ? draft.below.text : (h.alertBelow > 0 ? ZJGrouped(h.alertBelow) : @"") placeholder:@"跌到…提醒" width:180];
+        // One line in landscape (≥ 900 pt); portrait puts the alert fields on a second line.
+        BOOL oneLine = rowW >= 860;
+        row.buy.frame = CGRectMake(x, y, 180, 44);
+        row.shares.frame = CGRectMake(x + 192, y, 140, 44);
+        CGFloat ax = oneLine ? x + 352 : x;
+        CGFloat ay = oneLine ? y : y + 52;
+        // Up / down limits in the market colours: red for "rises to", green for "falls to".
+        row.above.frame = CGRectMake(ax, ay, 180, 44);
+        row.below.frame = CGRectMake(ax + 192, ay, 180, 44);
+        row.above.layer.borderColor = ZJUp().CGColor;
+        row.above.layer.borderWidth = 1.5;
+        row.below.layer.borderColor = ZJDown().CGColor;
+        row.below.layer.borderWidth = 1.5;
         [self.scroll addSubview:row.buy];
         [self.scroll addSubview:row.shares];
+        [self.scroll addSubview:row.above];
+        [self.scroll addSubview:row.below];
+        NSDictionary *q = [ZJStore quoteForCode:h.code];
+        double price = [q[@"price"] doubleValue];
+        if (price > 0) {
+            UILabel *now = [self caption:[NSString stringWithFormat:@"现价 %@", ZJGrouped(price)]];
+            CGFloat nx = ax + 384;
+            now.frame = CGRectMake(nx, ay, MAX(80, x + rowW - nx), 44);
+            [self.scroll addSubview:now];
+        }
         [self.rows addObject:row];
-        y += 60;
+        y += oneLine ? 60 : 112;
     }
     self.scroll.contentSize = CGSizeMake(W, y + 40);
 }
@@ -174,9 +224,16 @@
         h.name = row.name;
         h.buyPrice = [self numberFrom:row.buy];
         h.shares = [self numberFrom:row.shares];
+        h.alertAbove = [self numberFrom:row.above];
+        h.alertBelow = [self numberFrom:row.below];
         [holds addObject:h];
     }
     [ZJStore saveHoldings:holds];
+    if (self.soundSwitch) [ZJStore setAlertSoundOn:self.soundSwitch.on];
+}
+
+- (void)testChime {
+    [ZJChime ring:1];
 }
 
 - (void)addStock {
@@ -197,9 +254,11 @@
     [ZJStore saveHoldings:holds];
     self.addCode.text = @"";
     [self reloadForm];
+    __weak ZJSettingsVC *weak = self;
     [ZJQuote refreshNow:^(BOOL ok, NSString *error) {
         (void)ok; (void)error;
-        [self reloadForm];
+        // Reload for the fetched name and price; reloadForm keeps typed drafts.
+        [weak reloadForm];
     }];
 }
 

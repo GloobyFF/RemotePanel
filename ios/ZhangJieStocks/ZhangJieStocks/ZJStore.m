@@ -3,10 +3,17 @@
 @implementation ZJHolding
 @end
 
+@implementation ZJAlert
+@end
+
 static NSString *const kHold = @"ZJ.holdings";
 static NSString *const kQuotes = @"ZJ.quotes";
 static NSString *const kDwellSum = @"ZJ.dwellSummary";
 static NSString *const kDwellStock = @"ZJ.dwellStock";
+static NSString *const kSource = @"ZJ.lastSource";
+static NSString *const kAlertSound = @"ZJ.alertSound";
+/** code → { "above": "yyyy-MM-dd" | "", "below": … } — the day each side last fired. */
+static NSString *const kAlertState = @"ZJ.alertState";
 
 @implementation ZJStore
 
@@ -33,6 +40,8 @@ static NSString *const kDwellStock = @"ZJ.dwellStock";
     if (h.name.length == 0) h.name = h.code;
     h.buyPrice = [row[@"buy"] doubleValue];
     h.shares = [row[@"shares"] doubleValue];
+    h.alertAbove = [row[@"above"] doubleValue];
+    h.alertBelow = [row[@"below"] doubleValue];
     return h;
 }
 
@@ -42,6 +51,8 @@ static NSString *const kDwellStock = @"ZJ.dwellStock";
         @"name": h.name ?: @"",
         @"buy": @(h.buyPrice),
         @"shares": @(h.shares),
+        @"above": @(MAX(0, h.alertAbove)),
+        @"below": @(MAX(0, h.alertBelow)),
     };
 }
 
@@ -139,6 +150,82 @@ static NSString *const kDwellStock = @"ZJ.dwellStock";
 + (void)setDwellSummary:(NSInteger)summary stock:(NSInteger)stock {
     [[self ud] setInteger:MAX(5, summary) forKey:kDwellSum];
     [[self ud] setInteger:MAX(5, stock) forKey:kDwellStock];
+}
+
++ (NSString *)lastSource {
+    NSString *s = [[self ud] stringForKey:kSource];
+    return s.length ? s : @"";
+}
+
++ (void)setLastSource:(NSString *)source {
+    [[self ud] setObject:source ?: @"" forKey:kSource];
+}
+
++ (BOOL)alertSoundOn {
+    id v = [[self ud] objectForKey:kAlertSound];
+    return v ? [v boolValue] : YES;
+}
+
++ (void)setAlertSoundOn:(BOOL)on {
+    [[self ud] setBool:on forKey:kAlertSound];
+}
+
++ (NSString *)tradingDay {
+    static NSDateFormatter *fmt;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        fmt = [[NSDateFormatter alloc] init];
+        fmt.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
+        fmt.timeZone = [NSTimeZone timeZoneWithName:@"Asia/Shanghai"];
+        fmt.dateFormat = @"yyyy-MM-dd";
+    });
+    return [fmt stringFromDate:[NSDate date]];
+}
+
++ (NSArray<ZJAlert *> *)checkAlerts {
+    NSString *today = [self tradingDay];
+    NSMutableDictionary *state = [[[self ud] dictionaryForKey:kAlertState] mutableCopy] ?: [NSMutableDictionary dictionary];
+    NSMutableArray<ZJAlert *> *fired = [NSMutableArray array];
+    NSTimeInterval now = [NSDate date].timeIntervalSince1970;
+    for (ZJHolding *h in [self holdings]) {
+        NSDictionary *q = [self quoteForCode:h.code];
+        double price = [q[@"price"] doubleValue];
+        if (price <= 0) continue;
+        // Ignore a quote older than 30 min: e.g. yesterday's close seen at 9:00 must
+        // not fire today's alert before trading starts.
+        if (now - [q[@"at"] doubleValue] > 30 * 60) continue;
+        NSMutableDictionary *s = [state[h.code] isKindOfClass:[NSDictionary class]] ? [state[h.code] mutableCopy] : [NSMutableDictionary dictionary];
+        for (int side = 0; side < 2; side++) {
+            BOOL above = side == 0;
+            double limit = above ? h.alertAbove : h.alertBelow;
+            NSString *key = above ? @"above" : @"below";
+            if (limit <= 0) {
+                [s removeObjectForKey:key];
+                continue;
+            }
+            BOOL crossed = above ? price >= limit : price <= limit;
+            // Re-arm once the price is back 0.5% inside the line.
+            double band = limit * 0.005;
+            BOOL clear = above ? price < limit - band : price > limit + band;
+            NSString *firedOn = [s[key] isKindOfClass:[NSString class]] ? s[key] : @"";
+            if (crossed && ![firedOn isEqualToString:today]) {
+                ZJAlert *a = [[ZJAlert alloc] init];
+                a.code = h.code;
+                a.name = h.name.length ? h.name : h.code;
+                a.above = above;
+                a.limit = limit;
+                a.price = price;
+                a.at = now;
+                [fired addObject:a];
+                s[key] = today;
+            } else if (clear && firedOn.length) {
+                s[key] = @"";
+            }
+        }
+        state[h.code] = s;
+    }
+    [[self ud] setObject:state forKey:kAlertState];
+    return fired;
 }
 
 @end
