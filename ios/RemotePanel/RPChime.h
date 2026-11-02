@@ -7,6 +7,8 @@
 + (void)arrival;
 /** One short soft beep, for the every-10-minutes unread reminder. */
 + (void)nudge;
+/** Short click when a card is tapped. Not silenced at night: the person just tapped. */
++ (void)tap;
 /** 22:00–7:00 local time: show the banner but stay silent. */
 + (BOOL)isQuietHours;
 @end

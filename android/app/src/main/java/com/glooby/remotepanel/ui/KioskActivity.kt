@@ -78,7 +78,7 @@ class KioskActivity : AppCompatActivity() {
 
     private val clockTick = object : Runnable {
         override fun run() {
-            clockLabel.text = SimpleDateFormat("HH:mm", Locale.CHINA).format(Date())
+            Roll.clock(clockLabel, SimpleDateFormat("HH:mm", Locale.CHINA).format(Date()))
             val today = SimpleDateFormat("yyyyMMdd", Locale.US).format(Date())
             if (today != dayKey) {
                 dayKey = today
@@ -136,6 +136,7 @@ class KioskActivity : AppCompatActivity() {
         rebuildRoster()
         rosterKey = roster.joinToString(",") { it.id }
         showPage(0)
+        if (roster.firstOrNull()?.id != "local-video") Motion.enter(pageHost)
         refreshFeed()
         handler.post(clockTick)
         handler.postDelayed(pollTick, 30_000L)
@@ -374,15 +375,24 @@ class KioskActivity : AppCompatActivity() {
 
     private fun turnBy(delta: Int) {
         if (transitioning || roster.isEmpty()) return
+        val next = Math.floorMod(index + delta, roster.size)
+        val cut = roster[index].id == "local-video" || roster[next].id == "local-video"
+        if (cut) {
+            showPage(next)
+            return
+        }
         transitioning = true
         handler.removeCallbacks(dwellTick)
-        val travel = pageHost.width.coerceAtLeast(1).toFloat() * 0.2f
-        val dir = if (delta >= 0) 1f else -1f
+        Motion.cancel(pageHost)
+        pageHost.pivotX = pageHost.width / 2f
+        pageHost.pivotY = pageHost.height / 2f
         pageHost.animate().cancel()
-        pageHost.animate().translationX(-dir * travel).alpha(0f).setDuration(220).withEndAction {
-            showPage(index + delta)
-            pageHost.translationX = dir * travel
-            pageHost.animate().translationX(0f).alpha(1f).setDuration(320).withEndAction { transitioning = false }.start()
+        pageHost.animate().scaleX(0.92f).scaleY(0.92f).alpha(0f).setDuration(200).withEndAction {
+            pageHost.scaleX = 1f
+            pageHost.scaleY = 1f
+            pageHost.alpha = 1f
+            showPage(next)
+            Motion.enter(pageHost) { transitioning = false }
         }.start()
     }
 

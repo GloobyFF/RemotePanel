@@ -38,6 +38,7 @@
 		F10BF0000000000000000000 /* EventKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = F10000000000000000000000 /* EventKit.framework */; };
 		F11BF0000000000000000000 /* ImageIO.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = F11000000000000000000000 /* ImageIO.framework */; };
 		F12BF0000000000000000000 /* AVFoundation.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = F12000000000000000000000 /* AVFoundation.framework */; };
+		F13BF0000000000000000000 /* CoreMedia.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = F13000000000000000000000 /* CoreMedia.framework */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -82,6 +83,7 @@
 		F10000000000000000000000 /* EventKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = EventKit.framework; path = System/Library/Frameworks/EventKit.framework; sourceTree = SDKROOT; };
 		F11000000000000000000000 /* ImageIO.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = ImageIO.framework; path = System/Library/Frameworks/ImageIO.framework; sourceTree = SDKROOT; };
 		F12000000000000000000000 /* AVFoundation.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = AVFoundation.framework; path = System/Library/Frameworks/AVFoundation.framework; sourceTree = SDKROOT; };
+		F13000000000000000000000 /* CoreMedia.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = CoreMedia.framework; path = System/Library/Frameworks/CoreMedia.framework; sourceTree = SDKROOT; };
 		B150000000000000000000000 /* RemotePanel.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = RemotePanel.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
@@ -102,6 +104,7 @@
 				F10BF0000000000000000000 /* EventKit.framework in Frameworks */,
 				F11BF0000000000000000000 /* ImageIO.framework in Frameworks */,
 				F12BF0000000000000000000 /* AVFoundation.framework in Frameworks */,
+				F13BF0000000000000000000 /* CoreMedia.framework in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -131,6 +134,7 @@
 				F10000000000000000000000 /* EventKit.framework */,
 				F11000000000000000000000 /* ImageIO.framework */,
 				F12000000000000000000000 /* AVFoundation.framework */,
+				F13000000000000000000000 /* CoreMedia.framework */,
 			);
 			name = Frameworks;
 			sourceTree = "<group>";

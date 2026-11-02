@@ -13,13 +13,13 @@ import androidx.core.content.ContextCompat
 import com.glooby.remotepanel.data.DaySlot
 import com.glooby.remotepanel.data.FeedRepository
 import com.glooby.remotepanel.data.PanelState
-import com.glooby.remotepanel.data.QuoteItem
 import com.glooby.remotepanel.data.Theme
 import com.glooby.remotepanel.data.WeatherState
 import com.glooby.remotepanel.data.Wmo
 import com.glooby.remotepanel.ui.BarView
 import com.glooby.remotepanel.ui.Fmt
 import com.glooby.remotepanel.ui.KioskActivity
+import com.glooby.remotepanel.ui.Roll
 import com.glooby.remotepanel.ui.Ui
 import com.glooby.remotepanel.ui.Ui.W
 import java.text.SimpleDateFormat
@@ -32,61 +32,28 @@ import kotlin.math.roundToInt
 object HomePages {
     private val cn = Locale.CHINA
 
-    // ---------- 问候海报：时钟 + 天气 + 一句话 + 头条 + 行情 ----------
+    // ---------- 问候海报：大时钟、一句问候、天气 ----------
 
     fun hello(ctx: Context, s: PanelState): View = Ui.column(ctx).apply {
         val now = Date()
         val top = Ui.row(ctx)
         val clock = Ui.column(ctx).apply {
-            addView(Ui.number(ctx, SimpleDateFormat("HH:mm", cn).format(now), 200, Theme.text()), Ui.wide())
+            val face = Ui.number(ctx, SimpleDateFormat("HH:mm", cn).format(now), 200, Theme.text())
+            Roll.clock(face, face.text.toString(), "hello-clock")
+            addView(face, Ui.wide())
             addView(Ui.text(ctx, SimpleDateFormat("M月d日 EEEE", cn).format(now), Ui.H2, Theme.textDim(), W.MEDIUM), Ui.wide())
         }
         top.addView(clock, Ui.flexH(1.25f, end = Ui.GAP))
         top.addView(weatherChip(ctx, s.weather), Ui.flexH(1f))
-        addView(top, Ui.wide(300, bottom = Ui.GAP))
+        addView(top, Ui.wide(420, bottom = Ui.GAP))
 
         val greet = Ui.column(ctx, Theme.surface()).apply {
-            setPadding(Ui.px(36), Ui.px(28), Ui.px(36), Ui.px(28))
+            setPadding(Ui.px(36), Ui.px(36), Ui.px(36), Ui.px(36))
             gravity = Gravity.CENTER_VERTICAL
-            addView(Ui.text(ctx, s.helloPeriod.ifBlank { FeedRepository.helloSlot().first }, Ui.H1, Theme.accent(), W.BOLD), Ui.wide())
-            addView(Ui.text(ctx, s.hello.ifBlank { localTip(s.weather) }, Ui.H2, Theme.text(), W.MEDIUM, lines = 3), Ui.wide(top = 10))
+            addView(Ui.text(ctx, s.helloPeriod.ifBlank { FeedRepository.helloSlot().first }, Ui.HERO, Theme.accent(), W.BOLD), Ui.wide())
+            addView(Ui.text(ctx, s.hello.ifBlank { localTip(s.weather) }, Ui.H1, Theme.text(), W.MEDIUM, lines = 2), Ui.wide(top = 16))
         }
-        addView(greet, Ui.wide(310, bottom = 28))
-
-        val quotes = marketPicks(s)
-        if (s.dailyNews.isNotEmpty()) {
-            addView(Blocks.section(ctx, "今日头条", "共 ${s.dailyNews.size} 条"), Ui.wide(64, bottom = 14))
-            val list = Ui.column(ctx)
-            s.dailyNews.take(if (quotes.isEmpty()) 7 else 5).forEach { n ->
-                val row = Ui.row(ctx).apply {
-                    addView(View(ctx).apply { background = Ui.rounded(Theme.accent(), 999) }, Ui.fixed(14, 14, end = 22))
-                    addView(Ui.text(ctx, n.title, Ui.BODY, Theme.text(), W.MEDIUM), LinearLayout.LayoutParams(0, -2, 1f))
-                    if (n.publishedAt > 0) addView(Ui.text(ctx, Fmt.clock(n.publishedAt), Ui.META, Theme.textFaint()), Ui.wrap(start = 16))
-                }
-                list.addView(row, Ui.flexV())
-            }
-            addView(list, Ui.flexV(bottom = if (quotes.isEmpty()) 0 else 24))
-        } else {
-            addView(Ui.spacer(ctx), Ui.flexV())
-        }
-        if (quotes.isNotEmpty()) {
-            addView(Blocks.section(ctx, "行情", if (com.glooby.remotepanel.data.Feeds.marketOpen()) "交易中" else "已收盘"), Ui.wide(64, bottom = 14))
-            addView(Pages.grid(ctx, 1, 3, Ui.GAP) { i -> quotes.getOrNull(i)?.let { quoteTile(ctx, it) } }, Ui.wide(230))
-        }
-    }
-
-    private fun marketPicks(s: PanelState): List<QuoteItem> {
-        val idx = s.stocks?.indices.orEmpty()
-        return (idx.ifEmpty { s.stocks?.stocks.orEmpty() } + s.crypto).take(3)
-    }
-
-    private fun quoteTile(ctx: Context, q: QuoteItem): View = Ui.column(ctx, Theme.surface()).apply {
-        gravity = Gravity.CENTER_VERTICAL
-        setPadding(Ui.px(26), Ui.px(18), Ui.px(26), Ui.px(18))
-        val crypto = q.market == "crypto"
-        addView(Ui.text(ctx, q.name, Ui.BODY, Theme.textDim(), W.MEDIUM), Ui.wide())
-        addView(Ui.number(ctx, Fmt.price(q.price, crypto), 68, Theme.text()), Ui.wide())
-        addView(Ui.number(ctx, Fmt.percent(q.percent), Ui.BODY, Theme.move(q.percent)), Ui.wide())
+        addView(greet, Ui.wide())
     }
 
     private fun weatherChip(ctx: Context, w: WeatherState?): View = Ui.column(ctx, Theme.surface()).apply {
@@ -99,7 +66,9 @@ object HomePages {
         val today = w.daily.firstOrNull()
         addView(Ui.row(ctx).apply {
             addView(Ui.text(ctx, Wmo.icon(w.code), 84), Ui.wrap(end = 16))
-            addView(Ui.number(ctx, Fmt.temp(w.temp), 104, Theme.text()), Ui.wrap())
+            val temp = Ui.number(ctx, Fmt.temp(w.temp), 104, Theme.text())
+            Roll.bind(temp, "hello-temp", temp.text.toString())
+            addView(temp, Ui.wrap())
         }, Ui.wide())
         addView(Ui.text(ctx, "${w.city} · ${Wmo.text(w.code)}", Ui.BODY, Theme.text(), W.MEDIUM), Ui.wide())
         if (today != null) {
@@ -130,7 +99,9 @@ object HomePages {
                 setPadding(Ui.px(40), Ui.px(24), Ui.px(40), Ui.px(24))
                 addView(Ui.column(ctx).apply {
                     addView(Ui.text(ctx, "📍 ${w.city}", Ui.BODY, Theme.textDim(), W.MEDIUM), Ui.wide())
-                    addView(Ui.number(ctx, Fmt.temp(w.temp), Ui.HERO, Theme.text()), Ui.wide())
+                    val temp = Ui.number(ctx, Fmt.temp(w.temp), Ui.HERO, Theme.text())
+                    Roll.bind(temp, "weather-temp", temp.text.toString())
+                    addView(temp, Ui.wide())
                     addView(Ui.text(ctx, "${Wmo.text(w.code)} · 体感 ${Fmt.temp(w.feelsLike)}", Ui.H2, Theme.text(), W.MEDIUM), Ui.wide())
                 }, Ui.flexH(1f))
                 addView(Ui.column(ctx).apply {

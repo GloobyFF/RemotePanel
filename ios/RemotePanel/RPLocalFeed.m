@@ -20,6 +20,8 @@ NSString * const RPPageEnabledPrefix = @"RemotePanel.page.enabled.";
 NSString * const RPRefreshPrefix = @"RemotePanel.refresh.";
 NSString * const RPTickerURLKey = @"RemotePanel.tickerURL";
 NSString * const RPTickerProxyKey = @"RemotePanel.ticker.useProxy";
+NSString * const RPPCOpenURLKey = @"RemotePanel.pcOpenURL";
+NSString *RPLocalDefaultPCOpenURL(void) { return @"http://192.168.28.30:8092"; }
 NSString * const RPHelloKeyKey = @"RemotePanel.hello.key";
 NSString * const RPHelloModelKey = @"RemotePanel.hello.model";
 NSString * const RPFeedProgressNotification = @"RPFeedProgress";
@@ -73,7 +75,7 @@ NSDictionary *RPLocalSourceDefaults(void) {
         @"gamer520-switch-latest": @"https://www.gamer520.com/gameswitch",
         @"ps5-games-latest": @"https://2468c.com/ps5game",
         @"x-news": @"https://getdaytrends.com/united-states/",
-        @"xiaohongshu-hot": @"https://tophub.today/n/L4MdA5ldxD",
+        @"xiaohongshu-hot": @"https://neodrop.ai/channel/_RKGs-chEJG",
         @"bilibili-hot": @"https://api.bilibili.com/x/web-interface/popular?ps=20&pn=1",
         @"stocks-cn": @"600519,300750,600036,601318,002594",
         @"crypto": @"btc,eth,sol,bnb,xrp",
@@ -172,7 +174,7 @@ NSArray *RPLocalPageCatalog(void) {
         @{@"id": @"daily-news", @"title": @"每日新闻", @"dwell": @70, @"hint": @"新闻 RSS"},
         @{@"id": @"github-news", @"title": @"AI·热门项目", @"dwell": @70, @"hint": @"GitHub 接口或 RSS"},
         @{@"id": @"x-news", @"title": @"X · 动态", @"dwell": @60, @"hint": @"默认美国区热门，译成中文。也可换成 RSS"},
-        @{@"id": @"xiaohongshu-hot", @"title": @"小红书热门", @"dwell": @60, @"hint": @"小红书热榜页面"},
+        @{@"id": @"xiaohongshu-hot", @"title": @"小红书每日热门", @"dwell": @60, @"hint": @"每日热门笔记。默认每天换一批，不是长期热搜"},
         @{@"id": @"bilibili-hot", @"title": @"哔哩哔哩热门", @"dwell": @60, @"hint": @"哔哩哔哩热门接口"},
         @{@"id": @"stocks-cn", @"title": @"国内股票", @"dwell": @70, @"hint": @"股票代码，逗号分隔，如 600519,300750"},
         @{@"id": @"crypto", @"title": @"比特币", @"dwell": @70, @"hint": @"币种，逗号分隔，如 btc,eth,sol"},
@@ -522,6 +524,11 @@ static NSArray *RPMoviesFromMaoyan(NSData *data, NSInteger limit) {
             @"release_date": RPString(movie[@"rt"]),
             @"overview": RPString(movie[@"star"]),
             @"poster_url": RPString(movie[@"img"]),
+            @"link": ({
+                id rawId = movie[@"id"];
+                NSString *mid = [rawId isKindOfClass:[NSString class]] ? RPString(rawId) : ([rawId respondsToSelector:@selector(stringValue)] ? [rawId stringValue] : @"");
+                mid.length ? [NSString stringWithFormat:@"https://www.maoyan.com/films/%@", mid] : @"";
+            }),
         }];
         if ((NSInteger)items.count >= limit) break;
     }
@@ -552,6 +559,7 @@ static NSArray *RPParseMovies(NSData *data, NSInteger limit) {
                 @"release_date": RPString(entry[@"dateCreated"] ?: entry[@"datePublished"]),
                 @"overview": RPDecode([NSString stringWithFormat:@"%@", entry[@"description"] ?: @""]),
                 @"poster_url": poster,
+                @"link": RPString(entry[@"url"]),
             }];
             if ((NSInteger)items.count >= limit) return items;
         }
@@ -1255,6 +1263,8 @@ static NSString *RPSetupHTML(void) {
         "  h+=\"<label>代理密码\"+(state.proxy_pass_set?\"（已保存，留空则不改）\":\"\")+\"</label><input id=\\\"proxyPass\\\" type=\\\"password\\\" autocomplete=\\\"new-password\\\" value=\\\"\\\">\";\n"
         "  if(state.proxy_pass_set) h+=\"<label class=\\\"check\\\"><input id=\\\"proxyPassClear\\\" type=\\\"checkbox\\\"> 清除已保存的代理密码</label>\";\n"
         "  h+=\"<label>全局停留秒（0 表示用每一页自己的秒数）</label><input id=\\\"dwell\\\" class=\\\"narrow\\\" type=\\\"number\\\" value=\\\"\"+esc(state.dwell_override)+\"\\\"></div>\";\n"
+        "  h+=\"<div class=\\\"card\\\"><h2>在电脑上打开</h2><p>点小红书、哔哩哔哩、电影或游戏封面时，把这个条目的网页发给这台电脑。电脑上要先运行开页小程序。留空则不发送。</p>\";\n"
+        "  h+=\"<label>电脑地址</label><input id=\\\"pcOpen\\\" type=\\\"text\\\" value=\\\"\"+esc(state.pc_open_url||\"\")+\"\\\" placeholder=\\\"http://192.168.28.30:8092\\\"></div>\";\n"
         "  h+=\"<div class=\\\"card\\\"><h2>消息</h2><label>走马灯地址（JSON、纯文本或 RSS，留空则不显示）</label><input id=\\\"ticker\\\" type=\\\"text\\\" value=\\\"\"+esc(state.ticker_url)+\"\\\">\";\n"
         "  h+=\"<label class=\\\"check\\\"><input id=\\\"tickerProxy\\\" type=\\\"checkbox\\\"\"+(state.ticker_proxy?\" checked\":\"\")+\"> 使用代理</label>\";\n"
         "  h+=\"<label>多久拉一次</label><select id=\\\"tickerRefresh\\\">\"+opt(ch,ti,state.ticker_refresh)+\"</select></div>\";\n"
@@ -1322,6 +1332,7 @@ static NSString *RPSetupHTML(void) {
         "  body.proxy_pass=document.getElementById(\"proxyPass\").value;\n"
         "  var ppc=document.getElementById(\"proxyPassClear\"); body.proxy_pass_clear=!!(ppc&&ppc.checked);\n"
         "  body.dwell_override=Number(document.getElementById(\"dwell\").value)||0;\n"
+        "  body.pc_open_url=document.getElementById(\"pcOpen\").value;\n"
         "  body.ticker_url=document.getElementById(\"ticker\").value;\n"
         "  body.ticker_proxy=document.getElementById(\"tickerProxy\").checked;\n"
         "  body.ticker_refresh=Number(document.getElementById(\"tickerRefresh\").value);\n"
@@ -1538,11 +1549,24 @@ static id RPPlistSafe(id value) {
         // (The greeting still goes through its slot check: a morning line must not last into the evening.)
         BOOL oldXhs = [key isEqualToString:@"xhs"] && [payload isKindOfClass:[NSArray class]] && [(NSArray *)payload count] &&
             [[(NSArray *)payload firstObject] isKindOfClass:[NSDictionary class]] &&
-            [[(NSArray *)payload firstObject][@"cover"] integerValue] < 4;
+            [[(NSArray *)payload firstObject][@"cover"] integerValue] < 5;
         // v3 (build 10): cover feeds keep 10–15 items so pages fill whole rows. A v2
         // cover cache (6–8 items) is refetched once instead of waiting out its 24 h TTL.
         BOOL coverFeed = [@[@"movies", @"steam", @"pc", @"switch", @"ps5", @"bili"] containsObject:key];
         if (coverFeed && [box[@"v"] integerValue] < 3) return NO;
+        // Greeting panel now shows UV, humidity, feels-like and rain. An older
+        // weather cache has temperature only, so refetch it once.
+        if ([key isEqualToString:@"weather"] && [payload isKindOfClass:[NSDictionary class]] && ![(NSDictionary *)payload objectForKey:@"uv"]) return NO;
+        // Taps open these on the PC. Caches from before the link field refetch once.
+        if ([key isEqualToString:@"steam"] && [payload isKindOfClass:[NSDictionary class]]) {
+            NSArray *rows = [(NSDictionary *)payload objectForKey:@"new_releases"];
+            id first = ([rows isKindOfClass:[NSArray class]] && rows.count) ? rows[0] : nil;
+            if (![first isKindOfClass:[NSDictionary class]] || ![(NSDictionary *)first objectForKey:@"link"]) return NO;
+        }
+        if ([key isEqualToString:@"movies"] && [payload isKindOfClass:[NSArray class]] && [(NSArray *)payload count]) {
+            id first = [(NSArray *)payload firstObject];
+            if (![first isKindOfClass:[NSDictionary class]] || ![(NSDictionary *)first objectForKey:@"link"]) return NO;
+        }
         if (young && [box[@"v"] integerValue] >= 2 && ![key isEqualToString:@"hello"] && !oldXhs) return YES;
         if ([payload isKindOfClass:[NSArray class]] && [(NSArray *)payload count] == 0) return NO;
         if ([key isEqualToString:@"hello"]) {
@@ -1559,7 +1583,7 @@ static id RPPlistSafe(id value) {
             id first = [(NSArray *)payload firstObject];
             if (![first isKindOfClass:[NSDictionary class]] || ![(NSDictionary *)first objectForKey:@"image_url"] || (([key isEqualToString:@"x"] || [key isEqualToString:@"xhs"]) && ![first[@"rich"] boolValue])) return NO;
             // cover 4 = the build-7.1 list (16 items, heat values, 7 photos); older caches refetch once.
-            if ([key isEqualToString:@"xhs"] && [first[@"cover"] integerValue] < 4) return NO;
+            if ([key isEqualToString:@"xhs"] && [first[@"cover"] integerValue] < 5) return NO;
             if ([key isEqualToString:@"x"] && ![first[@"blurb"] isKindOfClass:[NSString class]]) return NO;
         }
         if ([key isEqualToString:@"bili"] && [payload isKindOfClass:[NSArray class]] && [(NSArray *)payload count]) {
@@ -1618,17 +1642,18 @@ static id RPPlistSafe(id value) {
     }
 }
 
-- (NSData *)syncGET:(NSString *)url proxy:(NSString *)proxy headers:(NSDictionary *)headers {
+- (NSData *)syncGET:(NSString *)url proxy:(NSString *)proxy headers:(NSDictionary *)headers timeout:(NSTimeInterval)timeout {
     if (url.length == 0) {
         self.fetchError = @"地址是空的";
         return nil;
     }
+    if (timeout < 5) timeout = 25;
     NSError *error = nil;
-    NSData *data = [RPNet syncGET:url proxy:proxy headers:headers timeout:25 error:&error];
+    NSData *data = [RPNet syncGET:url proxy:proxy headers:headers timeout:timeout error:&error];
     if (!data && proxy.length) {
         NSError *proxyError = error;
         NSError *directError = nil;
-        data = [RPNet syncGET:url proxy:nil headers:headers timeout:25 error:&directError];
+        data = [RPNet syncGET:url proxy:nil headers:headers timeout:timeout error:&directError];
         if (!data) {
             BOOL gaveUp = directError.code == 3 || directError.code == 5;
             error = (proxyError && gaveUp) ? proxyError : (directError ?: proxyError);
@@ -1638,6 +1663,10 @@ static id RPPlistSafe(id value) {
     }
     self.fetchError = data ? nil : (error.localizedDescription ?: @"请求失败");
     return data;
+}
+
+- (NSData *)syncGET:(NSString *)url proxy:(NSString *)proxy headers:(NSDictionary *)headers {
+    return [self syncGET:url proxy:proxy headers:headers timeout:25];
 }
 
 - (NSData *)syncPOST:(NSString *)url body:(NSData *)body proxy:(NSString *)proxy headers:(NSDictionary *)headers {
@@ -1741,6 +1770,7 @@ static id RPPlistSafe(id value) {
         // "已保存" and sends a new one only if the user types it.
         @"proxy_pass_set": @(RPString([ud stringForKey:RPProxyPassKey]).length > 0),
         @"dwell_override": @([ud integerForKey:RPDwellOverrideDefaultsKey]),
+        @"pc_open_url": [ud objectForKey:RPPCOpenURLKey] ? RPString([ud stringForKey:RPPCOpenURLKey]) : RPLocalDefaultPCOpenURL(),
         @"ticker_url": RPString([ud stringForKey:RPTickerURLKey]),
         @"ticker_proxy": @([ud boolForKey:RPTickerProxyKey]),
         @"ticker_refresh": choices[RPLocalRefreshChoiceIndex(RPLocalTTL(@"ticker"))],
@@ -1794,6 +1824,7 @@ static id RPPlistSafe(id value) {
         if (n > 3600) n = 3600;
         [ud setInteger:n forKey:RPDwellOverrideDefaultsKey];
     }
+    if ([doc[@"pc_open_url"] isKindOfClass:[NSString class]]) [ud setObject:RPString(doc[@"pc_open_url"]) forKey:RPPCOpenURLKey];
     if ([doc[@"ticker_url"] isKindOfClass:[NSString class]]) [ud setObject:doc[@"ticker_url"] forKey:RPTickerURLKey];
     if ([doc[@"ticker_proxy"] respondsToSelector:@selector(boolValue)]) [ud setBool:[doc[@"ticker_proxy"] boolValue] forKey:RPTickerProxyKey];
     if ([doc[@"ticker_refresh"] respondsToSelector:@selector(doubleValue)] && [doc[@"ticker_refresh"] doubleValue] >= 60) {
@@ -2387,7 +2418,7 @@ static id RPPlistSafe(id value) {
         if (self.fetchError.length == 0) self.fetchError = @"没有找到这个城市";
         return NO;
     }
-    NSString *forecast = [NSString stringWithFormat:@"https://api.open-meteo.com/v1/forecast?latitude=%@&longitude=%@&current=temperature_2m,weather_code,wind_speed_10m&daily=weather_code,temperature_2m_max,temperature_2m_min&timezone=auto", hit[@"latitude"], hit[@"longitude"]];
+    NSString *forecast = [NSString stringWithFormat:@"https://api.open-meteo.com/v1/forecast?latitude=%@&longitude=%@&current=temperature_2m,apparent_temperature,relative_humidity_2m,weather_code,wind_speed_10m&daily=weather_code,temperature_2m_max,temperature_2m_min,uv_index_max,precipitation_probability_max&timezone=auto", hit[@"latitude"], hit[@"longitude"]];
     NSData *body = [self syncGET:forecast proxy:proxy headers:nil];
     NSDictionary *json = [NSJSONSerialization JSONObjectWithData:body ?: [NSData data] options:0 error:nil];
     if (![json isKindOfClass:[NSDictionary class]]) {
@@ -2402,6 +2433,8 @@ static id RPPlistSafe(id value) {
     NSArray *maxs = daily[@"temperature_2m_max"] ?: @[];
     NSArray *mins = daily[@"temperature_2m_min"] ?: @[];
     NSArray *codes = daily[@"weather_code"] ?: @[];
+    NSArray *uvs = [daily[@"uv_index_max"] isKindOfClass:[NSArray class]] ? daily[@"uv_index_max"] : @[];
+    NSArray *rains = [daily[@"precipitation_probability_max"] isKindOfClass:[NSArray class]] ? daily[@"precipitation_probability_max"] : @[];
     NSMutableArray *weekly = [NSMutableArray array];
     NSUInteger n = MIN(MIN(dates.count, maxs.count), MIN(mins.count, codes.count));
     for (NSUInteger i = 0; i < MIN(n, 6); i++) {
@@ -2423,6 +2456,10 @@ static id RPPlistSafe(id value) {
         @"temp_min": min0.count ? min0[0] : @"-",
         @"temp_max": max0.count ? max0[0] : @"-",
         @"wind_speed": cur[@"wind_speed_10m"] ?: @"-",
+        @"feels_like": cur[@"apparent_temperature"] ?: @"-",
+        @"humidity": cur[@"relative_humidity_2m"] ?: @"-",
+        @"uv": uvs.count ? uvs[0] : @"-",
+        @"rain": rains.count ? rains[0] : @"-",
         @"icon": RPWeatherIcon(desc),
         @"weekly": weekly,
     }];
@@ -2743,6 +2780,11 @@ static id RPPlistSafe(id value) {
             @"capsule_url": RPString(rawItem[@"large_capsule_image"] ?: rawItem[@"header_image"]),
             @"price": price,
             @"discount": discount > 0 ? [NSString stringWithFormat:@"-%ld%%", (long)discount] : @"",
+            @"link": ({
+                id rawId = rawItem[@"id"];
+                NSString *appid = [rawId isKindOfClass:[NSString class]] ? RPString(rawId) : ([rawId respondsToSelector:@selector(stringValue)] ? [rawId stringValue] : @"");
+                appid.length ? [NSString stringWithFormat:@"https://store.steampowered.com/app/%@", appid] : @"";
+            }),
         }];
         if ((NSInteger)items.count >= limit) break;
     }
@@ -2830,23 +2872,93 @@ static id RPPlistSafe(id value) {
     return @[ @{ @"title": title, @"body": text } ];
 }
 
+static NSString *RPTrimTitleMarks(NSString *title) {
+    title = [title stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (title.length >= 2 && [title hasPrefix:@"《"] && [title hasSuffix:@"》"]) {
+        title = [title substringWithRange:NSMakeRange(1, title.length - 2)];
+    }
+    return title ?: @"";
+}
+
+static NSString *RPNeodropPostId(NSData *data) {
+    NSString *html = [[NSString alloc] initWithData:data ?: [NSData data] encoding:NSUTF8StringEncoding];
+    if (html.length == 0) return nil;
+    NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:@"/post/([A-Za-z0-9_-]{8,})" options:0 error:nil];
+    NSTextCheckingResult *m = [re firstMatchInString:html options:0 range:NSMakeRange(0, html.length)];
+    if (!m || m.numberOfRanges < 2) return nil;
+    return [html substringWithRange:[m rangeAtIndex:1]];
+}
+
+/* The channel page lists one post per day. Each post links the notes that
+   actually led their category in that 24-hour window. */
+static NSArray *RPParseNeodropNotes(NSData *data, NSInteger limit) {
+    NSString *html = [[NSString alloc] initWithData:data ?: [NSData data] encoding:NSUTF8StringEncoding];
+    if (html.length == 0) return @[];
+    NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:@"href=\"(https://www\\.xiaohongshu\\.com/explore/[^\"]+)\"[^>]*>([^<]{2,80})</a>" options:0 error:nil];
+    NSRegularExpression *likeRe = [NSRegularExpression regularExpressionWithPattern:@"([0-9][0-9,]*)\\s*个赞" options:0 error:nil];
+    NSMutableArray *items = [NSMutableArray array];
+    NSMutableSet *seen = [NSMutableSet set];
+    for (NSTextCheckingResult *m in [re matchesInString:html options:0 range:NSMakeRange(0, html.length)]) {
+        if (m.numberOfRanges < 3) continue;
+        NSString *link = [html substringWithRange:[m rangeAtIndex:1]];
+        NSString *key = link;
+        NSRange q = [link rangeOfString:@"?"];
+        if (q.location != NSNotFound) key = [link substringToIndex:q.location];
+        if (key.length == 0 || [seen containsObject:key]) continue;
+        [seen addObject:key];
+        NSString *title = RPTrimTitleMarks(RPDecode([html substringWithRange:[m rangeAtIndex:2]]));
+        if (title.length == 0) continue;
+        NSString *heat = @"";
+        NSUInteger tail = NSMaxRange(m.range);
+        if (tail < html.length) {
+            NSString *after = [html substringWithRange:NSMakeRange(tail, MIN((NSUInteger)240, html.length - tail))];
+            NSTextCheckingResult *h = [likeRe firstMatchInString:after options:0 range:NSMakeRange(0, after.length)];
+            if (h && h.numberOfRanges >= 2) heat = [after substringWithRange:[h rangeAtIndex:1]];
+        }
+        NSString *digits = [heat stringByReplacingOccurrencesOfString:@"," withString:@""];
+        [items addObject:@{
+            @"title": title,
+            @"heat": heat,
+            @"heat_value": @(RPHeatValue(digits)),
+            @"summary": heat.length ? [NSString stringWithFormat:@"%@ 个赞", heat] : @"每日热门",
+            @"link": link,
+            @"image_url": @"",
+        }];
+        if ((NSInteger)items.count >= limit) break;
+    }
+    return items;
+}
+
 - (BOOL)fetchXiaohongshu {
     NSString *url = [self sourceURL:@"xiaohongshu-hot"];
-    if (url.length == 0) url = RPLocalSourceDefaults()[@"xiaohongshu-hot"];
+    if (url.length == 0 || [url isEqualToString:@"https://tophub.today/n/L4MdA5ldxD"]) {
+        url = RPLocalSourceDefaults()[@"xiaohongshu-hot"];
+        [[NSUserDefaults standardUserDefaults] setObject:url forKey:[RPSourceURLPrefix stringByAppendingString:@"xiaohongshu-hot"]];
+    }
     NSString *proxy = [self proxyFor:@"xiaohongshu-hot"];
     if (proxy.length == 0) proxy = RPConfiguredProxy();
-    // tophub serves the list as plain HTML (rank-item-container cards), so read it
-    // directly first; r.jina.ai is only a fallback (it timed out often and returns
-    // at most ~10 rows).
-    NSData *data = [self syncGET:url proxy:proxy headers:@{ @"User-Agent": @"Mozilla/5.0 (iPad; CPU OS 9_3_5 like Mac OS X) AppleWebKit/601.1.46 (KHTML, like Gecko) Version/9.0 Mobile/13G36 Safari/601.1" }];
-    NSArray *items = RPParseTophubCards(data, 20);
-    if (!items.count) items = RPParseXiaohongshu(data, 20);
-    if (!items.count && [url rangeOfString:@"tophub.today"].location != NSNotFound) {
-        data = [self syncGET:[@"https://r.jina.ai/" stringByAppendingString:url] proxy:proxy headers:nil];
-        items = RPParseXiaohongshuText(data, 20);
+    NSArray *items = nil;
+    if ([url rangeOfString:@"neodrop.ai/channel/"].location != NSNotFound) {
+        NSDictionary *headers = @{ @"User-Agent": @"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_13_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.114 Safari/537.36" };
+        NSData *channel = [self syncGET:url proxy:proxy headers:headers timeout:35];
+        NSString *postId = RPNeodropPostId(channel);
+        if (postId.length) {
+            NSString *postURL = [@"https://neodrop.ai/post/" stringByAppendingString:postId];
+            NSData *post = [self syncGET:postURL proxy:proxy headers:headers timeout:40];
+            items = RPParseNeodropNotes(post, 16);
+        }
+    } else {
+        // A hand-pasted board, usually the old sticky hot list.
+        NSData *data = [self syncGET:url proxy:proxy headers:@{ @"User-Agent": @"Mozilla/5.0 (iPad; CPU OS 9_3_5 like Mac OS X) AppleWebKit/601.1.46 (KHTML, like Gecko) Version/9.0 Mobile/13G36 Safari/601.1" }];
+        items = RPParseTophubCards(data, 20);
+        if (!items.count) items = RPParseXiaohongshu(data, 20);
+        if (!items.count && [url rangeOfString:@"tophub.today"].location != NSNotFound) {
+            data = [self syncGET:[@"https://r.jina.ai/" stringByAppendingString:url] proxy:proxy headers:nil];
+            items = RPParseXiaohongshuText(data, 20);
+        }
     }
     if (!items.count) {
-        if (self.fetchError.length == 0) self.fetchError = @"没有解析到热门";
+        if (self.fetchError.length == 0) self.fetchError = @"没有读到今日笔记";
         return NO;
     }
     NSMutableArray *rich = [NSMutableArray array];
@@ -2871,7 +2983,7 @@ static id RPPlistSafe(id value) {
             }
         }
         row[@"rich"] = @YES;
-        row[@"cover"] = @4;
+        row[@"cover"] = @5;
         row[@"rank"] = @(rich.count + 1);
         if (!row[@"image_url"]) row[@"image_url"] = @"";
         [rich addObject:row];

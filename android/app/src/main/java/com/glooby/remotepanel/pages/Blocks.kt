@@ -13,6 +13,7 @@ import com.glooby.remotepanel.data.QuoteItem
 import com.glooby.remotepanel.data.Theme
 import com.glooby.remotepanel.ui.Fmt
 import com.glooby.remotepanel.ui.Img
+import com.glooby.remotepanel.ui.Roll
 import com.glooby.remotepanel.ui.Ui
 import com.glooby.remotepanel.ui.Ui.W
 
@@ -123,7 +124,9 @@ object Blocks {
             addView(Ui.text(ctx, q.symbol + if (crypto) " / USDT" else "", Ui.META, Theme.textFaint()), Ui.wide())
         }
         top.addView(name, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
-        top.addView(Ui.number(ctx, Fmt.price(q.price, crypto), 80, Theme.move(q.percent)).apply { gravity = Gravity.END }, Ui.wrap(end = 24))
+        val price = Ui.number(ctx, Fmt.price(q.price, crypto), 80, Theme.move(q.percent)).apply { gravity = Gravity.END }
+        Roll.bind(price, "px-${q.symbol.ifBlank { q.name }}", price.text.toString())
+        top.addView(price, Ui.wrap(end = 24))
         top.addView(Ui.column(ctx).apply {
             gravity = Gravity.END
             addView(movePill(ctx, q.percent), Ui.wrap())

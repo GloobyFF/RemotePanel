@@ -22,6 +22,8 @@
 /** Put each block off-canvas before the first paint, so the fly-in is the first thing shown. */
 - (void)parkMotionOffscreen;
 - (BOOL)rpIntroHasPlayed;
+/** If this page is on screen and the fly-in has not started, start it now. */
+- (void)rpCatchUpIntro;
 - (NSURL *)absURL:(NSString *)path base:(NSString *)base;
 - (void)loadImageURL:(NSURL *)url into:(UIImageView *)iv;
 /** Drop decoded bitmaps held by this page (call on leave / memory warning). */
@@ -30,6 +32,9 @@
 
 /** Prefetch remote images for a page id into the shared cache (no UI). */
 void RPPrefetchImagesForPage(NSString *pageId, NSDictionary *state, NSString *baseURL);
+/** Start buffering the next video about 15 s before that page is shown. */
+void RPPrepareUpcomingVideo(BOOL network);
+void RPDropPreparedVideo(void);
 /** Evict the shared UIImage cache (memory pressure). */
 void RPPurgeImageCache(void);
 

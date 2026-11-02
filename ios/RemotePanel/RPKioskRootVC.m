@@ -23,6 +23,12 @@ static NSString * const kDefaultProxy = @"socks5h://192.168.28.77:1080";
 static NSDictionary *RPSourceDefaults(void) { return RPLocalSourceDefaults(); }
 static BOOL RPDefaultUseProxy(NSString *pid) { return RPLocalDefaultUseProxy(pid); }
 
+static BOOL RPHasReading(id value) {
+    if (!value || value == [NSNull null]) return NO;
+    NSString *s = [[NSString stringWithFormat:@"%@", value] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    return s.length > 0 && ![s isEqualToString:@"-"] && ![s isEqualToString:@"--"] && ![s isEqualToString:@"(null)"];
+}
+
 @interface RPPageDef : NSObject
 @property (nonatomic, copy) NSString *pid;
 @property (nonatomic, copy) NSString *title;
@@ -78,12 +84,14 @@ static BOOL RPDefaultUseProxy(NSString *pid) { return RPLocalDefaultUseProxy(pid
 @property (nonatomic, assign) NSTimeInterval dwellTotal;
 @property (nonatomic, assign) NSTimeInterval dwellLeft;
 @property (nonatomic, assign) BOOL videoHold;
+@property (nonatomic, assign) NSInteger videoPrefetchIndex;
 @property (nonatomic, assign) BOOL stale;
 @property (nonatomic, strong) UIView *settingsDim;
 @property (nonatomic, strong) UIView *settingsSheet;
 @property (nonatomic, strong) UIScrollView *settingsScroll;
 @property (nonatomic, strong) UITextField *baseField;
 @property (nonatomic, strong) UITextField *proxyField;
+@property (nonatomic, strong) UITextField *pcOpenField;
 @property (nonatomic, strong) UITextField *proxyUserField;
 @property (nonatomic, strong) UITextField *proxyPassField;
 @property (nonatomic, strong) UILabel *videoAlbumLabel;
@@ -154,10 +162,12 @@ static BOOL RPDefaultUseProxy(NSString *pid) { return RPLocalDefaultUseProxy(pid
     [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(onFeedProgress:) name:RPFeedProgressNotification object:nil];
     [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(onVideoHold:) name:@"RPVideoHold" object:nil];
     [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(onVideoAdvance) name:@"RPVideoAdvance" object:nil];
+    [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(onPCOpenNotice:) name:@"RPPCOpenNotice" object:nil];
     [self rebuildEnabledPages];
     [self buildUI];
     [self installGestures];
     self.index = 0;
+    self.videoPrefetchIndex = -1;
     [self showPageAtIndex:0 resetDwell:YES];
     [self startClock];
     [self applyTickerMessages:[[RPLocalFeed sharedFeed] tickerMessages]];
@@ -523,6 +533,11 @@ static NSString *RPStringish(id value) {
     self.toastLabel.frame = CGRectMake(18, 8, w - 36, h - 16);
 }
 
+- (void)onPCOpenNotice:(NSNotification *)note {
+    NSString *text = [note.object isKindOfClass:[NSString class]] ? note.object : @"";
+    [self showToast:text];
+}
+
 - (void)showToast:(NSString *)text {
     if (text.length == 0) return;
     self.toastToken += 1;
@@ -726,8 +741,7 @@ static NSString *RPStringish(id value) {
         [[RPLocalFeed sharedFeed] appendLog:self.titleLabel.text ?: @"页面" status:@"fail" detail:[NSString stringWithFormat:@"这一页没能画出来：%@", why]];
     }
     if ([self.currentPage isKindOfClass:[RPBasePageVC class]]) {
-        RPBasePageVC *page = (RPBasePageVC *)self.currentPage;
-        if (![page rpIntroHasPlayed]) [page parkMotionOffscreen];
+        [(RPBasePageVC *)self.currentPage rpCatchUpIntro];
     }
 }
 
@@ -765,8 +779,13 @@ static NSString *RPStringish(id value) {
     self.indexLabel.text = [NSString stringWithFormat:@"%ld/%lu · %lds", (long)(idx+1), (unsigned long)self.pages.count, (long)[self dwellForDef:def]];
     BOOL web = [RPPageFactory isWebPageId:def.pid];
     [self setKioskChromeHidden:web];
-    if (self.lastState || web) [self applyCurrentPageState];
+    // Paint a placeholder even before the first feed pass, so the opening
+    // minute is not a blank page.
+    [self applyCurrentPageState];
     [page pageWillAppear];
+    // The page that comes after this one starts loading now, so its covers are
+    // already decoded when its fly-in runs.
+    [self prefetchUpcomingPageImages];
     [self layoutEdgeCatchers];
 
     if (reset) [self restartDwell];
@@ -791,12 +810,19 @@ static NSString *RPStringish(id value) {
     self.dwellLeft = self.dwellTotal;
     self.dwellTimer = [NSTimer scheduledTimerWithTimeInterval:0.25 target:self selector:@selector(dwellTick) userInfo:nil repeats:YES];
     [self updateProgress];
+    // A short page never reaches the 15 s mark. Warm the video as soon as it opens.
+    if (self.dwellTotal <= 20 && self.videoPrefetchIndex != self.index) {
+        self.videoPrefetchIndex = self.index;
+        [self prefetchUpcomingVideo];
+    }
 }
 
 - (void)onVideoHold:(NSNotification *)note {
     self.videoHold = [note.userInfo[@"hold"] boolValue];
     if (!self.videoHold) return;
     self.indexLabel.text = [NSString stringWithFormat:@"%ld/%lu · 播放", (long)(self.index + 1), (unsigned long)self.pages.count];
+    // Dwell is frozen while a clip plays, so warm the following page now.
+    [self prefetchUpcomingPageImages];
 }
 - (void)onVideoAdvance {
     self.videoHold = NO;
@@ -812,9 +838,11 @@ static NSString *RPStringish(id value) {
         return;
     }
     self.dwellLeft -= 0.25;
-    // Warm the next page's cover art so fly-in can start with images already in cache.
-    if (self.dwellLeft <= 12.0 && self.dwellLeft > 11.5) {
-        [self prefetchUpcomingPageImages];
+    // Pictures are warmed when the current page opens. A video needs the last
+    // 15 seconds so the clip is buffered before this page leaves.
+    if (self.dwellLeft <= 15.0 && self.dwellLeft > 14.5 && self.videoPrefetchIndex != self.index) {
+        self.videoPrefetchIndex = self.index;
+        [self prefetchUpcomingVideo];
     }
     if (self.dwellLeft <= 2.4) {
         [self nextPage];
@@ -822,6 +850,15 @@ static NSString *RPStringish(id value) {
     }
     [self updateProgress];
     self.indexLabel.text = [NSString stringWithFormat:@"%ld/%lu · %.0fs", (long)(self.index+1), (unsigned long)self.pages.count, ceil(self.dwellLeft)];
+}
+- (void)prefetchUpcomingVideo {
+    if (self.pages.count < 2) return;
+    NSInteger next = self.index + 1;
+    if (next >= (NSInteger)self.pages.count) next = 0;
+    NSString *pid = self.pages[next].pid;
+    if ([pid isEqualToString:@"local-video"]) RPPrepareUpcomingVideo(NO);
+    else if ([pid isEqualToString:@"net-video"]) RPPrepareUpcomingVideo(YES);
+    else RPDropPreparedVideo();
 }
 - (void)prefetchUpcomingPageImages {
     if (!self.lastState || self.pages.count < 2) return;
@@ -931,6 +968,8 @@ static NSString *RPStringish(id value) {
     }
     [[RPLocalFeed sharedFeed] refreshWithCompletion:^(NSDictionary *state, NSError *error) {
         if (state.count) {
+            NSDictionary *oldWeather = [weakSelf.lastState[@"weather"] isKindOfClass:[NSDictionary class]] ? weakSelf.lastState[@"weather"] : nil;
+            BOOL hadWeather = RPHasReading(oldWeather[@"temperature"]);
             weakSelf.lastState = state;
             weakSelf.stale = NO;
             // FAIL used to stick forever: only a pass that itself had a failure keeps it.
@@ -943,6 +982,14 @@ static NSString *RPStringish(id value) {
             }
             weakSelf.passHadFailure = NO;
             [weakSelf applyCurrentPageState];
+            [weakSelf prefetchUpcomingPageImages];
+            // First launch used to finish the feed pass as the greeting page was
+            // already leaving, so the weather flashed and flew out. Hold the page.
+            NSDictionary *newWeather = [state[@"weather"] isKindOfClass:[NSDictionary class]] ? state[@"weather"] : nil;
+            RPPageDef *showing = (weakSelf.index >= 0 && weakSelf.index < (NSInteger)weakSelf.pages.count) ? weakSelf.pages[weakSelf.index] : nil;
+            if (!hadWeather && RPHasReading(newWeather[@"temperature"]) && !weakSelf.pageTransitioning && [showing.pid isEqualToString:@"hello"] && weakSelf.dwellLeft < 25) {
+                [weakSelf restartDwell];
+            }
             [weakSelf applyTickerMessages:[[RPLocalFeed sharedFeed] tickerMessages]];
         } else {
             weakSelf.stale = YES;
@@ -1043,6 +1090,16 @@ static NSString *RPStringish(id value) {
     self.proxyUserField = [self settingsField:[pud stringForKey:RPProxyUserKey] ?: @"" placeholder:@"用户名" frame:CGRectMake(20, y, halfW, 40) secure:NO];
     BOOL hasPass = [[pud stringForKey:RPProxyPassKey] length] > 0;
     self.proxyPassField = [self settingsField:@"" placeholder:hasPass ? @"已保存，留空不改" : @"密码" frame:CGRectMake(20 + halfW + 12, y, halfW, 40) secure:YES];
+    y += 52;
+
+    UILabel *pcl = [[UILabel alloc] initWithFrame:CGRectMake(20, y, contentW, 36)];
+    pcl.font = [RPTheme small:14]; pcl.textColor = [RPTheme textDim]; pcl.numberOfLines = 2;
+    pcl.text = @"点小红书、电影、游戏封面时，把网页发给这台电脑。电脑上要开着开页小程序。留空则不发送。";
+    [self.settingsScroll addSubview:pcl];
+    y += 40;
+    NSString *savedPC = [[NSUserDefaults standardUserDefaults] objectForKey:RPPCOpenURLKey] ? ([[NSUserDefaults standardUserDefaults] stringForKey:RPPCOpenURLKey] ?: @"") : RPLocalDefaultPCOpenURL();
+    self.pcOpenField = [self settingsField:savedPC placeholder:@"http://192.168.28.30:8092" frame:CGRectMake(20, y, contentW, 40) secure:NO];
+    self.pcOpenField.keyboardType = UIKeyboardTypeURL;
     y += 52;
 
     // ---- Video boards ----
@@ -1308,7 +1365,7 @@ static NSString *RPStringish(id value) {
             if ([d.pid isEqualToString:@"weather"]) urlField.placeholder = @"城市名，例如 Shanghai";
             else if ([d.pid isEqualToString:@"schedule"]) urlField.placeholder = @"ICS 订阅，例如 https://.../basic.ics";
             else if ([d.pid isEqualToString:@"x-news"]) urlField.placeholder = @"默认全球热门话题，也可换成 RSS";
-            else if ([d.pid isEqualToString:@"xiaohongshu-hot"]) urlField.placeholder = @"小红书热榜页面";
+            else if ([d.pid isEqualToString:@"xiaohongshu-hot"]) urlField.placeholder = @"小红书每日热门";
             else if ([d.pid isEqualToString:@"bilibili-hot"]) urlField.placeholder = @"哔哩哔哩热门接口";
             else if ([d.pid isEqualToString:@"print"]) urlField.placeholder = @"打印机 JSON 接口";
             else if ([d.pid isEqualToString:@"stocks-cn"]) urlField.placeholder = @"股票代码，逗号分隔，如 600519,300750";
@@ -1594,6 +1651,7 @@ static NSString *RPStringish(id value) {
     self.vpsRefreshControl = nil;
     self.settingsDefs = nil;
     self.proxyField = nil;
+    self.pcOpenField = nil;
     self.proxyUserField = nil;
     self.proxyPassField = nil;
     self.videoAlbumLabel = nil;
@@ -1624,6 +1682,7 @@ static NSString *RPStringish(id value) {
     self.dwellOverride = [self.dwellField.text integerValue];
     NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
     [ud setObject:self.proxyField.text ?: @"" forKey:kProxyKey];
+    if (self.pcOpenField) [ud setObject:[self.pcOpenField.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]] ?: @"" forKey:RPPCOpenURLKey];
     if (self.proxyUserField) {
         NSString *pu = [self.proxyUserField.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]] ?: @"";
         [ud setObject:pu forKey:RPProxyUserKey];

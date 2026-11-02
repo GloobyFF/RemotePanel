@@ -2,6 +2,7 @@
 #import "RPTheme.h"
 #import "RPNet.h"
 #import "RPLocalFeed.h"
+#import "RPChime.h"
 #import "RPPhotoSource.h"
 #import <Photos/Photos.h>
 #import <WebKit/WebKit.h>
@@ -11,6 +12,7 @@
 #import <ImageIO/ImageIO.h>
 #import <QuartzCore/QuartzCore.h>
 #import <AVFoundation/AVFoundation.h>
+#import <CoreMedia/CoreMedia.h>
 #import <ctype.h>
 
 static NSString *RPShortNumber(id value);
@@ -44,6 +46,50 @@ static NSString *RPStringish(id value) {
     return @"";
 }
 
+static void RPPCNote(NSString *text) {
+    if (text.length == 0) return;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [[NSNotificationCenter defaultCenter] postNotificationName:@"RPPCOpenNotice" object:text];
+    });
+}
+
+/** Ask the PC listener to open this http(s) page. No-op when the address was cleared. */
+static void RPTellPC(NSString *title, NSString *url, NSString *source) {
+    [RPChime tap];
+    NSString *link = [RPStringish(url) stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    NSString *name = RPStringish(title);
+    if (name.length > 80) name = [[name substringToIndex:80] stringByAppendingString:@"…"];
+    if (![link hasPrefix:@"http://"] && ![link hasPrefix:@"https://"]) {
+        RPPCNote(name.length ? [NSString stringWithFormat:@"「%@」没有可以打开的网页", name] : @"这条没有可以打开的网页");
+        return;
+    }
+    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+    NSString *base = [ud objectForKey:RPPCOpenURLKey] ? RPStringish([ud stringForKey:RPPCOpenURLKey]) : RPLocalDefaultPCOpenURL();
+    base = [base stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    while ([base hasSuffix:@"/"]) base = [base substringToIndex:base.length - 1];
+    if (base.length == 0) {
+        RPPCNote(@"还没填写电脑地址");
+        return;
+    }
+    NSString *endpoint = [[base lowercaseString] hasSuffix:@"/open"] ? base : [base stringByAppendingString:@"/open"];
+    NSURL *dest = [NSURL URLWithString:endpoint];
+    if (!dest) {
+        RPPCNote(@"电脑地址填得不对");
+        return;
+    }
+    NSDictionary *body = @{ @"title": name ?: @"", @"url": link, @"source": RPStringish(source) };
+    NSData *data = [NSJSONSerialization dataWithJSONObject:body options:0 error:nil];
+    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:dest cachePolicy:NSURLRequestReloadIgnoringLocalCacheData timeoutInterval:4];
+    req.HTTPMethod = @"POST";
+    [req setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
+    req.HTTPBody = data ?: [NSData data];
+    RPPCNote(name.length ? [NSString stringWithFormat:@"发给电脑：%@", name] : @"发给电脑");
+    [[[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:^(NSData *resp, NSURLResponse *response, NSError *error) {
+        NSInteger code = [response isKindOfClass:[NSHTTPURLResponse class]] ? ((NSHTTPURLResponse *)response).statusCode : 0;
+        if (error || code < 200 || code >= 300) RPPCNote(@"电脑没有收到。请确认开页小程序在运行");
+    }] resume];
+}
+
 /* Longest the fly-in waits for covers before starting with whatever has loaded.
    Kept at 1.35 s: halving it would just start more pages with empty tiles. */
 static const NSTimeInterval kRPIntroImageWait = 1.35;
@@ -57,7 +103,7 @@ static NSCache *RPImageCache(void) {
         // iPad 3 dies if several full-size posters decode at once. 24 MB holds one
         // page of 10 covers at tile size (~1.3 MB each at 720×336) plus the next page's
         // prefetch; NSCache evicts beyond that, and on memory warnings.
-        c.totalCostLimit = 24 * 1024 * 1024;
+        c.totalCostLimit = 32 * 1024 * 1024;
     });
     return c;
 }
@@ -147,12 +193,12 @@ void RPPrefetchImagesForPage(NSString *pageId, NSDictionary *state, NSString *ba
         for (NSDictionary *it in (items ?: @[])) {
             if (![it isKindOfClass:[NSDictionary class]]) continue;
             RPCollectURL(keys, it[@"image_url"], baseURL);
-            if (++n >= 8) break;
+            if (++n >= 12) break;
         }
     }
     if (keys.count == 0) return;
-    if (keys.count > 4) [keys removeObjectsInRange:NSMakeRange(4, keys.count - 4)];
-    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_LOW, 0), ^{
+    if (keys.count > 12) [keys removeObjectsInRange:NSMakeRange(12, keys.count - 12)];
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
         for (NSString *key in keys) {
             if ([RPImageCache() objectForKey:key]) continue;
             NSError *error = nil;
@@ -161,8 +207,7 @@ void RPPrefetchImagesForPage(NSString *pageId, NSDictionary *state, NSString *ba
                 proxy = RPConfiguredProxy();
             }
             NSData *data = [RPNet syncGET:key proxy:proxy headers:nil timeout:16 error:&error];
-            // Match the size the cover pages now draw at, so the prefetched copy is used as-is.
-            UIImage *img = RPImageFromData(data, 720.0);
+            UIImage *img = RPImageFromData(data, 1024.0);
             if (img) RPCacheImage(key, img);
         }
     });
@@ -237,12 +282,26 @@ static NSString *RPHashObject(id obj) {
     [self parkMotionOffscreen];
     [self tryPlayIntro];
 }
+- (void)viewDidLayoutSubviews {
+    [super viewDidLayoutSubviews];
+    // pageWillAppear can run before the host has a size. Retry once layout is real,
+    // otherwise the blocks stay off-canvas for the whole dwell.
+    if (_waitingIntro && !_introPlayed) [self tryPlayIntro];
+}
 - (void)tryPlayIntro {
     if (!_waitingIntro || _introPlayed) return;
     if (_pendingImageLoads > 0) return;
     if (self.contentView.bounds.size.width < 2) return;
+    // No blocks yet (first launch, feed still running). Stay waiting so the
+    // later apply can fly them in instead of painting and immediately parking.
+    if ([self rpMotionViews].count == 0) return;
     _waitingIntro = NO;
     [self playPageIntro];
+}
+- (void)rpCatchUpIntro {
+    if (!_waitingIntro || _introPlayed) return;
+    [self parkMotionOffscreen];
+    [self tryPlayIntro];
 }
 - (void)noteImageLoadBegan {
     _pendingImageLoads += 1;
@@ -584,10 +643,8 @@ static void RPPurgeImages(UIView *root) {
         return;
     }
     UIImage *cached = [RPImageCache() objectForKey:key];
-    // A copy decoded smaller than this tile needs (e.g. by an older prefetch) would
-    // look soft; ignore it and decode again at the right size.
-    CGFloat needPx = MAX(iv.bounds.size.width, iv.bounds.size.height) * MIN(2.0, [UIScreen mainScreen].scale);
-    if (cached && MAX(cached.size.width, cached.size.height) * cached.scale + 1 < MIN(1024.0, MAX(kRPImageMaxSide, needPx)) * 0.9) cached = nil;
+    // A warmed image should show during the fly-in. Re-downloading for a sharper
+    // copy is what left covers blank until the animation had already finished.
     if (cached) {
         iv.image = cached;
         objc_setAssociatedObject(iv, &kRPImageURLKey, key, OBJC_ASSOCIATION_COPY_NONATOMIC);
@@ -634,6 +691,18 @@ static void RPPurgeImages(UIView *root) {
 - (BOOL)prefersStatusBarHidden { return YES; }
 - (UIInterfaceOrientationMask)supportedInterfaceOrientations { return UIInterfaceOrientationMaskAll; }
 - (BOOL)shouldAutorotate { return YES; }
+- (void)rpCoverTap:(UITapGestureRecognizer *)gr {
+    if (gr.state != UIGestureRecognizerStateEnded) return;
+    NSDictionary *pack = objc_getAssociatedObject(gr.view, &kRPImageURLKey);
+    if (![pack isKindOfClass:[NSDictionary class]]) return;
+    NSDictionary *it = [pack[@"item"] isKindOfClass:[NSDictionary class]] ? pack[@"item"] : @{};
+    NSString *title = RPStringish(it[@"title"]);
+    NSString *link = RPStringish(it[@"link"]);
+    if (link.length == 0) link = RPStringish(it[@"url"]);
+    NSString *source = RPStringish(pack[@"source"]);
+    if (source.length == 0) source = self.pageId;
+    RPTellPC(title, link, source);
+}
 @end
 
 #pragma mark - Hello
@@ -650,42 +719,102 @@ static void RPPurgeImages(UIView *root) {
     if (period.length == 0) period = @"你好";
     if (waiting) text = @"正在准备一句问候";
     NSDictionary *weather = [state[@"weather"] isKindOfClass:[NSDictionary class]] ? state[@"weather"] : @{};
-    NSString *fp = [NSString stringWithFormat:@"hello4|%@|%@|%@", period, text, weather[@"temperature"] ?: @""];
+    NSString *fp = [NSString stringWithFormat:@"hello5|%@|%@|%@|%@|%@|%@|%@|%@", period, text, weather[@"temperature"] ?: @"", weather[@"feels_like"] ?: @"", weather[@"humidity"] ?: @"", weather[@"uv"] ?: @"", weather[@"rain"] ?: @"", weather[@"wind_speed"] ?: @""];
     if ([self shouldSkipRebuildForKey:fp bounds:b]) return;
     [self clearContent];
     BOOL landscape = [self isLandscape];
     CGFloat m = [self mInset];
     UIColor *tone = [RPTheme accent];
 
-    CGFloat panelW = landscape ? floor(b.size.width * 0.34) : (b.size.width - 2 * m);
-    CGFloat panelH = landscape ? (b.size.height - 2 * m) : 220;
+    NSString *(^deg)(id) = ^NSString *(id v) {
+        NSString *n = RPShortNumber(v);
+        return [n isEqualToString:@"-"] ? @"--" : [NSString stringWithFormat:@"%@°", n];
+    };
+    NSString *(^pct)(id) = ^NSString *(id v) {
+        NSString *n = RPShortNumber(v);
+        return [n isEqualToString:@"-"] ? @"--" : [NSString stringWithFormat:@"%@%%", n];
+    };
+    NSString *uvText = @"--";
+    NSString *uvNum = RPShortNumber(weather[@"uv"]);
+    if (![uvNum isEqualToString:@"-"]) {
+        double uv = [uvNum doubleValue];
+        NSString *word = @"弱";
+        if (uv >= 11) word = @"极强";
+        else if (uv >= 8) word = @"很强";
+        else if (uv >= 6) word = @"强";
+        else if (uv >= 3) word = @"中等";
+        uvText = [NSString stringWithFormat:@"%@ %@", word, uvNum];
+    }
+    NSString *windNum = RPShortNumber(weather[@"wind_speed"]);
+    NSString *windText = [windNum isEqualToString:@"-"] ? @"--" : [NSString stringWithFormat:@"%@ km/h", windNum];
+    NSString *todayText = [NSString stringWithFormat:@"%@", weather[@"description"] ?: @""];
+    if ([todayText isEqualToString:@"(null)"] || todayText.length == 0) todayText = @"--";
+    NSArray *facts = @[
+        @[@"体感", deg(weather[@"feels_like"])],
+        @[@"最高", deg(weather[@"temp_max"])],
+        @[@"最低", deg(weather[@"temp_min"])],
+        @[@"湿度", pct(weather[@"humidity"])],
+        @[@"紫外线", uvText],
+        @[@"降水", pct(weather[@"rain"])],
+        @[@"风", windText],
+        @[@"今天", todayText],
+    ];
+
+    CGFloat panelW = landscape ? floor(b.size.width * 0.36) : (b.size.width - 2 * m);
+    CGFloat panelH = landscape ? (b.size.height - 2 * m) : MIN(360, MAX(220, b.size.height - 280));
     CGFloat panelX = landscape ? (b.size.width - m - panelW) : m;
     CGFloat panelY = landscape ? m : (b.size.height - m - panelH);
     UIView *panel = [self makeCard];
     panel.frame = CGRectMake(panelX, panelY, panelW, panelH);
     NSString *iconText = [NSString stringWithFormat:@"%@", weather[@"icon"] ?: @""];
     if ([iconText isEqualToString:@"(null)"] || iconText.length == 0) iconText = @"\uf00d";
-    UILabel *icon = [self makeLabel:[RPTheme weatherIcon:landscape ? 120 : 88] color:tone];
+    CGFloat iconSide = landscape ? 84 : 64;
+    UILabel *icon = [self makeLabel:[RPTheme weatherIcon:iconSide] color:tone];
     icon.text = iconText;
     icon.textAlignment = NSTextAlignmentCenter;
-    icon.frame = CGRectMake(12, 18, panelW - 24, landscape ? 140 : 96);
-    UILabel *temp = [self makeLabel:[RPTheme hero:landscape ? 64 : 48] color:[RPTheme text]];
+    icon.frame = CGRectMake(14, 12, iconSide, iconSide);
+    UILabel *temp = [self makeLabel:[RPTheme hero:landscape ? 60 : 46] color:[RPTheme text]];
     NSString *tempText = RPShortNumber(weather[@"temperature"]);
-    if ([tempText isEqualToString:@"-"]) tempText = @"";
-    temp.text = (tempText.length && ![tempText isEqualToString:@"(null)"]) ? [NSString stringWithFormat:@"%@°", tempText] : @"";
-    temp.textAlignment = NSTextAlignmentCenter;
-    temp.frame = CGRectMake(12, CGRectGetMaxY(icon.frame) + 4, panelW - 24, 70);
-    UILabel *desc = [self makeLabel:[RPTheme title:28] color:[RPTheme text]];
+    temp.text = [tempText isEqualToString:@"-"] ? @"--" : [NSString stringWithFormat:@"%@°", tempText];
+    temp.textAlignment = NSTextAlignmentLeft;
+    temp.frame = CGRectMake(14 + iconSide + 6, 12, panelW - iconSide - 36, iconSide);
+    UILabel *desc = [self makeLabel:[RPTheme title:landscape ? 22 : 18] color:[RPTheme textDim]];
     NSString *descText = [NSString stringWithFormat:@"%@", weather[@"description"] ?: @""];
     NSString *city = [NSString stringWithFormat:@"%@", weather[@"city"] ?: @""];
     if ([descText isEqualToString:@"(null)"]) descText = @"";
     if ([city isEqualToString:@"(null)"]) city = @"";
-    desc.text = city.length ? [NSString stringWithFormat:@"%@  %@", city, descText] : descText;
-    desc.textAlignment = NSTextAlignmentCenter;
-    desc.frame = CGRectMake(12, panelH - 52, panelW - 24, 36);
+    if (city.length && descText.length) desc.text = [NSString stringWithFormat:@"%@ · %@", city, descText];
+    else if (city.length || descText.length) desc.text = city.length ? city : descText;
+    else desc.text = @"天气读取中";
+    desc.frame = CGRectMake(16, 12 + iconSide + 2, panelW - 32, 28);
     [panel addSubview:icon];
     [panel addSubview:temp];
     [panel addSubview:desc];
+
+    CGFloat gridY = CGRectGetMaxY(desc.frame) + 10;
+    CGFloat gap = 8;
+    NSInteger cols = 2;
+    NSInteger rows = 4;
+    CGFloat cw = (panelW - 28 - gap) / (CGFloat)cols;
+    CGFloat ch = MAX(36, (panelH - gridY - 14 - gap * (rows - 1)) / (CGFloat)rows);
+    for (NSUInteger i = 0; i < facts.count; i++) {
+        NSInteger col = (NSInteger)i % cols;
+        NSInteger row = (NSInteger)i / cols;
+        UIView *cell = [[UIView alloc] initWithFrame:CGRectMake(14 + col * (cw + gap), gridY + row * (ch + gap), cw, ch)];
+        cell.backgroundColor = [UIColor colorWithWhite:1 alpha:0.07];
+        cell.layer.cornerRadius = 10;
+        UILabel *cap = [self makeLabel:[RPTheme small:15] color:[RPTheme textDim]];
+        cap.text = facts[i][0];
+        cap.frame = CGRectMake(10, 4, cw - 16, 18);
+        UILabel *val = [self makeLabel:[RPTheme title:ch > 56 ? 24 : 18] color:[RPTheme text]];
+        val.text = facts[i][1];
+        val.adjustsFontSizeToFitWidth = YES;
+        val.minimumScaleFactor = 0.6;
+        val.frame = CGRectMake(10, 22, cw - 16, ch - 28);
+        [cell addSubview:cap];
+        [cell addSubview:val];
+        [panel addSubview:cell];
+    }
     [self.contentView addSubview:panel];
 
     CGFloat textW = landscape ? (panelX - m - 16) : (b.size.width - 2 * m);
@@ -1126,7 +1255,7 @@ static NSString *RPShortNumber(id value) {
         heading = @"X · 动态";
     } else if ([kind isEqualToString:@"xhs"]) {
         items = state[@"news"][@"xhs_items"];
-        heading = @"小红书热门";
+        heading = @"小红书每日热门";
     } else if ([kind isEqualToString:@"bili"]) {
         items = state[@"news"][@"bili_items"];
         heading = @"哔哩哔哩热门";
@@ -1179,7 +1308,7 @@ static NSString *RPShortNumber(id value) {
     NSInteger maxN = self.github ? MIN(12, (NSInteger)items.count) : MIN(10, (NSInteger)items.count);
     if (maxN == 0) {
         UILabel *empty = [self makeLabel:[RPTheme body:22] color:[RPTheme textDim]];
-        if ([kind isEqualToString:@"xhs"]) empty.text = @"正在通过代理读取小红书热榜，两小时更新一次。";
+        if ([kind isEqualToString:@"xhs"]) empty.text = @"正在读取小红书每日热门，两小时看一次。";
         else if ([kind isEqualToString:@"bili"]) empty.text = @"正在读取哔哩哔哩热门，两小时更新一次。";
         else if ([kind isEqualToString:@"x"]) empty.text = @"正在通过代理读取 X 全球热门话题，两小时更新一次。";
         else empty.text = @"这一页还没有内容。检查设置里的接口地址，以及是否需要代理。";
@@ -1488,6 +1617,10 @@ static NSString *RPShortNumber(id value) {
     hl.numberOfLines = 1;
     hl.frame = CGRectMake(f.size.width - heatW - 12, 0, heatW, f.size.height);
     [row addSubview:hl];
+    row.userInteractionEnabled = YES;
+    UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(rpNewsTap:)];
+    [row addGestureRecognizer:tap];
+    objc_setAssociatedObject(row, &kRPImageURLKey, @{ @"item": it ?: @{}, @"base": @"", @"github": @NO, @"source": @"xiaohongshu-hot" }, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     return row;
 }
 
@@ -1500,7 +1633,7 @@ static NSString *RPShortNumber(id value) {
     for (id it in items) if ([it isKindOfClass:[NSDictionary class]] && RPStringish(it[@"title"]).length) [list addObject:it];
     if (list.count == 0) {
         UILabel *empty = [self makeLabel:[RPTheme body:24] color:[UIColor whiteColor]];
-        empty.text = @"正在读取小红书热榜，两小时更新一次。";
+        empty.text = @"正在读取小红书每日热门，两小时看一次。";
         empty.frame = CGRectMake(m, 12, b.size.width - 2 * m, 80);
         [self.contentView addSubview:empty];
         return;
@@ -1667,6 +1800,10 @@ static NSString *RPShortNumber(id value) {
     nl.numberOfLines = 1;
     nl.frame = CGRectMake(f.size.width - numW - 12, 0, numW, f.size.height);
     [row addSubview:nl];
+    row.userInteractionEnabled = YES;
+    UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(rpNewsTap:)];
+    [row addGestureRecognizer:tap];
+    objc_setAssociatedObject(row, &kRPImageURLKey, @{ @"item": it ?: @{}, @"base": @"", @"github": @NO, @"source": @"bilibili-hot" }, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     return row;
 }
 
@@ -1845,20 +1982,25 @@ static NSString *RPShortNumber(id value) {
     NSDictionary *it = pack[@"item"];
     BOOL github = [pack[@"github"] boolValue];
     NSString *base = pack[@"base"];
+    NSString *source = RPStringish(pack[@"source"]);
+    if (source.length == 0) source = self.pageId;
     if (github) {
         NSString *title = [NSString stringWithFormat:@"%@", it[@"full_name"] ?: it[@"name"] ?: @""];
         NSString *body = [NSString stringWithFormat:@"%@", it[@"description"] ?: @""];
         NSArray *topics = it[@"topics"];
         NSString *topicStr = [topics isKindOfClass:[NSArray class]] ? [topics componentsJoinedByString:@" · "] : @"";
         NSString *meta = [NSString stringWithFormat:@"★ %@  ·  %@  ·  %@\n%@", it[@"stars"]?:@"0", it[@"language"]?:@"--", it[@"url"]?:@"", topicStr];
+        RPTellPC(title, RPStringish(it[@"url"]), source);
         [self showDetailWithTitle:title body:body meta:meta imageURL:nil];
     } else {
         NSString *title = [NSString stringWithFormat:@"%@", it[@"title"] ?: @""];
         NSString *body = [NSString stringWithFormat:@"%@", it[@"summary"] ?: @""];
-        NSString *link = [NSString stringWithFormat:@"%@", it[@"link"] ?: @""];
+        NSString *link = RPStringish(it[@"link"]);
+        if (link.length == 0) link = RPStringish(it[@"url"]);
         NSURL *img = nil;
         NSString *iu = [NSString stringWithFormat:@"%@", it[@"image_url"] ?: @""];
-        if (iu.length) img = [self absURL:iu base:base];
+        if (iu.length && ![iu isEqualToString:@"(null)"]) img = [self absURL:iu base:base];
+        RPTellPC(title, link, source);
         [self showDetailWithTitle:title body:body meta:link imageURL:img];
     }
 }
@@ -2224,6 +2366,10 @@ static NSArray *RPFillGrid(CGRect avail, NSInteger available, NSInteger minN, NS
         rd.frame = CGRectMake(10, imgH + 34, f.size.width - 20, 24);
         [card addSubview:t];
         [card addSubview:rd];
+        card.userInteractionEnabled = YES;
+        UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(rpCoverTap:)];
+        [card addGestureRecognizer:tap];
+        objc_setAssociatedObject(card, &kRPImageURLKey, @{ @"item": mov ?: @{}, @"source": @"movie" }, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         [self.contentView addSubview:card];
     }
 }
@@ -2320,6 +2466,10 @@ static NSArray *RPFillGrid(CGRect avail, NSInteger available, NSInteger minN, NS
         pr.numberOfLines = 1;
         pr.frame = CGRectMake(10, imgH + 36, f.size.width - 20, 24);
         [card addSubview:pr];
+        card.userInteractionEnabled = YES;
+        UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(rpCoverTap:)];
+        [card addGestureRecognizer:tap];
+        objc_setAssociatedObject(card, &kRPImageURLKey, @{ @"item": item ?: @{}, @"source": self.pageOffset == 0 ? @"steam" : @"steam-hot" }, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         [self.contentView addSubview:card];
     }
 }
@@ -2409,6 +2559,10 @@ static NSArray *RPFillGrid(CGRect avail, NSInteger available, NSInteger minN, NS
             s.frame = CGRectMake(10, imgH + 36, f.size.width - 20, 24);
             [card addSubview:s];
         }
+        card.userInteractionEnabled = YES;
+        UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(rpCoverTap:)];
+        [card addGestureRecognizer:tap];
+        objc_setAssociatedObject(card, &kRPImageURLKey, @{ @"item": item ?: @{}, @"source": self.kind ?: @"game" }, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         [self.contentView addSubview:card];
     }
 }
@@ -3301,6 +3455,16 @@ static UIColor *RPMoveColor(double percent) {
         crypto ? @"24小时前" : @"昨收",
         RPGrouped([item[@"prev"] doubleValue], frac)];
     if (turn.length) [body appendFormat:@"\n%@  %@", crypto ? @"24小时成交额" : @"成交额", turn];
+    NSString *sym = RPStringish(item[@"symbol"]);
+    NSString *link = @"";
+    if (crypto && sym.length) {
+        link = [NSString stringWithFormat:@"https://www.binance.com/zh-CN/trade/%@_USDT", [sym uppercaseString]];
+    } else if (sym.length == 6) {
+        unichar c = [sym characterAtIndex:0];
+        NSString *ex = (c == '6' || c == '5' || c == '9') ? @"sh" : @"sz";
+        link = [NSString stringWithFormat:@"https://quote.eastmoney.com/%@%@.html", ex, sym];
+    }
+    RPTellPC(RPStringish(item[@"name"]), link, crypto ? @"crypto" : @"stock");
     [self showDetailWithTitle:item[@"name"] body:body meta:item[@"symbol"] imageURL:nil];
 }
 
@@ -3510,6 +3674,29 @@ static BOOL RPVideoExtensionOK(NSString *ext) {
     return [ext isEqualToString:@"mp4"] || [ext isEqualToString:@"mov"] || [ext isEqualToString:@"m4v"];
 }
 
+static NSArray *RPShuffled(NSArray *items) {
+    NSMutableArray *a = [items mutableCopy] ?: [NSMutableArray array];
+    for (NSUInteger i = a.count; i > 1; i--) {
+        [a exchangeObjectAtIndex:i - 1 withObjectAtIndex:arc4random_uniform((uint32_t)i)];
+    }
+    return a;
+}
+
+/** iPad 3 / iOS 9: H.264 up to 1080p. 4K and HEVC are rejected before the player starts. */
+static BOOL RPVideoAssetFits(AVAsset *av) {
+    if (![av isKindOfClass:[AVAsset class]] || !av.playable) return NO;
+    NSArray *tracks = [av tracksWithMediaType:AVMediaTypeVideo];
+    AVAssetTrack *track = tracks.firstObject;
+    if (![track isKindOfClass:[AVAssetTrack class]]) return NO;
+    CGSize sz = track.naturalSize;
+    if (MAX(fabs(sz.width), fabs(sz.height)) > 1920.5) return NO;
+    for (id desc in track.formatDescriptions) {
+        FourCharCode codec = CMFormatDescriptionGetMediaSubType((__bridge CMFormatDescriptionRef)desc);
+        if (codec == 'hvc1' || codec == 'hev1' || codec == 'dvh1' || codec == 'dvhe') return NO;
+    }
+    return YES;
+}
+
 static id RPVideoPick(NSArray *items, NSString *identity) {
     if (items.count == 0) return nil;
     uint32_t n = (uint32_t)items.count;
@@ -3557,7 +3744,50 @@ static NSArray *RPVideoLinksInPage(NSData *data, NSString *pageURL) {
 @property (nonatomic, assign) PHImageRequestID videoRequest;
 @property (nonatomic, assign) BOOL advancing;
 @property (nonatomic, strong) UIButton *muteButton;
+@property (nonatomic, copy) NSArray *videoCandidates;
+@property (nonatomic, assign) NSInteger videoCandidateCursor;
+@property (nonatomic, assign) BOOL videoTrying;
+@property (nonatomic, assign) BOOL videoSawCloud;
+@property (nonatomic, assign) BOOL prefetchMode;
+- (void)beginPlayback;
+- (BOOL)adoptPreparedItem;
+- (void)stopPlayback;
 @end
+
+static RPVideoPageVC *sPrepVC;
+static AVPlayerItem *sPrepItem;
+static AVPlayer *sPrepPlayer;
+static PHImageRequestID sPrepRequest;
+static BOOL sPrepReady;
+
+static BOOL sPrepNetwork;
+
+void RPDropPreparedVideo(void) {
+    if (sPrepVC) {
+        sPrepVC.playToken += 1;
+        [sPrepVC stopPlayback];
+        sPrepVC = nil;
+    }
+    [sPrepPlayer pause];
+    [sPrepPlayer replaceCurrentItemWithPlayerItem:nil];
+    sPrepPlayer = nil;
+    sPrepItem = nil;
+    if (sPrepRequest != 0) {
+        [[PHImageManager defaultManager] cancelImageRequest:sPrepRequest];
+        sPrepRequest = 0;
+    }
+    sPrepReady = NO;
+}
+void RPPrepareUpcomingVideo(BOOL network) {
+    if ((sPrepVC || sPrepReady) && sPrepNetwork == network) return;
+    if (sPrepVC || sPrepReady) RPDropPreparedVideo();
+    sPrepNetwork = network;
+    sPrepVC = [[RPVideoPageVC alloc] init];
+    sPrepVC.network = network;
+    sPrepVC.prefetchMode = YES;
+    sPrepVC.playToken = 1;
+    [sPrepVC beginPlayback];
+}
 
 @implementation RPVideoPageVC
 - (void)viewDidLoad {
@@ -3590,30 +3820,74 @@ static NSArray *RPVideoLinksInPage(NSData *data, NSString *pageURL) {
     self.advancing = NO;
     self.playToken += 1;
     [self stopPlayback];
+    [self updateMuteButton];
+    if ([self adoptPreparedItem]) return;
     [self showStatus:@"正在准备视频…"];
+    [self beginPlayback];
+}
+- (BOOL)adoptPreparedItem {
+    if (self.prefetchMode || !sPrepReady || !sPrepItem) {
+        if (!self.prefetchMode && sPrepVC) {
+            sPrepVC.playToken += 1;
+            [sPrepVC stopPlayback];
+            sPrepVC = nil;
+            sPrepReady = NO;
+        }
+        return NO;
+    }
+    [sPrepPlayer pause];
+    [sPrepPlayer replaceCurrentItemWithPlayerItem:nil];
+    sPrepPlayer = nil;
+    AVPlayerItem *item = sPrepItem;
+    sPrepItem = nil;
+    self.videoRequest = sPrepRequest;
+    sPrepRequest = 0;
+    sPrepReady = NO;
+    sPrepVC = nil;
+    [self startPlayer:item name:@"prepared"];
+    return YES;
+}
+- (void)stashPreparedItem:(AVPlayerItem *)item name:(NSString *)name {
+    if (!item || !self.prefetchMode) return;
+    AVPlayer *player = [AVPlayer playerWithPlayerItem:item];
+    player.muted = YES;
+    [player prerollAtRate:1.0 completionHandler:nil];
+    sPrepItem = item;
+    sPrepPlayer = player;
+    sPrepRequest = self.videoRequest;
+    self.videoRequest = 0;
+    sPrepReady = YES;
+    RPLastVideoKey = name ?: @"";
+    sPrepVC = nil;
+}
+- (void)beginPlayback {
     NSInteger token = self.playToken;
     NSDictionary *cfg = RPVideoSettings();
-    [self updateMuteButton];
+    if (!self.prefetchMode) [self updateMuteButton];
     if (self.network) {
         NSString *dir = cfg[@"http"] ?: @"";
         NSString *user = cfg[@"http_user"] ?: @"";
         NSString *pass = cfg[@"http_pass"] ?: @"";
         if (dir.length == 0) {
+            if (self.prefetchMode) { sPrepVC = nil; return; }
             [self showStatus:@"还没有填写视频目录。\n打开设置 → 网络视频，填 HTTP 或 WebDAV 地址。"];
             return;
         }
-        [self showStatus:@"正在读取视频目录…"];
+        if (!self.prefetchMode) [self showStatus:@"正在读取视频目录…"];
         dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
             NSString *why = nil;
             NSString *picked = [self pickNetworkVideo:dir user:user pass:pass why:&why];
             dispatch_async(dispatch_get_main_queue(), ^{
                 if (token != self.playToken) return;
                 if (picked.length == 0) {
+                    if (self.prefetchMode) { sPrepVC = nil; return; }
                     [self showStatus:why.length ? why : @"这个目录里没有 mp4、mov 或 m4v。"];
                     return;
                 }
                 RPLastVideoKey = picked;
-                [self startPlayer:[self networkItem:picked user:user pass:pass] name:picked];
+                AVPlayerItem *item = [self networkItem:picked user:user pass:pass];
+                if (self.prefetchMode) [self stashPreparedItem:item name:picked];
+                else [self startPlayer:item name:picked];
             });
         });
         return;
@@ -3750,16 +4024,117 @@ static NSArray *RPVideoLinksInDAV(NSData *data, NSURL *base) {
     self.statusLabel.hidden = NO;
     self.statusLabel.text = text;
 }
-- (void)playPickedFile:(NSInteger)token {
-    (void)token;
-    NSArray *files = RPVideoLocalFiles();
-    NSString *path = RPVideoPick(files, RPLastVideoKey);
-    if (path.length == 0) {
-        [self showStatus:@"还没有上传视频。\n用浏览器打开设置页，来源选「上传到这台 iPad」。"];
+- (void)holdVideoSearch:(BOOL)hold {
+    if (self.prefetchMode) return;
+    [[NSNotificationCenter defaultCenter] postNotificationName:@"RPVideoHold" object:nil userInfo:@{ @"hold": @(hold) }];
+}
+- (void)beginVideoSearch:(NSArray *)candidates token:(NSInteger)token emptyText:(NSString *)emptyText {
+    if (candidates.count == 0) {
+        if (self.prefetchMode) { sPrepVC = nil; return; }
+        [self showStatus:emptyText];
         return;
     }
-    RPLastVideoKey = path;
-    [self startPlayer:[AVPlayerItem playerItemWithURL:[NSURL fileURLWithPath:path]] name:path.lastPathComponent];
+    self.videoCandidates = candidates;
+    self.videoCandidateCursor = 0;
+    self.videoTrying = NO;
+    self.videoSawCloud = NO;
+    [self showStatus:@"正在准备视频…"];
+    // Don't let the dwell run out while unplayable clips are being skipped.
+    [self holdVideoSearch:YES];
+    [self tryNextCandidate:token];
+}
+- (void)noPlayableVideo {
+    if (self.prefetchMode) { sPrepVC = nil; return; }
+    [self holdVideoSearch:NO];
+    NSString *text = self.videoSawCloud
+        ? @"没有这台 iPad 能播的视频。能播的都还在 iCloud 上，没有下载到本机。"
+        : @"没有这台 iPad 能播的视频。";
+    [[RPLocalFeed sharedFeed] appendLog:@"视频" status:@"fail" detail:text];
+    [self showStatus:text];
+}
+- (void)skipUnplayable {
+    if (self.videoTrying) return;
+    NSInteger token = self.playToken;
+    [self stopPlayback];
+    [self tryNextCandidate:token];
+}
+- (void)considerAsset:(AVAsset *)av token:(NSInteger)token name:(NSString *)name {
+    if (token != self.playToken) return;
+    __weak typeof(self) weakSelf = self;
+    [av loadValuesAsynchronouslyForKeys:@[@"playable", @"tracks"] completionHandler:^{
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (!weakSelf || token != weakSelf.playToken) return;
+            weakSelf.videoTrying = NO;
+            AVKeyValueStatus playable = [av statusOfValueForKey:@"playable" error:nil];
+            AVKeyValueStatus tracks = [av statusOfValueForKey:@"tracks" error:nil];
+            if (playable != AVKeyValueStatusLoaded || tracks != AVKeyValueStatusLoaded || !RPVideoAssetFits(av)) {
+                [weakSelf tryNextCandidate:token];
+                return;
+            }
+            AVPlayerItem *item = nil;
+            if ([av isKindOfClass:[AVURLAsset class]]) {
+                NSURL *file = [(AVURLAsset *)av URL];
+                if (file) item = [AVPlayerItem playerItemWithURL:file];
+            }
+            if (!item) item = [AVPlayerItem playerItemWithAsset:av];
+            RPLastVideoKey = name ?: @"";
+            if (weakSelf.prefetchMode) [weakSelf stashPreparedItem:item name:name];
+            else [weakSelf startPlayer:item name:name];
+        });
+    }];
+}
+- (void)tryNextCandidate:(NSInteger)token {
+    if (token != self.playToken || self.videoTrying) return;
+    while (self.videoCandidateCursor < (NSInteger)self.videoCandidates.count) {
+        id candidate = self.videoCandidates[self.videoCandidateCursor];
+        self.videoCandidateCursor += 1;
+        if ([candidate isKindOfClass:[NSString class]]) {
+            NSString *path = candidate;
+            if (path.length == 0) continue;
+            self.videoTrying = YES;
+            AVURLAsset *file = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:path] options:nil];
+            [self considerAsset:file token:token name:path.lastPathComponent];
+            return;
+        }
+        if (![candidate isKindOfClass:[PHAsset class]]) continue;
+        PHAsset *asset = candidate;
+        NSInteger w = asset.pixelWidth, h = asset.pixelHeight;
+        if (w > 0 && h > 0 && MAX(w, h) > 1920) continue;
+        self.videoTrying = YES;
+        if (self.videoRequest) {
+            [[PHImageManager defaultManager] cancelImageRequest:self.videoRequest];
+            self.videoRequest = 0;
+        }
+        PHVideoRequestOptions *opt = [[PHVideoRequestOptions alloc] init];
+        // Local copies only. An iCloud-only clip returns at once and we try the next.
+        opt.networkAccessAllowed = NO;
+        opt.version = PHVideoRequestOptionsVersionOriginal;
+        opt.deliveryMode = PHVideoRequestOptionsDeliveryModeHighQualityFormat;
+        __weak typeof(self) weakSelf = self;
+        self.videoRequest = [[PHImageManager defaultManager] requestAVAssetForVideo:asset options:opt resultHandler:^(AVAsset *av, AVAudioMix *mix, NSDictionary *info) {
+            (void)mix;
+            dispatch_async(dispatch_get_main_queue(), ^{
+                if (!weakSelf || token != weakSelf.playToken) return;
+                if ([info[PHImageCancelledKey] boolValue]) {
+                    weakSelf.videoTrying = NO;
+                    return;
+                }
+                if (!av) {
+                    if ([info[PHImageResultIsInCloudKey] boolValue]) weakSelf.videoSawCloud = YES;
+                    weakSelf.videoTrying = NO;
+                    [weakSelf tryNextCandidate:token];
+                    return;
+                }
+                [weakSelf considerAsset:av token:token name:asset.localIdentifier];
+            });
+        }];
+        return;
+    }
+    self.videoTrying = NO;
+    [self noPlayableVideo];
+}
+- (void)playPickedFile:(NSInteger)token {
+    [self beginVideoSearch:RPShuffled(RPVideoLocalFiles()) token:token emptyText:@"还没有上传视频。\n用浏览器打开设置页，来源选「上传到这台 iPad」。"];
 }
 - (void)playPickedAlbum:(NSInteger)token album:(NSString *)album fallback:(NSString *)fallback {
     if (!self.photos) self.photos = [[RPPhotoSource alloc] init];
@@ -3770,29 +4145,10 @@ static NSArray *RPVideoLinksInDAV(NSData *data, NSURL *base) {
             return;
         }
         NSString *look = album.length ? album : fallback;
-        // Whole album (was the newest 80), so the random pick reaches old clips too.
         NSArray *assets = [self.photos videoAssetsInAlbumId:(look.length ? look : nil) limit:2000];
         if (assets.count == 0 && album.length == 0) assets = [self.photos videoAssetsInAlbumId:nil limit:2000];
-        PHAsset *asset = RPVideoPick(assets, RPLastVideoKey);
-        if (!asset) {
-            [self showStatus:album.length ? @"这个相册里没有视频。\n在设置 → 相册视频里换一个相册。" : @"相册里没有视频。"];
-            return;
-        }
-        RPLastVideoKey = asset.localIdentifier;
-        PHVideoRequestOptions *opt = [[PHVideoRequestOptions alloc] init];
-        opt.networkAccessAllowed = YES;
-        opt.deliveryMode = PHVideoRequestOptionsDeliveryModeAutomatic;
-        self.videoRequest = [[PHImageManager defaultManager] requestAVAssetForVideo:asset options:opt resultHandler:^(AVAsset *av, AVAudioMix *mix, NSDictionary *info) {
-            (void)mix; (void)info;
-            dispatch_async(dispatch_get_main_queue(), ^{
-                if (token != self.playToken) return;
-                if (!av) {
-                    [self showStatus:@"这条视频打不开。"];
-                    return;
-                }
-                [self startPlayer:[AVPlayerItem playerItemWithAsset:av] name:asset.localIdentifier];
-            });
-        }];
+        NSString *empty = album.length ? @"这个相册里没有视频。\n在设置 → 相册视频里换一个相册。" : @"相册里没有视频。";
+        [self beginVideoSearch:RPShuffled(assets) token:token emptyText:empty];
     }];
 }
 - (NSString *)pickHTTPVideo:(NSString *)page {
@@ -3814,7 +4170,12 @@ static NSArray *RPVideoLinksInDAV(NSData *data, NSURL *base) {
         [self showStatus:@"这条视频打不开。"];
         return;
     }
+    // stopPlayback cancels self.videoRequest. This item came from that request,
+    // so park the id across the cleanup or Photos closes the file and every clip fails.
+    PHImageRequestID keep = self.videoRequest;
+    self.videoRequest = 0;
     [self stopPlayback];
+    self.videoRequest = keep;
     BOOL muted = [RPVideoSettings()[@"muted"] boolValue];
     NSError *audioErr = nil;
     // Muted playback must not stop other audio (the alert chime, music); Ambient also
@@ -3853,8 +4214,7 @@ static NSArray *RPVideoLinksInDAV(NSData *data, NSURL *base) {
     if (item.status == AVPlayerItemStatusFailed) {
         [self.watchTimer invalidate];
         self.watchTimer = nil;
-        [self showStatus:@"这条视频播不了。请换 H.264 的 mp4。"];
-        [self stopPlayback];
+        [self skipUnplayable];
     }
 }
 - (void)onCap {
@@ -3866,8 +4226,7 @@ static NSArray *RPVideoLinksInDAV(NSData *data, NSURL *base) {
 }
 - (void)onVideoFailed:(NSNotification *)note {
     (void)note;
-    [self showStatus:@"播放中断了。"];
-    [self stopPlayback];
+    [self skipUnplayable];
 }
 - (void)finishAndAdvance {
     if (self.advancing) return;

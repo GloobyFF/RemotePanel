@@ -10,6 +10,9 @@ extern NSString * const RPPageEnabledPrefix;
 extern NSString * const RPRefreshPrefix;
 extern NSString * const RPTickerURLKey;
 extern NSString * const RPTickerProxyKey;
+/** Where a tap should ask a PC to open the item. Empty stored value means off. */
+extern NSString * const RPPCOpenURLKey;
+NSString *RPLocalDefaultPCOpenURL(void);
 extern NSString * const RPHelloKeyKey;
 extern NSString * const RPHelloModelKey;
 extern NSString * const RPFeedProgressNotification;

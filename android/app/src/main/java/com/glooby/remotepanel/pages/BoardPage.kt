@@ -71,7 +71,7 @@ object Pages {
     fun feedOf(id: String): String = meta[id]?.feed.orEmpty()
 
     fun signature(id: String, s: PanelState): Any? = when (id) {
-        "hello" -> listOf(minute(), s.helloPeriod, s.hello, s.weather, s.dailyNews.take(6), s.stocks, s.crypto.take(3))
+        "hello" -> listOf(minute(), s.helloPeriod, s.hello, s.weather)
         "schedule" -> minute().dropLast(1)
         "weather" -> listOf(s.weather, s.vps)
         "daily-news" -> s.dailyNews

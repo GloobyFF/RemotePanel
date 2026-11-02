@@ -8,6 +8,7 @@ import com.glooby.remotepanel.data.PanelState
 import com.glooby.remotepanel.data.QuoteItem
 import com.glooby.remotepanel.data.Theme
 import com.glooby.remotepanel.ui.Fmt
+import com.glooby.remotepanel.ui.Roll
 import com.glooby.remotepanel.ui.Ui
 import com.glooby.remotepanel.ui.Ui.W
 
@@ -53,7 +54,9 @@ object MarketPages {
         gravity = Gravity.CENTER_VERTICAL
         setPadding(Ui.px(26), Ui.px(14), Ui.px(22), Ui.px(14))
         addView(Ui.text(ctx, q.name, Ui.BODY, Theme.textDim(), W.MEDIUM), Ui.wide())
-        addView(Ui.number(ctx, Fmt.price(q.price), 72, Theme.move(q.percent)), Ui.wide())
+        val price = Ui.number(ctx, Fmt.price(q.price), 72, Theme.move(q.percent))
+        Roll.bind(price, "idx-${q.symbol.ifBlank { q.name }}", price.text.toString())
+        addView(price, Ui.wide())
         addView(Ui.number(ctx, "${Fmt.percent(q.percent)}  ${Fmt.change(q.change)}", Ui.META, Theme.move(q.percent)), Ui.wide())
     }
 }
