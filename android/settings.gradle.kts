@@ -16,3 +16,4 @@ dependencyResolutionManagement {
 }
 rootProject.name = "RemotePanel"
 include(":app")
+include(":stocks")
